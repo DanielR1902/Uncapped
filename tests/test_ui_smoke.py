@@ -31,6 +31,21 @@ def seeded_db(tmp_path):
     database.get_engine().dispose()
 
 
+@pytest.fixture()
+def demo_seeded_db(tmp_path):
+    """Catalog + the admin/persona demo accounts (db/seed_demo.py) — used by
+    tests that need the standing admin login rather than a freshly registered
+    user."""
+    from db.seed_demo import run_demo_seed
+
+    db_path = tmp_path / "test_ui_demo.db"
+    database.configure(f"sqlite:///{db_path}")
+    database.init_db()
+    run_demo_seed()
+    yield
+    database.get_engine().dispose()
+
+
 def _register(at: AppTest, username: str, email: str, full_name: str, password: str = "Passw0rd!") -> AppTest:
     at.get_by_key("open_register").click().run()
     at.get_by_key("register_username").input(username)
@@ -269,6 +284,8 @@ def test_publish_and_view_in_community_thread(seeded_db):
 
 
 def test_fork_from_community_loads_build_studio(seeded_db):
+    from engine.solvers import CATEGORY_ORDER
+
     at = AppTest.from_file(str(APP_PATH))
     at.run()
     _register(at, "kevin", "kevin@example.com", "Kevin Row")
@@ -288,24 +305,264 @@ def test_fork_from_community_loads_build_studio(seeded_db):
 
     assert not at.exception
     assert at.session_state["page"] == "create_build"
-    assert at.session_state["build_draft"]["components"]
+    components = at.session_state["build_draft"]["components"]
+    assert set(components.keys()) == set(CATEGORY_ORDER)  # every category carried over, not just some
 
 
-def test_my_builds_grouped_and_global_views(seeded_db):
+def test_my_builds_grouped_view_clone_loads_full_build(seeded_db):
+    from engine.solvers import CATEGORY_ORDER
+
     at = AppTest.from_file(str(APP_PATH))
     at.run()
     _register(at, "laura", "laura@example.com", "Laura Row")
     at.get_by_key("nav_create_build").click().run()
-    at.get_by_key("mode_budget").click().run()
-    at.get_by_key("generate_budget_build").click().run()
+    at.get_by_key("mode_workload").click().run()
+    at.get_by_key("generate_workload_build").click().run()
     at.get_by_key("build_name_input").input("Laura's Rig")
     at.get_by_key("save_build").click()
     at.run()
 
     assert not at.exception  # default "Group by Workload Profile" view
+    clone_buttons = [b.key for b in at.button if b.key and b.key.startswith("Clone_")]
+    assert clone_buttons
+
+    at.get_by_key(clone_buttons[0]).click()
+    at.run()
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    components = at.session_state["build_draft"]["components"]
+    assert set(components.keys()) == set(CATEGORY_ORDER)
+
+
+def test_my_builds_global_sort_orders_without_exception(seeded_db):
+    at = AppTest.from_file(str(APP_PATH))
+    at.run()
+    _register(at, "mallory", "mallory@example.com", "Mallory Row")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("generate_budget_build").click().run()
+    at.get_by_key("build_name_input").input("Mallory's Rig")
+    at.get_by_key("save_build").click()
+    at.run()
 
     at.get_by_key("my_builds_view_mode").set_value("Global Sort")
     at.run()
     assert not at.exception
 
+    for sort_label in ("Cost (High to Low)", "Cost (Low to High)", "Date"):
+        at.get_by_key("my_builds_sort").set_value(sort_label)
+        at.run()
+        assert not at.exception  # no DetachedInstanceError under any sort order
+
     assert any(b.key and b.key.startswith("Clone_") for b in at.button)
+
+
+def test_analysis_invalidated_after_component_swap(seeded_db):
+    """Regression test: swapping a part used to leave the synergy/bottleneck
+    card showing stale numbers for a build that no longer matched what was on
+    screen (ui/state.py::set_component didn't clear build_draft_analysis)."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run()
+    _register(at, "nathan", "nathan@example.com", "Nathan Row")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("generate_budget_build").click().run()
+    at.get_by_key("run_analysis").click().run()
+
+    assert at.session_state["build_draft_analysis"] is not None
+
+    current_cpu_id = at.session_state["build_draft"]["components"]["CPU"]
+    other_cpu_buttons = [
+        b.key for b in at.button
+        if b.key and b.key.startswith("select_CPU_") and str(current_cpu_id) not in b.key
+    ]
+    assert other_cpu_buttons
+    at.get_by_key(other_cpu_buttons[0]).click().run()
+
+    assert not at.exception
+    assert at.session_state["build_draft_analysis"] is None
+
+
+def test_comment_box_clears_and_resubmission_is_a_no_op(seeded_db):
+    """Regression test: the comment text_area used to retain its posted text,
+    so clicking "Post comment" again without retyping silently created a
+    duplicate comment."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run()
+    _register(at, "olivia", "olivia@example.com", "Olivia Row")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("generate_budget_build").click().run()
+    at.get_by_key("build_name_input").input("Olivia's Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click()
+    at.run()
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    view_buttons = [b.key for b in at.button if b.key and b.key.startswith("view_post_")]
+    at.get_by_key(view_buttons[0]).click().run()
+
+    at.get_by_key("new_comment_input").input("Great build!")
+    at.get_by_key("post_comment").click()
+    at.run()
+
+    from db.repositories import community_repo
+
+    post_id = at.session_state["selected_post_id"]
+    assert len(community_repo.get_comments(post_id)) == 1
+    assert at.get_by_key("new_comment_input").value == ""  # cleared, not left with stale text
+
+    # clicking Post again with nothing retyped must be a no-op, not a duplicate
+    at.get_by_key("post_comment").click()
+    at.run()
+    assert not at.exception
+    assert len(community_repo.get_comments(post_id)) == 1
+
+
+def test_admin_login_works(demo_seeded_db):
+    """Task 2 requirement: the seeded admin account (admin / admin123) can log
+    in via the standard dual-identifier form, just like any other user."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run()
+
+    at.get_by_key("open_login").click().run()
+    at.get_by_key("login_identifier").input("admin")
+    at.get_by_key("login_password").input("admin123")
+    at.get_by_key("login_submit").click()
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["auth_user"] is not None
+    assert at.session_state["auth_user"]["username"] == "admin"
+    assert at.session_state["auth_user"]["email"] == "admin@gmail.com"
+
+
+def test_admin_login_works_by_email(demo_seeded_db):
+    at = AppTest.from_file(str(APP_PATH))
+    at.run()
+
+    at.get_by_key("open_login").click().run()
+    at.get_by_key("login_identifier").input("admin@gmail.com")
+    at.get_by_key("login_password").input("admin123")
+    at.get_by_key("login_submit").click()
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["auth_user"]["username"] == "admin"
+
+
+def test_build_deletion_requires_confirmation_then_removes_build(seeded_db):
+    """Task 2 requirement: Delete asks for confirmation before it fires, and
+    the build disappears from the list immediately once confirmed."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run()
+    _register(at, "petra", "petra@example.com", "Petra Row")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("generate_budget_build").click().run()
+    at.get_by_key("build_name_input").input("Disposable Rig")
+    at.get_by_key("save_build").click()
+    at.run()
+
+    from db.repositories import builds_repo
+
+    user_id = at.session_state["auth_user"]["id"]
+    assert [b.name for b in builds_repo.get_builds_for_user(user_id)] == ["Disposable Rig"]
+
+    delete_buttons = [b.key for b in at.button if b.key and b.key.startswith("Delete_")]
+    assert delete_buttons
+    at.get_by_key(delete_buttons[0]).click().run()
+
+    # first click only arms the confirmation — build must still exist
+    assert not at.exception
+    assert len(builds_repo.get_builds_for_user(user_id)) == 1
+    yes_buttons = [b.key for b in at.button if b.key and "confirm_Delete_" in b.key and b.key.endswith("_yes")]
+    assert yes_buttons
+
+    at.get_by_key(yes_buttons[0]).click().run()
+
+    assert not at.exception
+    assert builds_repo.get_builds_for_user(user_id) == []
+
+
+def test_build_deletion_cancel_keeps_the_build(seeded_db):
+    at = AppTest.from_file(str(APP_PATH))
+    at.run()
+    _register(at, "quinn", "quinn@example.com", "Quinn Row")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("generate_budget_build").click().run()
+    at.get_by_key("build_name_input").input("Keep Me")
+    at.get_by_key("save_build").click()
+    at.run()
+
+    from db.repositories import builds_repo
+
+    user_id = at.session_state["auth_user"]["id"]
+    delete_buttons = [b.key for b in at.button if b.key and b.key.startswith("Delete_")]
+    at.get_by_key(delete_buttons[0]).click().run()
+
+    cancel_buttons = [b.key for b in at.button if b.key and "confirm_Delete_" in b.key and b.key.endswith("_cancel")]
+    assert cancel_buttons
+    at.get_by_key(cancel_buttons[0]).click().run()
+
+    assert not at.exception
+    assert [b.name for b in builds_repo.get_builds_for_user(user_id)] == ["Keep Me"]
+
+
+def test_build_deletion_cascades_to_community_post(seeded_db):
+    """Deleting a published build must also remove its community post (FK
+    cascade on build_id) rather than leaving an orphaned post behind."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run()
+    _register(at, "randall", "randall@example.com", "Randall Row")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("generate_budget_build").click().run()
+    at.get_by_key("build_name_input").input("Published Then Deleted")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click()
+    at.run()
+
+    from db.repositories import community_repo
+
+    assert len(community_repo.get_feed()) == 1
+
+    delete_buttons = [b.key for b in at.button if b.key and b.key.startswith("Delete_")]
+    at.get_by_key(delete_buttons[0]).click().run()
+    yes_buttons = [b.key for b in at.button if b.key and "confirm_Delete_" in b.key and b.key.endswith("_yes")]
+    at.get_by_key(yes_buttons[0]).click().run()
+
+    assert not at.exception
+    assert community_repo.get_feed() == []
+
+
+def test_build_studio_mode_cards_and_slot_grid_render(seeded_db):
+    """Studio redesign smoke test: mode-selector cards and the 8-slot grid
+    (with Selected/Empty status badges, popover pickers) render without
+    exception, and every core category's picker is reachable."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run()
+    _register(at, "sam", "sam@example.com", "Sam Row")
+    at.get_by_key("nav_create_build").click().run()
+
+    assert not at.exception
+    assert at.get_by_key("mode_budget") is not None
+    assert at.get_by_key("mode_workload") is not None
+    assert at.get_by_key("mode_free") is not None
+
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("generate_budget_build").click().run()
+    assert not at.exception
+
+    from engine.solvers import CATEGORY_ORDER
+
+    # every category was filled by the solver, so its "Remove" control (only
+    # rendered once a component is selected) and at least one "Select"
+    # button for a *different* candidate must both be reachable inside the
+    # popover picker AppTest already traverses.
+    for category in CATEGORY_ORDER:
+        assert at.get_by_key(f"remove_{category}") is not None
+        assert any(b.key and b.key.startswith(f"select_{category}_") for b in at.button)
+
+    assert at.session_state["build_draft_analysis"] is None  # nothing analyzed yet, badges show "—"

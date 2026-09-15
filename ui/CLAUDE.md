@@ -7,11 +7,11 @@ All Streamlit rendering, page routing, and session-state orchestration. This pac
 
 ## Files
 - `router.py` — reads `st.session_state["page"]`, dispatches to the matching `views/*.py::render()`. Enforces the auth hard-gate: unauthenticated users are always forced to `landing` regardless of requested page (`spec.md` §7.2).
-- `state.py` — the single source of truth for `st.session_state` shape: `init_session_state()` (defaults, called once from `app.py`), `new_build_draft()`, and the `build_draft` (plain dict, category -> component **id**) <-> `BuildState` (category -> `Component` row) bridge: `resolve_build_state`, `set_component`, `remove_component`, `build_total_cost`, `is_build_complete`.
-- `theme.py` — the single source of color/typography constants (`spec.md` §7.7) plus `inject_css()` and small helpers like `tag(text, kind)` for colored inline spans. No hex codes or font sizes hardcoded in any `views/` or `components/` file — import from here.
+- `state.py` — the single source of truth for `st.session_state` shape: `init_session_state()` (defaults, called once from `app.py`), `new_build_draft()`, and the `build_draft` (plain dict, category -> component **id**) <-> `BuildState` (category -> `Component` row) bridge: `resolve_build_state`, `set_component`, `remove_component` (both also clear `build_draft_analysis` via `_invalidate_analysis` — a component change always makes the last synergy/bottleneck read stale), `build_total_cost`.
+- `theme.py` — the single source of color/typography constants (`spec.md` §7.7) plus `inject_css()` and `tag(text, kind)` for colored inline spans (danger/success/warning). Status badges ("Selected"/"Empty", "Compatible") use the native `st.badge` widget instead, not a `theme.*` helper. No hex codes or font sizes hardcoded in any `views/` or `components/` file — import from here.
 - `format.py` — tiny shared display-formatting helpers (e.g. `humanize_profile("VideoEditing") -> "Video Editing"`). Purely string formatting, no business logic.
 - `views/landing.py`, `views/create_build.py`, `views/my_builds.py`, `views/community.py` — one file per top-level page, matching `spec.md` §7.4–§7.6.
-- `components/auth_modal.py`, `components/build_card.py`, `components/part_picker.py` — reusable widgets shared across views.
+- `components/auth_modal.py`, `components/build_card.py`, `components/part_picker.py` — reusable widgets shared across views. `build_card.py`'s `render_build_card(..., confirm_labels=frozenset({"Delete"}))` gates any action named in `confirm_labels` behind a Yes/Cancel step before its callback fires — use this for any future destructive action, not just Delete. `part_picker.py` renders each slot as a status-badged card with a `st.popover` drawer (not `st.expander`) for changing the pick.
 
 ## Allowed imports
 - `streamlit`.

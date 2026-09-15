@@ -44,6 +44,35 @@ def _save_to_my_builds(build) -> None:
     st.success("Saved to your builds!")
 
 
+def _submit_comment(post_id: int) -> None:
+    """on_click callback (see _comments_section) — runs before the widget is
+    re-instantiated on the next rerun, which is the only reliable point at
+    which a text_area's own session_state value can be cleared. Without this,
+    a posted comment's text stayed in the box, and clicking "Post comment"
+    again with nothing changed silently created a duplicate comment."""
+    content = st.session_state.get("new_comment_input", "").strip()
+    if content:
+        community_repo.add_comment(post_id, current_user()["id"], content)
+    st.session_state["new_comment_input"] = ""
+
+
+@st.fragment
+def _comments_section(post) -> None:
+    """Fragment-scoped so posting a comment only re-renders this box, not the
+    whole thread page above it (header, cost breakdown, component list) —
+    keeps the page from fully reflowing/jumping back to the top on submit."""
+    st.markdown("#### Comments")
+    comments = community_repo.get_comments(post.id)
+    for comment in comments:
+        author = users_repo.get_by_id(comment.user_id)
+        author_name = author.full_name if author is not None else "Unknown user"
+        st.markdown(f"**{author_name}** · {comment.created_at:%Y-%m-%d %H:%M}")
+        st.write(comment.content)
+
+    st.text_area("Add a comment", key="new_comment_input")
+    st.button("Post comment", key="post_comment", on_click=_submit_comment, args=(post.id,))
+
+
 def _thread_view(post) -> None:
     if st.button("⬅ Back to feed", key="back_to_feed"):
         st.session_state["selected_post_id"] = None
@@ -66,19 +95,7 @@ def _thread_view(post) -> None:
     if cols[1].button("💾 Save to My Builds", key="save_to_my_builds", use_container_width=True):
         _save_to_my_builds(post.build)
 
-    st.markdown("#### Comments")
-    comments = community_repo.get_comments(post.id)
-    for comment in comments:
-        author = users_repo.get_by_id(comment.user_id)
-        author_name = author.full_name if author is not None else "Unknown user"
-        st.markdown(f"**{author_name}** · {comment.created_at:%Y-%m-%d %H:%M}")
-        st.write(comment.content)
-
-    new_comment = st.text_area("Add a comment", key="new_comment_input")
-    if st.button("Post comment", key="post_comment"):
-        if new_comment.strip():
-            community_repo.add_comment(post.id, current_user()["id"], new_comment.strip())
-            st.rerun()
+    _comments_section(post)
 
 
 def render() -> None:

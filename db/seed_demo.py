@@ -37,6 +37,12 @@ DEMO_USERS = [
 ]
 DEMO_USERNAMES = [u["username"] for u in DEMO_USERS]
 
+# Standing test/admin login — separate from the persona demo dataset above
+# (own password, no generated builds), seeded/checked independently so it's
+# never affected by force-reseeding the personas.
+ADMIN_USER = {"username": "admin", "email": "admin@gmail.com", "full_name": "admin admin"}
+ADMIN_PASSWORD = "admin123"
+
 
 @dataclass
 class BuildPlan:
@@ -245,9 +251,26 @@ def _create_build(plan: BuildPlan, user_id: int):
     )
 
 
+def _ensure_admin_user() -> int:
+    """Standing admin/test login. Independent idempotency check from the demo
+    personas below — "if already present, do not duplicate" — so it's
+    unaffected by force-reseeding the persona dataset."""
+    existing = users_repo.get_by_username(ADMIN_USER["username"])
+    if existing is not None:
+        return existing.id
+    user = auth_service.register(
+        username=ADMIN_USER["username"],
+        password=ADMIN_PASSWORD,
+        email=ADMIN_USER["email"],
+        full_name=ADMIN_USER["full_name"],
+    )
+    return user.id
+
+
 def run_demo_seed(force: bool = False) -> dict:
     init_db()
     run_catalog_seed()  # idempotent; ensures components exist for builds to reference
+    _ensure_admin_user()
 
     already_seeded = users_repo.get_by_username(DEMO_USERNAMES[0]) is not None
     if already_seeded and not force:
@@ -297,6 +320,9 @@ def run_demo_seed(force: bool = False) -> dict:
 
 
 def _print_credentials() -> None:
+    print("\nAdmin login:")
+    print(f"  username: {ADMIN_USER['username']:<16} email: {ADMIN_USER['email']:<28} password: {ADMIN_PASSWORD}")
+
     print("\nDemo login credentials (all share the same password):")
     print(f"  password: {DEMO_PASSWORD}")
     for entry in DEMO_USERS:

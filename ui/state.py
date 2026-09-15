@@ -60,10 +60,20 @@ def resolve_build_state(build_draft: dict | None) -> BuildState:
 
 def set_component(build_draft: dict, category: str, component: Component) -> None:
     build_draft.setdefault("components", {})[category] = component.id
+    _invalidate_analysis()
 
 
 def remove_component(build_draft: dict, category: str) -> None:
     build_draft.get("components", {}).pop(category, None)
+    _invalidate_analysis()
+
+
+def _invalidate_analysis() -> None:
+    """Any change to which components are picked makes the last synergy/
+    bottleneck analysis stale — clear it so the UI doesn't keep showing scores
+    for a build that no longer matches what's on screen (it'll say "select at
+    least two components" or need a fresh "Analyze" click instead)."""
+    st.session_state["build_draft_analysis"] = None
 
 
 def build_total_cost(build_state: BuildState) -> float:

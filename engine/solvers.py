@@ -71,6 +71,86 @@ def _cheapest_price(category: str, build_state: BuildState) -> float:
     return min(c.price_usd for c in candidates)
 
 
+def cheapest_fill_cost(build_state: BuildState, categories: list[str]) -> float:
+    """Cheapest possible additional cost to fill every category in
+    `categories` (skipping ones already present in build_state) with its own
+    cheapest compatible option, given what's already selected. Locks in each
+    choice before evaluating the next category, so later categories' cheapest
+    compatible option correctly accounts for earlier ones (e.g. socket match).
+    Shared by the feasibility check in _greedy_fill and by
+    ui/components/part_picker.py's Minimum Reserve Threshold filtering."""
+    working = dict(build_state)
+    total = 0.0
+    for category in categories:
+        if category in working:
+            continue
+        candidates = get_compatible_candidates(category, working)
+        if not candidates:
+            candidates = components_repo.get_by_category(category)
+        if not candidates:
+            continue
+        cheapest = min(candidates, key=lambda c: c.price_usd)
+        total += cheapest.price_usd
+        working[category] = cheapest
+    return total
+
+
+def minimum_possible_build_cost() -> float:
+    """The cheapest possible total cost of a complete, compatible 8-part
+    build — the true floor below which no Budget ceiling can ever be
+    satisfied. Delegates to cheapest_fill_cost so it can never silently
+    drift from what the solver's own feasibility logic considers the
+    minimum. Used by ui/views/create_build.py to clamp the Budget ceiling
+    input's min_value and to auto-correct/warn when a user types a ceiling
+    below it."""
+    return cheapest_fill_cost({}, list(CATEGORY_ORDER))
+
+
+def _downgrade_pinned_until_feasible(selection: BuildState, categories_to_fill: list[str], ceiling: float) -> BuildState:
+    """When the caller's own pinned/pre-selected parts make the ceiling
+    infeasible on their own, step the most expensive PINNED categories down
+    to progressively cheaper compatible alternatives (highest tier that's
+    still cheaper than the current pick) — one step at a time, most
+    expensive pinned category first — until pinned_cost + cheapest_fill_cost
+    of what's left fits under the ceiling, or there's nothing left to
+    downgrade. Mirrors _enforce_ceiling's proven price-descending / progress-
+    flag pattern below, just applied to the caller's pins instead of the
+    solver's own picks. If even the cheapest compatible option for every
+    pinned category still doesn't fit, this simply stops (no exception) —
+    the caller proceeds with whatever's left, same graceful-degradation
+    philosophy as a fresh empty selection with an unrealistic ceiling."""
+    if not selection:
+        return selection
+
+    working = dict(selection)
+
+    def pinned_plus_reserve(sel: BuildState) -> float:
+        return sum(c.price_usd for c in sel.values()) + cheapest_fill_cost(sel, categories_to_fill)
+
+    progress = True
+    while pinned_plus_reserve(working) > ceiling and progress:
+        progress = False
+        for category in sorted(working, key=lambda cat: working[cat].price_usd, reverse=True):
+            others = {c: v for c, v in working.items() if c != category}
+            candidates = get_compatible_candidates(category, others)
+            if not candidates:
+                candidates = components_repo.get_by_category(category)
+            if not candidates:
+                continue
+
+            current_price = working[category].price_usd
+            cheaper = [c for c in candidates if c.price_usd < current_price]
+            if not cheaper:
+                continue  # this pinned category is already at its cheapest compatible option
+
+            working[category] = max(cheaper, key=lambda c: c.price_usd)  # highest tier that's still cheaper
+            progress = True
+            if pinned_plus_reserve(working) <= ceiling:
+                break
+
+    return working
+
+
 def _enforce_ceiling(result: BuildState, adjustable_categories: list[str], ceiling: float) -> BuildState:
     """Repair pass: the reservation estimate in the main loop can still
     undershoot when a downstream category's true minimum cost depends jointly
@@ -121,7 +201,25 @@ def _greedy_fill(selection: BuildState, categories_to_fill: list[str], ceiling: 
     the most expensive still-affordable, compatible candidate. Degrades to the
     category's cheapest compatible option rather than ever leaving it unfilled.
     Finishes with _enforce_ceiling so the ceiling invariant holds even where the
-    per-category reservation heuristic underestimated a joint constraint."""
+    per-category reservation heuristic underestimated a joint constraint, plus
+    a final all-categories-adjustable safety net (see below) for the rare
+    residual case where that repair pass alone still isn't enough.
+
+    If `selection` (the caller's pinned/pre-selected parts) alone makes the
+    ceiling infeasible — either those parts alone exceed it, or they leave
+    less than the cheapest possible cost to fill every remaining category —
+    this auto-downgrades the most expensive pinned categories to
+    progressively cheaper compatible alternatives via
+    _downgrade_pinned_until_feasible rather than raising. A fresh, empty
+    selection is never touched by this (there's no prior user choice to
+    step down); it degrades exactly as before via the main loop + repair
+    pass below."""
+    if selection:
+        pinned_cost = sum(c.price_usd for c in selection.values())
+        min_remaining = cheapest_fill_cost(selection, categories_to_fill)
+        if pinned_cost > ceiling or pinned_cost + min_remaining > ceiling:
+            selection = _downgrade_pinned_until_feasible(selection, categories_to_fill, ceiling)
+
     result = dict(selection)
     spent = sum(c.price_usd for c in result.values())
     remaining_budget = ceiling - spent
@@ -145,7 +243,24 @@ def _greedy_fill(selection: BuildState, categories_to_fill: list[str], ceiling: 
         result[category] = chosen
         remaining_budget -= chosen.price_usd
 
-    return _enforce_ceiling(result, categories_to_fill, ceiling)
+    result = _enforce_ceiling(result, categories_to_fill, ceiling)
+
+    total = sum(c.price_usd for c in result.values())
+    if total > ceiling:
+        # Absolute last resort: cheapest_fill_cost's fixed-order estimate
+        # (used by the feasibility pre-check above and by
+        # _downgrade_pinned_until_feasible) and _enforce_ceiling's own
+        # descending-price greedy repair order can, in rare cases where
+        # compatibility constraints chain non-trivially across categories,
+        # converge on slightly different totals. If the normal repair pass
+        # (pinned categories excluded) still leaves the build over the
+        # ceiling, re-run it treating EVERY category — including ones the
+        # caller pinned — as adjustable. The ceiling is a hard invariant
+        # (spec.md §5.2: "never exceeds the ceiling"); a pin only ever
+        # yields to it once nothing else is left to trim.
+        result = _enforce_ceiling(result, list(result.keys()), ceiling)
+
+    return result
 
 
 def initialize_budget_build(ceiling: float, seed_selection: BuildState | None = None) -> BuildState:

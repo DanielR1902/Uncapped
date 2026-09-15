@@ -25,11 +25,6 @@ def tag(text: str, kind: str = "danger") -> str:
     return f'<span class="uncapped-tag-{kind}">{text}</span>'
 
 
-def badge(text: str, kind: str = "ai") -> str:
-    """Pill badge, used for the "AI Engine" vs "Heuristic Baseline" source tag."""
-    return f'<span class="uncapped-badge uncapped-badge-{kind}">{text}</span>'
-
-
 def inject_css() -> None:
     st.markdown(
         f"""
@@ -45,21 +40,6 @@ def inject_css() -> None:
         .uncapped-tag-success {{ color: {PRIMARY_ACCENT}; font-weight: 600; }}
         .uncapped-tag-warning {{ color: {WARNING_ACCENT}; font-weight: 600; }}
         .uncapped-muted {{ color: {TEXT_MUTED}; font-size: 0.85rem; }}
-        .uncapped-badge {{
-            display: inline-block;
-            padding: 0.15rem 0.6rem;
-            border-radius: 999px;
-            font-size: 0.75rem;
-            font-weight: 600;
-        }}
-        .uncapped-badge-ai {{
-            background-color: rgba(61, 220, 151, 0.15);
-            color: {PRIMARY_ACCENT};
-        }}
-        .uncapped-badge-heuristic {{
-            background-color: rgba(242, 177, 52, 0.15);
-            color: {WARNING_ACCENT};
-        }}
         /* Best-effort: push the sidebar's last element (Logout) toward the
         bottom via flex layout. Streamlit's internal sidebar DOM structure can
         shift between versions, so this degrades gracefully to a normal

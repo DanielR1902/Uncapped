@@ -1,9 +1,17 @@
 """Inline login/register modal — same page, no navigation (spec.md §7.3).
 
-Streamlit reruns the whole script on every widget interaction, so checking
-is_username_taken/is_email_taken on each rerun (outside a st.form, so each
-keystroke commits immediately) gives genuinely live duplicate flags, not just
-an on-submit check.
+Streamlit commits a text_input's value (and reruns) on blur/Enter, not on
+literal every keystroke, but that commit still reran the *entire* app —
+sidebar, page title, everything — until each form was wrapped in its own
+@st.fragment below. Now a field commit only reruns that fragment, so typing
+into one field of the register form no longer reflows the whole page. Live
+is_username_taken/is_email_taken checks still work exactly as before —
+fragments rerun on every widget interaction inside them, same as the full app
+would — they just don't drag the rest of the page along for the ride.
+
+A successful submit calls a plain st.rerun() (default scope="app"), which
+*is* a full-app rerun on purpose: login/register success needs to update the
+sidebar and nav buttons outside this fragment's boundary.
 """
 from __future__ import annotations
 
@@ -14,6 +22,7 @@ from auth.session import log_in, set_auth_mode
 from ui import theme
 
 
+@st.fragment
 def _register_form() -> None:
     st.subheader("Create an account")
 
@@ -39,6 +48,7 @@ def _register_form() -> None:
             st.rerun()
 
 
+@st.fragment
 def _login_form() -> None:
     st.subheader("Log in")
 

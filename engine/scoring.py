@@ -50,6 +50,20 @@ def heuristic_synergy_score(compatibility_score: float, bottleneck_percentage: f
     return max(0.0, compatibility_score - bottleneck_percentage / 2)
 
 
+def live_bottleneck_and_synergy(build_state: BuildState) -> tuple[float, float, str] | None:
+    """Instant, local (no-LLM) synergy/bottleneck estimate for the Build
+    Studio summary header — available the moment at least 2 components are
+    picked, not gated behind the full analyze_build() call. Returns None when
+    there aren't enough components yet; the caller shows a placeholder then.
+    Returns (synergy_score, bottleneck_percentage, direction)."""
+    if len(build_state) < 2:
+        return None
+    bottleneck_pct, direction = bottleneck_percentage_baseline(build_state)
+    compat_score = compatibility_score(build_state)
+    synergy = heuristic_synergy_score(compat_score, bottleneck_pct)
+    return synergy, bottleneck_pct, direction
+
+
 def value_index(component: Component, category_candidates: list[Component], build_state: BuildState) -> float:
     """Higher is better. Compares `component` against its category peers on
     (compatibility contribution if hypothetically slotted in) vs. price, per

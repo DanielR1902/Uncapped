@@ -128,3 +128,15 @@ def set_public(build_id: int, is_public: bool) -> None:
         if build is None:
             raise ValueError(f"No build with id={build_id}")
         build.is_public = is_public
+
+
+def delete_build(build_id: int) -> None:
+    """Deletes the build and, via ORM cascade + the DB-level ON DELETE CASCADE
+    on build_id/build_id FKs, its build_components and any community_posts it
+    was shared as (which in turn cascades their community_comments). No-op if
+    the build is already gone."""
+    with session_scope() as session:
+        build = session.get(Build, build_id)
+        if build is None:
+            return
+        session.delete(build)

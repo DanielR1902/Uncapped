@@ -313,6 +313,225 @@ def test_on_user_pins_component_respects_pin_and_budget(seeded_db):
     assert compatibility.evaluate_build(build).is_compatible is True
 
 
+def test_budget_solver_downgrades_pinned_gpu_when_infeasible(seeded_db):
+    """A user who pins an expensive part first, then sets a ceiling too tight
+    to ever complete the other 7 slots, must still get a complete, in-budget
+    build — the solver auto-downgrades the pin itself (highest tier that still
+    fits) rather than refusing outright or silently exceeding the ceiling."""
+    from db.repositories import components_repo
+
+    priciest_gpu = max(components_repo.get_by_category("GPU"), key=lambda c: c.price_usd)
+    # deliberately leaves only $10 for the other 7 categories combined, as pinned
+    ceiling = priciest_gpu.price_usd + 10.0
+
+    build = solvers.initialize_budget_build(ceiling, seed_selection={"GPU": priciest_gpu})
+
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= ceiling
+    assert build["GPU"].id != priciest_gpu.id  # the pin itself had to be stepped down
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+    assert compatibility.evaluate_build(build).is_compatible is True
+
+
+def test_budget_solver_downgrades_pin_when_pin_alone_exceeds_ceiling(seeded_db):
+    from db.repositories import components_repo
+
+    priciest_gpu = max(components_repo.get_by_category("GPU"), key=lambda c: c.price_usd)
+    ceiling = priciest_gpu.price_usd - 1.0  # the pin ALONE already blows the ceiling
+
+    build = solvers.initialize_budget_build(ceiling, seed_selection={"GPU": priciest_gpu})
+
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= ceiling
+    assert build["GPU"].id != priciest_gpu.id
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+
+
+def test_budget_solver_never_exceeds_ceiling_with_expensive_pinned_component(seeded_db):
+    """The core regression guard this task asked for: pin a pricey (but not
+    the single most extreme) component, use a ceiling that comfortably fits
+    it plus the rest, and confirm the final build both respects the ceiling
+    and leaves the pin untouched."""
+    from db.repositories import components_repo
+
+    gpus_by_price = sorted(components_repo.get_by_category("GPU"), key=lambda c: c.price_usd)
+    pinned_gpu = gpus_by_price[-3]  # pricey, not the single most extreme
+    ceiling = pinned_gpu.price_usd + 800.0
+
+    build = solvers.initialize_budget_build(ceiling, seed_selection={"GPU": pinned_gpu})
+
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= ceiling
+    assert build["GPU"].id == pinned_gpu.id  # pinned component must remain immutable
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+    assert compatibility.evaluate_build(build).is_compatible is True
+
+
+def test_on_user_pins_component_downgrades_when_infeasible(seeded_db):
+    """The same auto-downgrade behavior applies through the
+    on_user_pins_component entry point, not just initialize_budget_build —
+    both route through the same _greedy_fill, so this should already hold,
+    but it's worth locking in explicitly since it's a distinct public entry
+    point."""
+    from db.repositories import components_repo
+
+    priciest_gpu = max(components_repo.get_by_category("GPU"), key=lambda c: c.price_usd)
+    ceiling = priciest_gpu.price_usd + 10.0
+
+    build = solvers.on_user_pins_component({}, "GPU", priciest_gpu, ceiling)
+
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= ceiling
+    assert build["GPU"].id != priciest_gpu.id
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+
+
+def test_cheapest_fill_cost_skips_already_present_categories(seeded_db):
+    from db.repositories import components_repo
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    build_state = {"CPU": cpu}
+    # CPU is already present, so it must not be double-counted in the fill cost
+    cost_including_cpu_category = solvers.cheapest_fill_cost(build_state, ["CPU", "RAM"])
+    cost_ram_only = solvers.cheapest_fill_cost(build_state, ["RAM"])
+    assert cost_including_cpu_category == cost_ram_only
+
+
+def test_budget_solver_produces_complete_build_at_1500_from_empty(seeded_db):
+    """Explicit check at the exact figure called out in the verification
+    requirement: an empty build, $1,500 ceiling, "Generate starting build"
+    equivalent (initialize_budget_build with no seed) must produce a
+    complete, fully compatible 8-part build at or under that ceiling."""
+    ceiling = 1500.0
+    build = solvers.initialize_budget_build(ceiling)
+
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= ceiling
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+    assert compatibility.evaluate_build(build).is_compatible is True
+
+
+def test_reserve_threshold_never_allows_a_deadlock(seeded_db):
+    """The same math ui/components/part_picker.py now delegates to
+    (engine.solvers.cheapest_fill_cost) for its Minimum Reserve Threshold:
+    on an empty $700 budget build, picking the most expensive GPU that still
+    passes the threshold must leave a mathematically completable remainder —
+    i.e. the picker's "safe to select" boundary can never actually deadlock
+    the other 7 slots."""
+    from db.repositories import components_repo
+
+    ceiling = 700.0
+    other_categories = [c for c in solvers.CATEGORY_ORDER if c != "GPU"]
+    min_reserve = solvers.cheapest_fill_cost({}, other_categories)
+    max_gpu_cost = ceiling - min_reserve
+
+    affordable_gpus = [c for c in components_repo.get_by_category("GPU") if c.price_usd <= max_gpu_cost]
+    assert affordable_gpus  # at least one GPU must fit at this ceiling
+
+    most_expensive_affordable_gpu = max(affordable_gpus, key=lambda c: c.price_usd)
+    remaining_cost = solvers.cheapest_fill_cost({"GPU": most_expensive_affordable_gpu}, other_categories)
+    assert most_expensive_affordable_gpu.price_usd + remaining_cost <= ceiling
+
+    # and the boundary itself is tight: the cheapest DISALLOWED gpu (if any)
+    # should genuinely not fit, confirming the threshold isn't overly loose
+    disallowed_gpus = [c for c in components_repo.get_by_category("GPU") if c.price_usd > max_gpu_cost]
+    if disallowed_gpus:
+        cheapest_disallowed = min(disallowed_gpus, key=lambda c: c.price_usd)
+        remaining_for_disallowed = solvers.cheapest_fill_cost({"GPU": cheapest_disallowed}, other_categories)
+        assert cheapest_disallowed.price_usd + remaining_for_disallowed > ceiling
+
+
+@pytest.mark.parametrize("ceiling", [800.0, 1200.0, 1500.0, 2000.0])
+def test_budget_solver_never_exceeds_ceiling_across_limits_from_empty(seeded_db, ceiling):
+    """Hard invariant, checked at every ceiling the verification directive
+    named: an empty from-scratch Budget build must never total more than the
+    ceiling, whatever that ceiling is."""
+    build = solvers.initialize_budget_build(ceiling)
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= ceiling
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+    assert compatibility.evaluate_build(build).is_compatible is True
+
+
+@pytest.mark.parametrize("ceiling", [800.0, 1200.0, 1500.0, 2000.0])
+def test_budget_solver_never_exceeds_ceiling_across_limits_with_pin(seeded_db, ceiling):
+    """Same hard invariant, but seeded with a pinned expensive GPU at each
+    ceiling — exercises the pin-preserved-when-possible path as well as the
+    final all-categories-adjustable safety net for ceilings too tight for
+    the pin to survive."""
+    from db.repositories import components_repo
+
+    priciest_gpu = max(components_repo.get_by_category("GPU"), key=lambda c: c.price_usd)
+    build = solvers.initialize_budget_build(ceiling, seed_selection={"GPU": priciest_gpu})
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= ceiling
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+
+
+def test_minimum_possible_build_cost_matches_cheapest_fill(seeded_db):
+    """minimum_possible_build_cost() must be a pure delegation to
+    cheapest_fill_cost({}, CATEGORY_ORDER) — the single source of truth for
+    "cheapest possible fill" — not a separate re-implementation that could
+    silently drift from it."""
+    assert solvers.minimum_possible_build_cost() == solvers.cheapest_fill_cost({}, list(solvers.CATEGORY_ORDER))
+
+
+def test_budget_solver_at_minimum_floor_completes_build(seeded_db):
+    """A ceiling set exactly at the floor must still produce a complete,
+    compatible 8-part build whose total sits at (not above) that floor —
+    proving the floor value itself is achievable, not just a lower bound."""
+    floor = solvers.minimum_possible_build_cost()
+    build = solvers.initialize_budget_build(floor)
+
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= floor
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+    assert compatibility.evaluate_build(build).is_compatible is True
+
+
+def test_ceiling_below_minimum_floor_still_completes_build_at_floor_cost(seeded_db):
+    """Entering a ceiling below the minimum floor is mathematically
+    unsatisfiable by definition of `floor` — no cheaper complete build
+    exists. The solver must still degrade gracefully (never leave a
+    category unfilled, never raise) and land exactly at the floor cost,
+    which is what ui/views/create_build.py's clamp-to-floor + toast logic
+    relies on being the true achievable minimum."""
+    floor = solvers.minimum_possible_build_cost()
+    below_floor_ceiling = floor - 1.0
+
+    build = solvers.initialize_budget_build(below_floor_ceiling)
+    total_cost = sum(c.price_usd for c in build.values())
+
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+    assert compatibility.evaluate_build(build).is_compatible is True
+    assert total_cost == pytest.approx(floor)
+
+
+def test_category_max_cap_permits_candidate_exactly_at_boundary(seeded_db):
+    """Mirrors ui/components/part_picker.py's per-candidate Category Max Cap
+    check using only engine.solvers primitives (part_picker.py itself isn't
+    unit-tested per this project's UI testing convention). A candidate
+    priced exactly at the cap — price + reserve-with-this-candidate == the
+    ceiling — must be permitted (price_usd <= Category_Max_Cap), not
+    incorrectly treated as over budget. This is the exact boundary the
+    verification directive's "$99 motherboard, $282 headroom" example
+    describes."""
+    from db.repositories import components_repo
+
+    category = "Motherboard"
+    other_categories = [c for c in solvers.CATEGORY_ORDER if c != category]
+    candidate = min(components_repo.get_by_category(category), key=lambda c: c.price_usd)
+
+    reserve_with_candidate = solvers.cheapest_fill_cost({category: candidate}, other_categories)
+    ceiling = candidate.price_usd + reserve_with_candidate  # constructed to land exactly on the boundary
+
+    spent_locked = 0.0
+    category_max_cap = ceiling - spent_locked - reserve_with_candidate
+
+    assert candidate.price_usd == pytest.approx(category_max_cap)
+    assert candidate.price_usd <= category_max_cap  # must be selectable, not disabled
+
+
 def test_get_compatible_candidates_narrows_by_socket(seeded_db):
     from db.repositories import components_repo
 

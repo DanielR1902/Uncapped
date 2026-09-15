@@ -38,11 +38,21 @@ def _share_to_community(build) -> None:
     st.rerun()
 
 
+def _delete_build(build) -> None:
+    builds_repo.delete_build(build.id)
+    st.success(f'"{build.name}" deleted.')
+    st.rerun()
+
+
+_DELETE_LABEL = "Delete"
+
+
 def _card_actions(build) -> dict:
     return {
         "Clone": lambda b=build: _clone_into_studio(b),
         "Edit": lambda b=build: _clone_into_studio(b),
         "Share to Community": lambda b=build: _share_to_community(b),
+        _DELETE_LABEL: lambda b=build: _delete_build(b),
     }
 
 
@@ -72,7 +82,7 @@ def render() -> None:
         for group_name, group_builds in grouped.items():
             st.markdown(f"#### {group_name}")
             for build in group_builds:
-                render_build_card(build, actions=_card_actions(build))
+                render_build_card(build, actions=_card_actions(build), confirm_labels=frozenset({_DELETE_LABEL}))
     else:
         sort_label = st.selectbox("Sort by", list(_SORT_LABELS.values()), key="my_builds_sort")
         sort_key = next(key for key, label in _SORT_LABELS.items() if label == sort_label)
@@ -85,4 +95,4 @@ def render() -> None:
         cols = st.columns(3)
         for index, build in enumerate(builds):
             with cols[index % 3]:
-                render_build_card(build, actions=_card_actions(build))
+                render_build_card(build, actions=_card_actions(build), confirm_labels=frozenset({_DELETE_LABEL}))
