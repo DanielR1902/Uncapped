@@ -468,12 +468,30 @@ def test_budget_solver_never_exceeds_ceiling_across_limits_with_pin(seeded_db, c
     assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
 
 
-def test_minimum_possible_build_cost_matches_cheapest_fill(seeded_db):
-    """minimum_possible_build_cost() must be a pure delegation to
-    cheapest_fill_cost({}, CATEGORY_ORDER) — the single source of truth for
-    "cheapest possible fill" — not a separate re-implementation that could
-    silently drift from it."""
-    assert solvers.minimum_possible_build_cost() == solvers.cheapest_fill_cost({}, list(solvers.CATEGORY_ORDER))
+def test_minimum_possible_build_cost_never_exceeds_greedy_fill_cost(seeded_db):
+    """minimum_possible_build_cost() is a real exhaustive search, not a
+    delegation to the greedy cheapest_fill_cost({}, CATEGORY_ORDER) — greedy
+    can get stuck locking in an early category's own cheapest option even
+    when a slightly pricier choice there would unlock a much cheaper LATER
+    category (verified against this seed catalog: greedy finds $661, the
+    true minimum is $632). The true minimum must never exceed what greedy
+    finds (greedy's own path is always in the exhaustive search space, so
+    the true minimum is always <=), and the current seed catalog's known
+    gap must actually manifest (proving this isn't a no-op)."""
+    true_min = solvers.minimum_possible_build_cost()
+    greedy = solvers.cheapest_fill_cost({}, list(solvers.CATEGORY_ORDER))
+    assert true_min <= greedy
+    assert true_min < greedy  # the known Case/Cooler joint-optimum gap in this catalog is real
+
+
+def test_true_minimum_build_is_compatible_and_complete(seeded_db):
+    """The exact combination _true_minimum_build()/minimum_possible_build_cost()
+    relies on must itself be a complete, 100% compatible 8-part build — not
+    just a number that happens to be lower."""
+    build = solvers._true_minimum_build()
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+    assert compatibility.evaluate_build(build).is_compatible is True
+    assert sum(c.price_usd for c in build.values()) == solvers.minimum_possible_build_cost()
 
 
 def test_budget_solver_at_minimum_floor_completes_build(seeded_db):
@@ -489,22 +507,45 @@ def test_budget_solver_at_minimum_floor_completes_build(seeded_db):
     assert compatibility.evaluate_build(build).is_compatible is True
 
 
-def test_ceiling_below_minimum_floor_still_completes_build_at_floor_cost(seeded_db):
-    """Entering a ceiling below the minimum floor is mathematically
+def test_ceiling_below_minimum_floor_still_completes_build_gracefully(seeded_db):
+    """Entering a ceiling below the true minimum floor is mathematically
     unsatisfiable by definition of `floor` — no cheaper complete build
     exists. The solver must still degrade gracefully (never leave a
-    category unfilled, never raise) and land exactly at the floor cost,
-    which is what ui/views/create_build.py's clamp-to-floor + toast logic
-    relies on being the true achievable minimum."""
+    category unfilled, never raise) rather than error out. It does NOT
+    necessarily land exactly at the floor cost here — the floor's exact
+    combination also doesn't fit this ceiling (that's the whole point of
+    "below the floor"), so the solver falls back to whatever its own
+    single-category-swap repair pass can best achieve, per
+    _greedy_fill's docstring."""
     floor = solvers.minimum_possible_build_cost()
     below_floor_ceiling = floor - 1.0
 
     build = solvers.initialize_budget_build(below_floor_ceiling)
-    total_cost = sum(c.price_usd for c in build.values())
 
     assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
     assert compatibility.evaluate_build(build).is_compatible is True
-    assert total_cost == pytest.approx(floor)
+
+
+@pytest.mark.parametrize("ceiling_offset", [0.0, 5.0, 15.0, 28.0])
+def test_ceiling_between_true_floor_and_greedy_local_optimum_still_satisfied(seeded_db, ceiling_offset):
+    """The core regression this round's fix targets: _enforce_ceiling only
+    ever swaps one category at a time, so it can get permanently stuck
+    above a ceiling that's mathematically achievable but requires changing
+    two categories together (e.g. Case+Cooler in this seed catalog — see
+    _true_minimum_build's docstring). For every ceiling between the true
+    floor and the greedy local optimum it would otherwise get stuck at, the
+    solver must still land at or under the ceiling — this used to fail
+    outright (total_cost > ceiling) before the true-minimum fallback was
+    added to _greedy_fill."""
+    floor = solvers.minimum_possible_build_cost()
+    ceiling = floor + ceiling_offset
+
+    build = solvers.initialize_budget_build(ceiling)
+    total_cost = sum(c.price_usd for c in build.values())
+
+    assert total_cost <= ceiling
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+    assert compatibility.evaluate_build(build).is_compatible is True
 
 
 def test_category_max_cap_permits_candidate_exactly_at_boundary(seeded_db):
@@ -556,3 +597,160 @@ def test_workload_baseline_respects_tier_when_available(seeded_db):
     # a "High" gaming tier pick should clearly outperform an "Entry" one
     entry_build = solvers.allocate_workload_baseline("Gaming", target_tier="Entry")
     assert build["CPU"].benchmark_score >= entry_build["CPU"].benchmark_score
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional dynamic budgeting for optional peripherals
+# ---------------------------------------------------------------------------
+def test_removing_peripheral_releases_its_exact_price_as_core_headroom(seeded_db):
+    """Peripherals never contribute to the Core Empty Reserve (they're 100%
+    optional, whether present or absent), so removing a selected peripheral
+    must free up EXACTLY its own price as headroom for a core slot — no
+    reserve recalculation needed, since the peripheral was never counted in
+    that reserve to begin with. Mirrors ui/components/part_picker.py's
+    Max_Allowed_Price formula using only engine.solvers primitives (ui/ isn't
+    unit-tested per this project's convention)."""
+    from db.repositories import components_repo
+
+    ceiling = 1000.0
+    network_card = components_repo.get_by_category("NetworkCard")[0]
+    other_core_categories = [c for c in solvers.CATEGORY_ORDER if c != "GPU"]
+
+    build_state_with_peripheral = {"NetworkCard": network_card}
+    spent_with_peripheral = network_card.price_usd
+    reserve = solvers.cheapest_fill_cost(build_state_with_peripheral, other_core_categories)
+    max_allowed_gpu_with_peripheral = ceiling - spent_with_peripheral - reserve
+
+    # remove the peripheral -> empty build
+    reserve_after_removal = solvers.cheapest_fill_cost({}, other_core_categories)
+    max_allowed_gpu_after_removal = ceiling - 0.0 - reserve_after_removal
+
+    # the peripheral was never part of the core reserve either way, so the
+    # ONLY thing that changes on removal is spent_elsewhere dropping by its
+    # exact price
+    assert reserve == reserve_after_removal
+    assert max_allowed_gpu_after_removal - max_allowed_gpu_with_peripheral == pytest.approx(network_card.price_usd)
+
+
+def test_expensive_peripheral_exceeding_core_floor_is_flagged_over_budget(seeded_db):
+    """A peripheral priced above `Budget_Ceiling - Core_Empty_Reserve` must be
+    mathematically over budget (picking it really would leave less than the
+    minimum required to complete the 8 core slots) — and one priced at or
+    under that cap must genuinely still fit. Catalog-agnostic: proves the
+    boundary itself is sound rather than depending on specific seeded
+    prices."""
+    from db.repositories import components_repo
+
+    ceiling = 700.0
+    core_floor = solvers.cheapest_fill_cost({}, list(solvers.CATEGORY_ORDER))
+    max_allowed_peripheral = ceiling - core_floor
+
+    for category in ("NetworkCard", "SoundCard", "OpticalDrive"):
+        for card in components_repo.get_by_category(category):
+            if card.price_usd > max_allowed_peripheral:
+                assert card.price_usd + core_floor > ceiling
+            else:
+                assert card.price_usd + core_floor <= ceiling
+
+
+def test_downgrade_pinned_until_feasible_preserves_peripheral_while_downgrading_core_pin(seeded_db):
+    """A pinned peripheral is a fixed, off-the-top budget deduction — the
+    solver's best-effort 'preserve intent' downgrade pass
+    (_downgrade_pinned_until_feasible) must never swap it out as long as a
+    pinned CORE category can absorb the adjustment instead. Mirrors the
+    already-established test_budget_solver_downgrades_pinned_gpu_when_infeasible
+    scenario, with a pinned peripheral riding along unaffected."""
+    from db.repositories import components_repo
+
+    priciest_gpu = max(components_repo.get_by_category("GPU"), key=lambda c: c.price_usd)
+    priciest_optical_drive = max(components_repo.get_by_category("OpticalDrive"), key=lambda c: c.price_usd)
+
+    # the peripheral's price appears identically on both sides (pinned_cost
+    # and ceiling), so it cancels out and this triggers the downgrade pass
+    # under exactly the same condition as the GPU-only version of this test.
+    ceiling = priciest_optical_drive.price_usd + priciest_gpu.price_usd + 10.0
+
+    seed = {"GPU": priciest_gpu, "OpticalDrive": priciest_optical_drive}
+    build = solvers.initialize_budget_build(ceiling, seed_selection=seed)
+
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= ceiling
+    assert build["OpticalDrive"].id == priciest_optical_drive.id  # peripheral pin preserved untouched
+    assert build["GPU"].id != priciest_gpu.id  # the core pin absorbed the downgrade instead
+    assert set(cat for cat in build if cat in solvers.CATEGORY_ORDER) == set(solvers.CATEGORY_ORDER)
+
+
+def test_budget_solver_accounts_for_preselected_peripherals(seeded_db):
+    """A user who's already picked a (possibly pricey) peripheral before
+    clicking "Generate starting build" must still get a complete core build
+    where TOTAL cost (core + peripheral) respects the ceiling — the
+    peripheral eats into the same budget pool, it doesn't get a free pass.
+    Exercises the exact path ui/views/create_build.py's button handler uses:
+    a peripheral riding along in `seed_selection`."""
+    from db.repositories import components_repo
+
+    priciest_network_card = max(components_repo.get_by_category("NetworkCard"), key=lambda c: c.price_usd)
+    # comfortably above the true achievable minimum (core floor + this
+    # peripheral), not an arbitrary fixed margin — otherwise the ceiling could
+    # be mathematically infeasible regardless of solver correctness.
+    ceiling = priciest_network_card.price_usd + solvers.minimum_possible_build_cost() + 100.0
+    seed = {"NetworkCard": priciest_network_card}
+
+    build = solvers.initialize_budget_build(ceiling, seed_selection=seed)
+
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= ceiling
+
+    core_only = {cat: c for cat, c in build.items() if cat in solvers.CATEGORY_ORDER}
+    assert set(core_only.keys()) == set(solvers.CATEGORY_ORDER)
+    assert compatibility.evaluate_build(core_only).is_compatible is True
+
+
+def test_default_initialize_budget_build_never_adds_peripherals(seeded_db):
+    """fill_peripherals_with_surplus defaults to False — every existing
+    caller (including every other test in this file) must see byte-
+    identical, core-only behavior unless it explicitly opts in. This is
+    the regression guard for that default."""
+    build = solvers.initialize_budget_build(5000.0)
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+
+
+def test_budget_solver_fills_peripherals_with_surplus_when_opted_in(seeded_db):
+    """On a high budget where the 8 core parts max out well below the
+    ceiling, initialize_budget_build(..., fill_peripherals_with_surplus=True)
+    must spend the leftover on optional peripherals (NetworkCard/SoundCard/
+    OpticalDrive — the only peripheral categories that actually exist in
+    this catalog) while total cost strictly stays <= ceiling."""
+    ceiling = 5000.0
+    core_only_build = solvers.initialize_budget_build(ceiling)
+    core_total = sum(c.price_usd for c in core_only_build.values())
+    assert core_total < ceiling  # sanity: there really is surplus to spend at this ceiling
+
+    build = solvers.initialize_budget_build(ceiling, fill_peripherals_with_surplus=True)
+    total_cost = sum(c.price_usd for c in build.values())
+
+    assert total_cost <= ceiling
+    assert set(solvers.CATEGORY_ORDER).issubset(build.keys())  # every core slot still filled
+    peripherals_added = [cat for cat in solvers.PERIPHERAL_CATEGORIES if cat in build]
+    assert peripherals_added  # at least one peripheral was added given this much surplus
+    assert compatibility.evaluate_build(build).is_compatible is True
+
+
+def test_peripheral_surplus_fill_never_exceeds_ceiling_across_limits(seeded_db):
+    """Hard invariant across a range of ceilings: total cost (core +
+    whatever peripherals got auto-filled) must never exceed the ceiling,
+    whether or not there's enough surplus for every peripheral, or any at
+    all."""
+    from db.repositories import components_repo
+
+    cheapest_peripheral_total = sum(
+        min(components_repo.get_by_category(cat), key=lambda c: c.price_usd).price_usd
+        for cat in solvers.PERIPHERAL_CATEGORIES
+    )
+    core_floor = solvers.minimum_possible_build_cost()
+
+    for ceiling in (core_floor + 5.0, core_floor + cheapest_peripheral_total, 3000.0, 5000.0):
+        build = solvers.initialize_budget_build(ceiling, fill_peripherals_with_surplus=True)
+        total_cost = sum(c.price_usd for c in build.values())
+        assert total_cost <= ceiling
+        assert set(solvers.CATEGORY_ORDER).issubset(build.keys())

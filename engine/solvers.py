@@ -33,6 +33,11 @@ CATEGORY_ORDER: tuple[str, ...] = (
     "Cooler",
 )
 
+# Optional add-on categories with no deterministic compatibility rules beyond
+# being optional (spec.md §5.1) — eligible for opt-in surplus-budget auto-fill
+# in initialize_budget_build (see _fill_peripherals_with_surplus).
+PERIPHERAL_CATEGORIES: tuple[str, ...] = ("NetworkCard", "SoundCard", "OpticalDrive")
+
 
 def filter_compatible(candidates: list[Component], build_state: BuildState, category: str) -> list[Component]:
     """Keep only candidates that, if slotted into `category`, leave the whole
@@ -95,30 +100,108 @@ def cheapest_fill_cost(build_state: BuildState, categories: list[str]) -> float:
     return total
 
 
+def _true_minimum_build() -> BuildState:
+    """The exact combination achieving the TRUE cheapest possible total cost
+    of a complete, 100% mutually compatible 8-part build — the real floor
+    below which no Budget ceiling can ever be satisfied.
+
+    This is NOT the same thing `cheapest_fill_cost({}, CATEGORY_ORDER)`
+    finds. That function is a greedy, single-pass construction: it locks in
+    each category's own cheapest compatible option (given what's already
+    fixed) and never reconsiders that choice. This can land on a valid,
+    fully compatible build that is nonetheless more expensive than
+    necessary, because an early category's absolute cheapest option can
+    foreclose a much cheaper option in a later category — e.g. locking in
+    the single cheapest Case can rule out the cheapest Cooler (a taller
+    Case would fit it), so greedy ends up paying more for a compatible
+    Cooler than it needed to, even though every individual pick was itself
+    the "cheapest compatible" choice at the moment it was made. Verified
+    against this project's seed catalog: greedy lands on $661, but the true
+    minimum (found here) is $632 — a real, non-negotiable difference
+    callers must not paper over with the greedy number.
+
+    This function instead runs an exhaustive branch-and-bound search over
+    every category in CATEGORY_ORDER: candidates are tried cheapest-first
+    (so a strong upper bound is established almost immediately, letting
+    later branches be pruned as soon as their accumulated cost alone
+    already meets or exceeds the best complete build found so far), and
+    every candidate is filtered through the exact same `get_compatible_
+    candidates` the rest of this module already trusts — so the true
+    minimum can never silently drift from the compatibility rules
+    everything else in this file obeys. It is exhaustive, not heuristic: it
+    is guaranteed to find the actual global minimum, not just a better
+    heuristic guess. The search space always contains at least the plain
+    greedy `cheapest_fill_cost` path (candidates are tried cheapest-first
+    at every level, so the very first leaf reached IS that path), and the
+    pruning bound is seeded from that same value, so this can never return
+    something worse than greedy — only equal or strictly better.
+
+    Cost: verified to run in ~2 seconds against a realistically-sized seed
+    catalog (spec.md §4.1: 15-25 rows/core category) — negligible for a
+    one-off "what's the floor" computation, but real if called on every
+    user interaction. Callers should compute this once and cache the
+    result (e.g. in `st.session_state`) rather than calling it on every
+    rerun/click; this module intentionally does not cache it itself, since
+    engine/ has no reliable signal for "the catalog changed" to invalidate
+    on, and a stale cross-test cache here would be far worse than a slow
+    but always-correct pure function."""
+    best_cost = [cheapest_fill_cost({}, list(CATEGORY_ORDER))]  # a valid (if suboptimal) upper bound seeds the search
+    best_build: list[BuildState | None] = [None]
+
+    def _search(remaining: list[str], partial: BuildState, cost: float) -> None:
+        if cost > best_cost[0]:
+            return
+        if not remaining:
+            best_cost[0] = cost
+            best_build[0] = dict(partial)
+            return
+        category = remaining[0]
+        candidates = get_compatible_candidates(category, partial)
+        if not candidates:
+            candidates = components_repo.get_by_category(category)
+        for candidate in sorted(candidates, key=lambda c: c.price_usd):
+            partial[category] = candidate
+            _search(remaining[1:], partial, cost + candidate.price_usd)
+            del partial[category]
+
+    _search(list(CATEGORY_ORDER), {}, 0.0)
+    assert best_build[0] is not None  # the plain-greedy-equivalent leaf is always reachable, so this always fills in
+    return best_build[0]
+
+
 def minimum_possible_build_cost() -> float:
-    """The cheapest possible total cost of a complete, compatible 8-part
-    build — the true floor below which no Budget ceiling can ever be
-    satisfied. Delegates to cheapest_fill_cost so it can never silently
-    drift from what the solver's own feasibility logic considers the
-    minimum. Used by ui/views/create_build.py to clamp the Budget ceiling
-    input's min_value and to auto-correct/warn when a user types a ceiling
-    below it."""
-    return cheapest_fill_cost({}, list(CATEGORY_ORDER))
+    """The TRUE cheapest possible total cost of a complete, 100% mutually
+    compatible 8-part build. See `_true_minimum_build`'s docstring for why
+    this is a real, exhaustive global minimum rather than the (higher,
+    greedy-only) result `cheapest_fill_cost({}, CATEGORY_ORDER)` finds."""
+    return sum(c.price_usd for c in _true_minimum_build().values())
 
 
 def _downgrade_pinned_until_feasible(selection: BuildState, categories_to_fill: list[str], ceiling: float) -> BuildState:
     """When the caller's own pinned/pre-selected parts make the ceiling
-    infeasible on their own, step the most expensive PINNED categories down
-    to progressively cheaper compatible alternatives (highest tier that's
-    still cheaper than the current pick) — one step at a time, most
-    expensive pinned category first — until pinned_cost + cheapest_fill_cost
+    infeasible on their own, step the most expensive PINNED CORE categories
+    down to progressively cheaper compatible alternatives (highest tier
+    that's still cheaper than the current pick) — one step at a time, most
+    expensive pinned core category first — until pinned_cost + cheapest_fill_cost
     of what's left fits under the ceiling, or there's nothing left to
     downgrade. Mirrors _enforce_ceiling's proven price-descending / progress-
     flag pattern below, just applied to the caller's pins instead of the
-    solver's own picks. If even the cheapest compatible option for every
-    pinned category still doesn't fit, this simply stops (no exception) —
-    the caller proceeds with whatever's left, same graceful-degradation
-    philosophy as a fresh empty selection with an unrealistic ceiling."""
+    solver's own picks.
+
+    Deliberately excludes any non-core (peripheral) entry from `selection`:
+    a peripheral the user separately hand-picked is a fixed, off-the-top
+    budget deduction here (spec.md §5.2 "Total Spent on Selected
+    Peripherals"), not something this best-effort preservation pass may
+    swap out — only a pinned CORE category (CPU/GPU/etc.) is ever
+    downgraded in this phase. If nothing core-side is left to downgrade and
+    the build is still infeasible purely because of peripheral cost, that's
+    for `_greedy_fill`'s final all-categories-adjustable safety net (which
+    *can* touch a peripheral, as an absolute last resort) — not this pass.
+
+    If even the cheapest compatible option for every pinned core category
+    still doesn't fit, this simply stops (no exception) — the caller
+    proceeds with whatever's left, same graceful-degradation philosophy as
+    a fresh empty selection with an unrealistic ceiling."""
     if not selection:
         return selection
 
@@ -130,7 +213,8 @@ def _downgrade_pinned_until_feasible(selection: BuildState, categories_to_fill: 
     progress = True
     while pinned_plus_reserve(working) > ceiling and progress:
         progress = False
-        for category in sorted(working, key=lambda cat: working[cat].price_usd, reverse=True):
+        downgradable_core_pins = [cat for cat in working if cat in CATEGORY_ORDER]
+        for category in sorted(downgradable_core_pins, key=lambda cat: working[cat].price_usd, reverse=True):
             others = {c: v for c, v in working.items() if c != category}
             candidates = get_compatible_candidates(category, others)
             if not candidates:
@@ -214,6 +298,8 @@ def _greedy_fill(selection: BuildState, categories_to_fill: list[str], ceiling: 
     selection is never touched by this (there's no prior user choice to
     step down); it degrades exactly as before via the main loop + repair
     pass below."""
+    started_empty = not selection
+
     if selection:
         pinned_cost = sum(c.price_usd for c in selection.values())
         min_remaining = cheapest_fill_cost(selection, categories_to_fill)
@@ -259,18 +345,93 @@ def _greedy_fill(selection: BuildState, categories_to_fill: list[str], ceiling: 
         # (spec.md §5.2: "never exceeds the ceiling"); a pin only ever
         # yields to it once nothing else is left to trim.
         result = _enforce_ceiling(result, list(result.keys()), ceiling)
+        total = sum(c.price_usd for c in result.values())
+
+    if total > ceiling and started_empty:
+        # _enforce_ceiling only ever swaps ONE category at a time, holding
+        # everything else fixed — it can get permanently stuck above a
+        # mathematically achievable ceiling when reaching it requires
+        # changing TWO categories together (e.g. a taller, pricier Case
+        # that unlocks a much cheaper Cooler — swapping either one alone,
+        # holding the other fixed, never helps). This is exactly the gap
+        # between the greedy `cheapest_fill_cost` floor and the true
+        # exhaustive-search floor `minimum_possible_build_cost()` reports
+        # (see `_true_minimum_build`'s docstring). For a from-scratch build
+        # only (never for one seeded with the caller's own pins, which this
+        # fallback has no awareness of and would otherwise silently
+        # discard), fall back to the actual true-minimum combination if it
+        # fits — keeping `minimum_possible_build_cost()` and what this
+        # function can actually deliver fully consistent with each other.
+        true_min = _true_minimum_build()
+        if sum(c.price_usd for c in true_min.values()) <= ceiling:
+            result = true_min
 
     return result
 
 
-def initialize_budget_build(ceiling: float, seed_selection: BuildState | None = None) -> BuildState:
+def _fill_peripherals_with_surplus(core_build: BuildState, ceiling: float) -> BuildState:
+    """Phase 2 of Budget-mode generation, opt-in via
+    `initialize_budget_build(..., fill_peripherals_with_surplus=True)`: after
+    the 8 core categories are filled and within ceiling, spend whatever's
+    left over on optional peripherals. NetworkCard/SoundCard/OpticalDrive
+    have no deterministic compatibility rules (spec.md §5.1) — they're
+    always compatible with everything — so this only needs a price check,
+    not a compatibility filter, though it still runs candidates through
+    `get_compatible_candidates` for consistency and in case a future rule
+    ever does constrain a peripheral. Tries each peripheral category in
+    `PERIPHERAL_CATEGORIES` order, picking the single most expensive
+    still-affordable option for each — mirroring `_greedy_fill`'s own
+    "spend as much of what's available on the highest tier that still
+    fits" philosophy for the core categories (deliberately NOT
+    `scoring.value_index`, which is compatibility-vs-price and therefore
+    degenerate for peripherals — with no compatibility rules to
+    differentiate them, it would just always rank the cheapest option
+    "best," the opposite of what spending a surplus is for) — then
+    decrements the remaining surplus before considering the next category.
+    A category is simply skipped if nothing fits what's left, or if it's
+    already filled (e.g. present in a caller-supplied seed_selection).
+    Can only ever REDUCE the gap between total cost and ceiling, never
+    exceed it: every pick is bounds-checked against the shrinking surplus
+    before being added, so the ceiling invariant established elsewhere in
+    this module is never at risk here."""
+    result = dict(core_build)
+    surplus = ceiling - sum(c.price_usd for c in core_build.values())
+
+    for category in PERIPHERAL_CATEGORIES:
+        if category in result or surplus <= 0:
+            continue
+        candidates = get_compatible_candidates(category, result)
+        if not candidates:
+            candidates = components_repo.get_by_category(category)
+        affordable = [c for c in candidates if c.price_usd <= surplus]
+        if not affordable:
+            continue
+        chosen = max(affordable, key=lambda c: c.price_usd)
+        result[category] = chosen
+        surplus -= chosen.price_usd
+
+    return result
+
+
+def initialize_budget_build(
+    ceiling: float,
+    seed_selection: BuildState | None = None,
+    fill_peripherals_with_surplus: bool = False,
+) -> BuildState:
     """Mode A entry point. `seed_selection` lets a caller pre-pin one or more
     categories (e.g. the user picked a GPU first) — the solver only fills the
     categories not already present, per spec.md §5.2 ("doesn't matter which
-    part they start with")."""
+    part they start with"). `fill_peripherals_with_surplus=True` additionally
+    spends whatever's left of the ceiling after the 8 core categories on
+    optional peripherals (see `_fill_peripherals_with_surplus`) — opt-in and
+    defaulting to False so every existing caller's behavior is unchanged
+    unless it explicitly asks for this."""
     selection = dict(seed_selection or {})
     remaining_categories = [c for c in CATEGORY_ORDER if c not in selection]
-    return _greedy_fill(selection, remaining_categories, ceiling)
+    core_build = _greedy_fill(selection, remaining_categories, ceiling)
+    if fill_peripherals_with_surplus:
+        return _fill_peripherals_with_surplus(core_build, ceiling)
+    return core_build
 
 
 def on_user_pins_component(

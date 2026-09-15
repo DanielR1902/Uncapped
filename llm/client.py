@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
 
 import httpx
@@ -60,6 +61,8 @@ def _call_openrouter(request: BuildAnalysisRequest) -> dict[str, Any]:
             headers={
                 "Authorization": f"Bearer {_api_key()}",
                 "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8501",
+                "X-Title": "Uncapped Studio",
             },
             json={
                 "model": _model(),
@@ -73,8 +76,10 @@ def _call_openrouter(request: BuildAnalysisRequest) -> dict[str, Any]:
         raise LLMUnavailableError(f"OpenRouter request failed: {exc}") from exc
 
     if response.status_code == 429:
+        print(f"OpenRouter rate-limited the request: {response.text}", file=sys.stderr)
         raise LLMUnavailableError("OpenRouter rate-limited the request")
     if response.status_code >= 400:
+        print(f"OpenRouter returned HTTP {response.status_code}: {response.text}", file=sys.stderr)
         raise LLMUnavailableError(f"OpenRouter returned HTTP {response.status_code}")
 
     try:

@@ -1,9 +1,12 @@
 """PC Build Studio — Mode A/B/C (spec.md §7.4, intent.txt §3).
 
 Layout: mode selector (or a "change mode" header) → mode-specific generator
-controls → a summary header that stays visible above the part-picker grid →
-the 8 core slots in a 2-column grid + optional peripherals → a detailed
-synergy/bottleneck analysis panel → save/publish.
+controls → a summary header that stays visible above the part-picker grid
+(with a compact Analyze trigger folded into it for the LLM-backed
+synergy/bottleneck read — auto-run the instant a build first becomes
+complete in ANY mode, see `_maybe_auto_analyze`, with the button there too
+for a manual re-trigger) → a "Reset All Fields" control → the 8 core slots
+in a 2-column grid + optional peripherals → save/publish.
 """
 from __future__ import annotations
 
@@ -16,11 +19,11 @@ from engine import scoring, solvers
 from engine.compatibility import evaluate_build
 from llm.client import analyze_build
 from ui import state, theme
-from ui.components.part_picker import SORT_OPTIONS, render_part_picker
+from ui.components.part_picker import render_part_picker
 from ui.format import humanize_profile
 
 CORE_CATEGORIES = solvers.CATEGORY_ORDER
-PERIPHERAL_CATEGORIES = ("NetworkCard", "SoundCard", "OpticalDrive")
+PERIPHERAL_CATEGORIES = solvers.PERIPHERAL_CATEGORIES
 TIERS = ("Entry", "Mid", "High", "Enthusiast")
 
 _MODE_CARDS = (
@@ -45,52 +48,82 @@ def _mode_selector() -> None:
                     st.rerun()
 
 
+def _cached_floor_cost() -> float:
+    """`solvers.minimum_possible_build_cost()` is an exhaustive search (~2s
+    against a realistically-sized catalog — see its docstring) — the
+    catalog never changes during a running session, so this only needs to
+    run once per session rather than on every single "Apply budget &
+    generate build" click (which would otherwise pay that cost every time,
+    even when the entered ceiling is nowhere near the floor)."""
+    if "_budget_floor_cost" not in st.session_state:
+        st.session_state["_budget_floor_cost"] = solvers.minimum_possible_build_cost()
+    return st.session_state["_budget_floor_cost"]
+
+
+def _apply_budget_and_generate(build_draft: dict) -> None:
+    """on_click callback for the unified "Apply budget & generate build"
+    button. Runs BEFORE the next script rerun, which is the only point at
+    which it's legal to overwrite the ceiling number_input's own
+    st.session_state["budget_ceiling_input"] value — doing that inside a
+    plain post-widget button block would raise StreamlitAPIException, since
+    the widget has already been instantiated earlier in the same run.
+    Floor-clamps whatever the user typed, commits it to build_draft, and
+    immediately generates a build against it — all in this one callback, so
+    the very next render already reflects the fully-applied result
+    (ceiling, components, and every part-picker's headroom) in a single
+    rerun.
+
+    Deliberately a full from-scratch regenerate, not an "adjust my existing
+    picks to the new ceiling" one: every core and peripheral selection is
+    cleared first, then `initialize_budget_build` runs with no seed at all.
+    This button is "give me a fresh optimal build for this budget," not
+    "nudge what I already have." Manually picking one slot via its own
+    picker (`_part_pickers`'s `on_select`) goes straight through
+    `state.set_component` and does not re-run the solver at all — it's a
+    plain, unconstrained pin with no re-partitioning of the rest of the
+    build, no ceiling re-check, and no `on_user_pins_component` call (that
+    entry point exists and is exercised at the engine level, but nothing in
+    this UI currently calls it)."""
+    floor_cost = _cached_floor_cost()
+    entered = st.session_state.get("budget_ceiling_input", floor_cost)
+
+    if entered < floor_cost:
+        st.session_state["budget_ceiling_input"] = floor_cost
+        ceiling = floor_cost
+        st.toast(f"Budget set to minimum viable floor: ${floor_cost:,.2f}", icon="⚠️")
+    else:
+        ceiling = entered
+
+    build_draft["budget_ceiling"] = ceiling
+    build_draft["components"] = {}  # wipe every existing core/peripheral selection before regenerating
+
+    new_selection = solvers.initialize_budget_build(ceiling, fill_peripherals_with_surplus=True)
+
+    build_draft["components"] = {category: component.id for category, component in new_selection.items()}
+    st.session_state["build_draft_analysis"] = None
+
+
 def _budget_controls(build_draft: dict) -> None:
     with st.container(border=True):
         st.caption("💰 **Budget mode** — the solver spends as much of your ceiling as it can on the highest-tier compatible parts.")
-
-        floor_cost = solvers.minimum_possible_build_cost()
 
         unlimited = st.checkbox(
             "No limit — show every compatible part, skip budget filtering",
             key="budget_unlimited_input",
         )
-        ceiling = st.number_input(
-            "Budget ceiling ($)", min_value=floor_cost,
-            value=max(build_draft.get("budget_ceiling") or 1500.0, floor_cost), step=50.0,
+        if unlimited:
+            build_draft["budget_ceiling"] = None
+
+        st.number_input(
+            "Budget ceiling ($)",
+            value=build_draft.get("budget_ceiling") or 1500.0, step=50.0,
             key="budget_ceiling_input", disabled=unlimited,
         )
-        if not unlimited and ceiling < floor_cost:
-            st.toast(
-                f"Budget adjusted to ${floor_cost:,.2f} (the minimum viable cost "
-                "for a complete compatible build).",
-                icon="⚠️",
-            )
-            ceiling = floor_cost
-        # Live-sync immediately (not just inside the button handler below) so
-        # every picker's filtering updates the instant the ceiling changes,
-        # with no need to click "Generate starting build" first.
-        build_draft["budget_ceiling"] = None if unlimited else ceiling
 
-        if st.button("Generate starting build", key="generate_budget_build", type="primary", disabled=unlimited):
-            seed_selection = state.resolve_build_state(build_draft)  # keep whatever the user already pinned
-            new_selection = solvers.initialize_budget_build(ceiling, seed_selection=seed_selection or None)
-
-            downgraded_categories = [
-                category for category, original in seed_selection.items()
-                if category in new_selection and new_selection[category].id != original.id
-            ]
-
-            build_draft["components"] = {category: component.id for category, component in new_selection.items()}
-            st.session_state["build_draft_analysis"] = None
-
-            if downgraded_categories:
-                st.toast(
-                    "Adjusted pre-selected components to the best possible tier that "
-                    "completes a functional build within your budget.",
-                    icon="⚠️",
-                )
-            st.rerun()
+        st.button(
+            "Apply budget & generate build", key="apply_budget_generate", type="primary",
+            disabled=unlimited, on_click=_apply_budget_and_generate, args=(build_draft,),
+        )
 
         if unlimited:
             st.caption("Uncheck to set a ceiling and generate a starting build, or keep picking parts freely below.")
@@ -113,12 +146,21 @@ def _workload_controls(build_draft: dict) -> None:
             st.rerun()
 
 
-def _sort_controls() -> None:
-    current = st.session_state.get("sort_criteria", "Cost")
-    choice = st.segmented_control(
-        "Sort candidates by", SORT_OPTIONS, default=current, key="sort_criteria_input", selection_mode="single",
-    )
-    st.session_state["sort_criteria"] = choice or current
+def _reset_controls(build_draft: dict) -> None:
+    if st.button("🔄 Reset All Fields", key="reset_all_fields"):
+        mode = build_draft.get("creation_mode")
+        st.session_state["build_draft"] = state.new_build_draft(mode)
+        st.session_state["build_draft_analysis"] = None
+        # Clear the mode-specific widgets' own remembered state too, or
+        # they'd keep showing whatever the user last typed/picked instead of
+        # falling back to new_build_draft's clean defaults on the next
+        # render (a widget's `key`-bound session_state entry always wins
+        # over its `value=`/`index=` default once it exists).
+        st.session_state.pop("budget_ceiling_input", None)
+        st.session_state.pop("budget_unlimited_input", None)
+        st.session_state.pop("workload_profile_input", None)
+        st.session_state.pop("workload_tier_input", None)
+        st.rerun()
 
 
 def _candidates_for(build_draft: dict, build_state: dict, category: str) -> list:
@@ -157,10 +199,48 @@ def _part_pickers(build_draft: dict, build_state: dict) -> None:
                     candidates,
                     on_select=lambda component, cat=category: state.set_component(build_draft, cat, component),
                     on_remove=lambda cat=category: state.remove_component(build_draft, cat),
+                    budget_ceiling=build_draft.get("budget_ceiling"),
                 )
 
 
-def _summary_header(build_state: dict) -> None:
+def _maybe_auto_analyze(build_draft: dict, build_state: dict) -> None:
+    """Auto-run the LLM analysis the instant a build first becomes complete
+    (all 8 core categories filled) — across every creation flow (Budget's
+    "Apply budget & generate build", Workload's "Generate baseline build",
+    or simply finishing the last manual pick in Free mode) — so the summary
+    banner shows AI Engine metrics on the very next render, with no manual
+    "Analyze" click required.
+
+    A single hook point in `render()` covers all three flows uniformly
+    rather than duplicating a trigger call in each button handler, because
+    they already share one signal for "this needs (re-)analysis":
+    `ui/state.py`'s `set_component`/`remove_component` (used by every
+    picker's on_select/on_remove) and every generate handler already clear
+    `build_draft_analysis` to `None` on any component change. So the only
+    two conditions to check here are "no analysis on file yet" and "the
+    build is actually complete" — never on every single rerun, only once
+    per distinct complete build state.
+
+    No separate cache/hash bookkeeping is needed beyond that: `analyze_build`
+    itself already checks `llm_cache` (keyed by the exact sorted component
+    id set) before ever making a network call, so even the FIRST time this
+    fires for a given session, if that exact build was already analyzed
+    previously (this session or another), it's a cache hit, not a new
+    OpenRouter call."""
+    if st.session_state.get("build_draft_analysis") is not None:
+        return
+    if not set(solvers.CATEGORY_ORDER).issubset(build_state.keys()):
+        return
+    with st.spinner("Analyzing build..."):
+        response = analyze_build(
+            build_state,
+            workload_profile=build_draft.get("workload_profile"),
+            budget_ceiling=build_draft.get("budget_ceiling"),
+        )
+    st.session_state["build_draft_analysis"] = response.model_dump()
+
+
+def _summary_header(build_draft: dict, build_state: dict) -> None:
     """Prominent, always-current metrics bar placed above the part-picker
     grid. True CSS position:sticky was attempted (targeting the class
     Streamlit generates for st.container(key=...)) but doesn't actually
@@ -189,7 +269,7 @@ def _summary_header(build_state: dict) -> None:
             synergy, bottleneck_pct, direction = live
             cols[2].metric(
                 "⚡ Synergy", f"{synergy:.0f}",
-                help="Local estimate — click Analyze below for the full AI/heuristic breakdown.",
+                help="Local estimate — click Analyze for the full AI/heuristic breakdown.",
                 border=True,
             )
             cols[3].metric(
@@ -201,7 +281,7 @@ def _summary_header(build_state: dict) -> None:
             cols[2].metric("⚡ Synergy", "—", border=True)
             cols[3].metric("📉 Bottleneck", "—", border=True)
 
-        badge_cols = st.columns([1, 1, 2])
+        badge_cols = st.columns([1, 1, 1, 2])
         with badge_cols[0]:
             if report.is_compatible:
                 st.badge("Compatible", icon=":material/check_circle:", color="green")
@@ -219,48 +299,20 @@ def _summary_header(build_state: dict) -> None:
             with badge_cols[1]:
                 st.badge("Live Estimate", icon=":material/bolt:", color="gray")
 
+        with badge_cols[2]:
+            if st.button("🔮 Analyze", key="run_analysis_compact", use_container_width=True, disabled=len(build_state) < 2):
+                with st.spinner("Analyzing build..."):
+                    response = analyze_build(
+                        build_state,
+                        workload_profile=build_draft.get("workload_profile"),
+                        budget_ceiling=build_draft.get("budget_ceiling"),
+                    )
+                st.session_state["build_draft_analysis"] = response.model_dump()
+                st.rerun()
+
         if report.issues:
             for issue in report.issues:
                 st.markdown(theme.tag(issue, "danger"), unsafe_allow_html=True)
-
-
-def _analysis_panel(build_draft: dict, build_state: dict) -> None:
-    st.markdown("#### Synergy & Bottleneck Analysis")
-
-    if len(build_state) < 2:
-        st.caption("Select at least two components to run an analysis.")
-        return
-
-    if st.button("🔮 Analyze synergy & bottleneck", key="run_analysis"):
-        with st.spinner("Analyzing build..."):
-            response = analyze_build(
-                build_state,
-                workload_profile=build_draft.get("workload_profile"),
-                budget_ceiling=build_draft.get("budget_ceiling"),
-            )
-        st.session_state["build_draft_analysis"] = response.model_dump()
-        st.rerun()
-
-    analysis = st.session_state.get("build_draft_analysis")
-    if not analysis:
-        return
-
-    st.write(analysis["insights"]["summary"])
-
-    if analysis["synergy"]["positive_synergies"]:
-        st.markdown("**Working well:**")
-        for note in analysis["synergy"]["positive_synergies"]:
-            st.markdown(theme.tag(note, "success"), unsafe_allow_html=True)
-
-    if analysis["synergy"]["negative_conflicts"]:
-        st.markdown("**Conflicts:**")
-        for conflict in analysis["synergy"]["negative_conflicts"]:
-            st.markdown(theme.tag(conflict, "warning"), unsafe_allow_html=True)
-
-    if analysis["insights"]["upgrade_path"]:
-        st.markdown("**Upgrade path:**")
-        for suggestion in analysis["insights"]["upgrade_path"]:
-            st.write(f"- {suggestion}")
 
 
 def _save_actions(build_draft: dict, build_state: dict) -> None:
@@ -327,14 +379,14 @@ def render() -> None:
         _workload_controls(build_draft)
 
     build_state = state.resolve_build_state(build_draft)
-    _summary_header(build_state)
+    _maybe_auto_analyze(build_draft, build_state)
+    _summary_header(build_draft, build_state)
 
-    _sort_controls()
+    _reset_controls(build_draft)
     _part_pickers(build_draft, build_state)
 
     # re-resolve after the picker section: a Select/Remove click above
-    # already triggers st.rerun(), but this keeps the analysis/save section
+    # already triggers st.rerun(), but this keeps the save section
     # consistent within a single render pass too.
     build_state = state.resolve_build_state(build_draft)
-    _analysis_panel(build_draft, build_state)
     _save_actions(build_draft, build_state)

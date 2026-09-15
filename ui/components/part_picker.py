@@ -125,7 +125,7 @@ def render_part_picker(
         spent_elsewhere = sum(c.price_usd for cat, c in build_state.items() if cat != category)
 
     with st.container(border=True):
-        header_cols = st.columns([3, 2])
+        header_cols = st.columns([3, 1.6, 0.6])
         with header_cols[0]:
             st.markdown(f"{icon} **{category}**")
             if current is not None:
@@ -178,8 +178,8 @@ def render_part_picker(
                                 if over_budget:
                                     st.caption(f"${candidate.price_usd - max_slot_cost:,.2f} over budget")
 
-                if current is not None and on_remove is not None:
-                    st.divider()
-                    if st.button(f"Remove {category}", key=f"remove_{category}", use_container_width=True):
-                        on_remove()
-                        st.rerun()
+        with header_cols[2]:
+            if current is not None and on_remove is not None:
+                if st.button("✕", key=f"clear_{category}", help=f"Clear {category}", use_container_width=True):
+                    on_remove()
+                    st.rerun()
