@@ -599,6 +599,50 @@ def test_workload_baseline_respects_tier_when_available(seeded_db):
     assert build["CPU"].benchmark_score >= entry_build["CPU"].benchmark_score
 
 
+@pytest.mark.parametrize("profile", ["General", "Gaming", "VideoEditing", "Design", "Programming"])
+def test_workload_tier_costs_are_strictly_monotonic(seeded_db, profile):
+    """The core regression this guards against: a tier's own median-priced
+    per-category picks (from workload_mappings' curated tier tags) could
+    sum to no more — or even less — than a cheaper tier's, since those tags
+    are a per-component "fits this workload at this tier" judgment call,
+    not a strict price partition. Verified empirically before the fix: 4 of
+    5 profiles violated this. Every profile must now satisfy
+    Cost(Entry) < Cost(Mid) < Cost(High) < Cost(Enthusiast), strictly."""
+    costs = {}
+    for tier in solvers.WORKLOAD_TIERS:
+        build = solvers.allocate_workload_baseline(profile, target_tier=tier)
+        costs[tier] = sum(c.price_usd for c in build.values())
+        assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+        assert compatibility.evaluate_build(build).is_compatible is True
+
+    assert costs["Entry"] < costs["Mid"] < costs["High"] < costs["Enthusiast"]
+
+
+@pytest.mark.parametrize("profile", ["General", "Gaming", "VideoEditing", "Design", "Programming"])
+def test_workload_tier_costs_stay_monotonic_with_peripherals(seeded_db, profile):
+    """Same invariant, with include_peripherals=True (the flag "Generate
+    baseline build" now always passes) — peripheral cost is folded into
+    each tier's total from the start (see _build_workload_tier), so the
+    ordering guarantee must hold with them included too, not just for the
+    8 core categories alone."""
+    costs = {}
+    for tier in solvers.WORKLOAD_TIERS:
+        build = solvers.allocate_workload_baseline(profile, target_tier=tier, include_peripherals=True)
+        costs[tier] = sum(c.price_usd for c in build.values())
+        assert set(solvers.CATEGORY_ORDER).issubset(build.keys())
+        assert compatibility.evaluate_build(build).is_compatible is True
+
+    assert costs["Entry"] < costs["Mid"] < costs["High"] < costs["Enthusiast"]
+
+
+def test_workload_baseline_default_excludes_peripherals(seeded_db):
+    """include_peripherals defaults to False — every existing caller
+    (including every other workload test in this file) must see
+    byte-identical, core-only behavior unless it explicitly opts in."""
+    build = solvers.allocate_workload_baseline("Gaming", target_tier="Mid")
+    assert set(build.keys()) == set(solvers.CATEGORY_ORDER)
+
+
 # ---------------------------------------------------------------------------
 # Bidirectional dynamic budgeting for optional peripherals
 # ---------------------------------------------------------------------------

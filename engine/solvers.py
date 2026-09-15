@@ -449,6 +449,7 @@ def on_user_pins_component(
 
 
 DEFAULT_WORKLOAD_TIER = "Mid"
+WORKLOAD_TIERS: tuple[str, ...] = ("Entry", "Mid", "High", "Enthusiast")
 
 
 def _median_by_price(candidates: list[Component]) -> Component:
@@ -456,29 +457,197 @@ def _median_by_price(candidates: list[Component]) -> Component:
     return ordered[len(ordered) // 2]
 
 
-def allocate_workload_baseline(profile: str, target_tier: str = DEFAULT_WORKLOAD_TIER) -> BuildState:
+def _workload_tier_category_candidates(
+    tier_matches: list[tuple[Component, object]],
+    profile_matches: list[tuple[Component, object]],
+    category: str,
+    selection: BuildState,
+) -> list[Component]:
+    """Compatible candidates for one category at one workload tier, degrading
+    tier-tagged -> any-tier-for-this-profile -> plain compatibility, exactly
+    as `allocate_workload_baseline` always has — factored out so both the
+    normal per-category loop and the cross-tier escalation repair pass
+    (`_escalate_workload_tier_above_floor`) share one source of truth for
+    "what's a legal pick here" rather than risking two slightly different
+    definitions drifting apart.
+
+    Takes already-fetched `tier_matches`/`profile_matches` rather than
+    querying `components_repo.get_workload_matches` itself — those results
+    depend only on (profile, tier), never on `category` or `selection`, so
+    the caller fetches each exactly once per tier and reuses it across every
+    category and every escalation attempt, instead of re-querying the DB
+    per category per pool-widening pass (a real, measured slowdown once
+    `allocate_workload_baseline` started computing all 4 tiers per call)."""
+    candidates = [component for component, mapping in tier_matches if component.category == category]
+    candidates = filter_compatible(candidates, selection, category)
+    if candidates:
+        return candidates
+
+    candidates = [component for component, mapping in profile_matches if component.category == category]
+    candidates = filter_compatible(candidates, selection, category)
+    if candidates:
+        return candidates
+
+    return get_compatible_candidates(category, selection)
+
+
+def _build_workload_tier(
+    tier_matches: list[tuple[Component, object]],
+    profile_matches: list[tuple[Component, object]],
+    include_peripherals: bool = False,
+) -> BuildState:
+    """One tier's baseline, in isolation — the median-priced (per spec.md
+    §5.6) compatible pick for each category, degrading exactly as
+    `_workload_tier_category_candidates` describes. This alone does NOT
+    guarantee cross-tier price ordering (see `allocate_workload_baseline`'s
+    docstring for why not); `_escalate_workload_tier_above_floor` is what
+    repairs that, applied by the caller after this returns.
+
+    `include_peripherals=True` additionally picks a median-priced compatible
+    option for each of `PERIPHERAL_CATEGORIES` the same way — `_
+    workload_tier_category_candidates` already degrades to plain
+    `get_compatible_candidates` for any category with no workload_mappings
+    tag at all, which peripherals frequently don't have per profile, so this
+    never leaves a peripheral slot silently unfilled just because it wasn't
+    curated for this specific profile/tier. Folded into THIS function
+    (contributing to the tier's total from the start) rather than applied
+    as a separate post-processing step, so `allocate_workload_baseline`'s
+    cross-tier escalation repair sees peripheral cost too and the price
+    invariant it guarantees still holds with peripherals included, not just
+    for the 8 core categories."""
+    selection: BuildState = {}
+    categories = CATEGORY_ORDER + PERIPHERAL_CATEGORIES if include_peripherals else CATEGORY_ORDER
+    for category in categories:
+        candidates = _workload_tier_category_candidates(tier_matches, profile_matches, category, selection)
+        if not candidates:
+            continue
+        selection[category] = _median_by_price(candidates)
+    return selection
+
+
+def _escalate_workload_tier_above_floor(
+    selection: BuildState,
+    floor: float,
+    tier_matches: list[tuple[Component, object]],
+    profile_matches: list[tuple[Component, object]],
+) -> BuildState:
+    """Push `selection`'s total strictly above `floor` by swapping categories
+    to progressively pricier compatible options — cheapest category first, so
+    the adjustment stays as proportionate as possible. Used to repair the
+    case `allocate_workload_baseline` exists to guard against: a tier's own
+    median-per-category picks summing to no more than the previous
+    (supposedly cheaper) tier's total, because `workload_mappings`' tier
+    tags are a curated "fits this workload at this tier" judgment call per
+    component, not a price partition — nothing stops two adjacent tiers'
+    tagged sets from overlapping or even inverting in aggregate for a given
+    profile.
+
+    Tries this tier's own tagged pool first (preserves "this part suits
+    this tier" as much as possible), and only widens to any-tier-for-this-
+    profile, then the full compatible catalog, if the tier's own pool runs
+    out of upgrade headroom before clearing the floor — verified necessary
+    against this project's seed data: some profiles' Entry baseline is
+    pricier than Mid's own tagged pool has room to catch up to, e.g. one
+    category's Entry-tagged option costs unusually more than anything
+    tagged Mid for that same category. Stops gracefully (same philosophy as
+    the rest of this module) if even the full catalog has no further
+    upgrade anywhere, rather than raising — the caller proceeds with
+    whatever this reaches, same graceful-degradation precedent as
+    `_greedy_fill` and friends.
+
+    `tier_matches`/`profile_matches` are pre-fetched by the caller (see
+    `_workload_tier_category_candidates`'s docstring for why) — this
+    function never queries the DB itself."""
+    result = dict(selection)
+    total = sum(c.price_usd for c in result.values())
+
+    def pool_for(pool_index: int, category: str, working: BuildState) -> list[Component]:
+        if pool_index == 0:
+            return filter_compatible([c for c, m in tier_matches if c.category == category], working, category)
+        if pool_index == 1:
+            return filter_compatible([c for c, m in profile_matches if c.category == category], working, category)
+        return get_compatible_candidates(category, working)
+
+    for pool_index in range(3):
+        progress = True
+        while total <= floor and progress:
+            progress = False
+            for category in sorted(result, key=lambda cat: result[cat].price_usd):
+                others = {c: v for c, v in result.items() if c != category}
+                candidates = pool_for(pool_index, category, others)
+                pricier = [c for c in candidates if c.price_usd > result[category].price_usd]
+                if not pricier:
+                    continue
+                result[category] = min(pricier, key=lambda c: c.price_usd)  # smallest upgrade that still helps
+                total = sum(c.price_usd for c in result.values())
+                progress = True
+                if total > floor:
+                    break
+        if total > floor:
+            break
+
+    return result
+
+
+def allocate_workload_baseline(
+    profile: str,
+    target_tier: str = DEFAULT_WORKLOAD_TIER,
+    include_peripherals: bool = False,
+) -> BuildState:
     """Mode B entry point (spec.md §5.6). Picks a representative (median-priced)
     component per category from workload_mappings rows tagged for `profile` at
     `target_tier`, degrading to any tier for the profile, then to plain
-    compatibility, rather than leaving a category empty."""
-    selection: BuildState = {}
-    tier_matches = components_repo.get_workload_matches(profile, target_tier)
-    all_profile_matches = components_repo.get_workload_matches(profile)
+    compatibility, rather than leaving a category empty.
 
-    for category in CATEGORY_ORDER:
-        candidates = [component for component, mapping in tier_matches if component.category == category]
-        candidates = filter_compatible(candidates, selection, category)
+    Internally computes ALL FOUR tiers in Entry -> Mid -> High -> Enthusiast
+    order on every call (regardless of which single tier was requested) and
+    only returns the requested one, because the cross-tier price invariant
+    this function guarantees — Cost(Entry) < Cost(Mid) < Cost(High) <
+    Cost(Enthusiast), for every profile — cannot be checked or repaired
+    looking at one tier alone; each tier's total must be verified against
+    the tier before it. A tier's own naive per-category median picks can
+    otherwise sum to no more (or even less) than a cheaper tier's, because
+    `workload_mappings` tier tags are a curated per-component judgment call,
+    not a strict price partition (verified empirically against this
+    project's seed data before this fix: 4 of 5 profiles violated strict
+    ordering). When that happens, `_escalate_workload_tier_above_floor`
+    repairs it by swapping the affected tier's cheapest-relative-to-itself
+    categories up to pricier options from that SAME tier's own candidate
+    pool until its total clears the previous tier's — preserving each
+    tier's own curated part pool as much as possible, never borrowing
+    another tier's pool to do it.
 
-        if not candidates:
-            candidates = [component for component, mapping in all_profile_matches if component.category == category]
-            candidates = filter_compatible(candidates, selection, category)
+    `include_peripherals=True` additionally fills `PERIPHERAL_CATEGORIES`
+    per tier (see `_build_workload_tier`) — opt-in and defaulting to False,
+    mirroring `initialize_budget_build`'s `fill_peripherals_with_surplus`
+    flag, so every existing caller (the ~6 workload tests included) keeps
+    its exact prior core-only behavior unless it explicitly asks for this.
+    Peripherals are included in the tier's total from the start, so the
+    price-ordering guarantee above holds with them, not just for the 8 core
+    categories alone.
 
-        if not candidates:
-            candidates = get_compatible_candidates(category, selection)
+    Fetches `get_workload_matches(profile)` (no tier filter) exactly once
+    here and `get_workload_matches(profile, tier)` exactly once per tier —
+    both independent of `category`, so every helper below reuses these
+    same lists across all categories and all escalation attempts instead
+    of re-querying the DB each time."""
+    profile_matches = components_repo.get_workload_matches(profile)
 
-        if not candidates:
-            continue
+    floor_total = -1.0
+    result: BuildState | None = None
 
-        selection[category] = _median_by_price(candidates)
+    for tier in WORKLOAD_TIERS:
+        tier_matches = components_repo.get_workload_matches(profile, tier)
+        selection = _build_workload_tier(tier_matches, profile_matches, include_peripherals=include_peripherals)
+        total = sum(c.price_usd for c in selection.values())
 
-    return selection
+        if floor_total >= 0 and total <= floor_total:
+            selection = _escalate_workload_tier_above_floor(selection, floor_total, tier_matches, profile_matches)
+            total = sum(c.price_usd for c in selection.values())
+
+        floor_total = total
+        if tier == target_tier:
+            result = selection
+
+    assert result is not None  # target_tier is always one of WORKLOAD_TIERS
+    return result

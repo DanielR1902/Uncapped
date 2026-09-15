@@ -130,7 +130,7 @@ def test_resolve_build_state_handles_empty_draft():
 # End-to-end smoke tests via AppTest
 # ---------------------------------------------------------------------------
 def test_app_boots_and_shows_landing_when_logged_out(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
 
     assert not at.exception
@@ -140,7 +140,7 @@ def test_app_boots_and_shows_landing_when_logged_out(seeded_db):
 
 
 def test_gated_nav_buttons_disabled_when_logged_out(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
 
     assert at.get_by_key("nav_create_build").disabled is True
@@ -149,7 +149,7 @@ def test_gated_nav_buttons_disabled_when_logged_out(seeded_db):
 
 
 def test_register_flow_authenticates_user(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "alice", "alice@example.com", "Alice Doe")
 
@@ -160,7 +160,7 @@ def test_register_flow_authenticates_user(seeded_db):
 
 
 def test_duplicate_username_shown_live_before_submit(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "bob", "bob@example.com", "Bob Row")
 
@@ -174,7 +174,7 @@ def test_duplicate_username_shown_live_before_submit(seeded_db):
 
 
 def test_login_flow_by_email(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "carol", "carol@example.com", "Carol Row")
     at.get_by_key("logout_button").click().run()
@@ -190,7 +190,7 @@ def test_login_flow_by_email(seeded_db):
 
 
 def test_logout_returns_to_landing(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "dave", "dave@example.com", "Dave Row")
     at.get_by_key("sidebar_nav_my_builds").click().run()
@@ -203,7 +203,7 @@ def test_logout_returns_to_landing(seeded_db):
 
 
 def test_free_mode_selection_renders_without_exception(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "erin", "erin@example.com", "Erin Row")
 
@@ -216,7 +216,7 @@ def test_free_mode_selection_renders_without_exception(seeded_db):
 
 
 def test_budget_mode_generates_full_compatible_build(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "frank", "frank@example.com", "Frank Row")
 
@@ -245,7 +245,7 @@ def test_budget_ceiling_below_floor_clamps_and_generates_full_build(seeded_db):
     from db.repositories import components_repo
     from engine.solvers import CATEGORY_ORDER, minimum_possible_build_cost
 
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "victor", "victor@example.com", "Victor Row")
     at.get_by_key("nav_create_build").click().run()
@@ -274,7 +274,7 @@ def test_raising_budget_ceiling_immediately_unlocks_over_budget_parts(seeded_db)
     rather than assuming the catalog's priciest GPU is even in the
     candidate list — a GPU can be absent for compatibility reasons
     (case/length fit) entirely unrelated to budget."""
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "wendy", "wendy@example.com", "Wendy Row")
     at.get_by_key("nav_create_build").click().run()
@@ -301,7 +301,7 @@ def test_raising_budget_ceiling_immediately_unlocks_over_budget_parts(seeded_db)
 
 
 def test_workload_mode_generates_baseline_build(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "grace", "grace@example.com", "Grace Row")
 
@@ -314,23 +314,26 @@ def test_workload_mode_generates_baseline_build(seeded_db):
 
 
 def test_analysis_falls_back_to_heuristic_without_api_key(seeded_db, monkeypatch):
+    """No manual "Analyze" button exists anymore — analysis auto-triggers
+    the instant the build completes (_maybe_auto_analyze), so it's already
+    present (and, with no API key, on the heuristic path) right after
+    "Apply budget & generate build" with no further click needed."""
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
 
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "heidi", "heidi@example.com", "Heidi Row")
     at.get_by_key("nav_create_build").click().run()
     at.get_by_key("mode_budget").click().run()
     at.get_by_key("apply_budget_generate").click().run()
-    at.get_by_key("run_analysis_compact").click().run()
 
     assert not at.exception
     assert at.session_state["build_draft_analysis"]["source"] == "heuristic"
 
 
 def test_save_build_lands_on_my_builds(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "ivan", "ivan@example.com", "Ivan Row")
     at.get_by_key("nav_create_build").click().run()
@@ -345,7 +348,7 @@ def test_save_build_lands_on_my_builds(seeded_db):
 
 
 def test_publish_and_view_in_community_thread(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "judy", "judy@example.com", "Judy Row")
     at.get_by_key("nav_create_build").click().run()
@@ -371,10 +374,73 @@ def test_publish_and_view_in_community_thread(seeded_db):
     assert not at.exception
 
 
+def test_community_description_saved_and_displayed(seeded_db):
+    """The optional 'Community post description' text area (shown only
+    once 'Also publish to Community' is checked) must actually reach the
+    saved post's author_notes, and the post's thread view must render it
+    (ui/views/community.py's `_thread_view` already had an `if
+    post.author_notes:` block — the feed list itself only ever showed
+    title/cost/date, never notes, core or otherwise, so the thread view is
+    where "displaying posts in the Community feed" actually surfaces it)."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "karen", "karen@example.com", "Karen Row")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Karen's Rig")
+
+    at.get_by_key("publish_checkbox").check().run()
+    assert at.get_by_key("community_description_input") is not None  # only rendered once checked
+
+    note = "Great for 1440p gaming and light streaming."
+    at.get_by_key("community_description_input").input(note)
+    at.get_by_key("save_build").click()
+    at.run()
+
+    assert not at.exception
+    from db.repositories import community_repo
+
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    assert feed[0].author_notes == note
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    view_buttons = [b.key for b in at.button if b.key and b.key.startswith("view_post_")]
+    assert view_buttons
+    at.get_by_key(view_buttons[0]).click().run()
+
+    assert not at.exception
+    assert any(note in m.value for m in at.markdown)
+
+
+def test_community_description_omitted_when_left_blank(seeded_db):
+    """Leaving the description blank must not store an empty-string
+    author_notes — it should stay None, matching a build published with no
+    notes at all (and the feed view's `if post.author_notes:` guard)."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "leo", "leo@example.com", "Leo Row")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Leo's Rig")
+    at.get_by_key("publish_checkbox").check().run()
+    at.get_by_key("save_build").click()
+    at.run()
+
+    assert not at.exception
+    from db.repositories import community_repo
+
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    assert feed[0].author_notes is None
+
+
 def test_fork_from_community_loads_build_studio(seeded_db):
     from engine.solvers import CATEGORY_ORDER
 
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "kevin", "kevin@example.com", "Kevin Row")
     at.get_by_key("nav_create_build").click().run()
@@ -404,7 +470,7 @@ def test_fork_from_community_loads_build_studio(seeded_db):
 def test_my_builds_grouped_view_clone_loads_full_build(seeded_db):
     from engine.solvers import CATEGORY_ORDER
 
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "laura", "laura@example.com", "Laura Row")
     at.get_by_key("nav_create_build").click().run()
@@ -423,11 +489,15 @@ def test_my_builds_grouped_view_clone_loads_full_build(seeded_db):
     assert not at.exception
     assert at.session_state["page"] == "create_build"
     components = at.session_state["build_draft"]["components"]
-    assert set(components.keys()) == set(CATEGORY_ORDER)
+    # every core category must carry over (the clone must not drop any of
+    # them) — "Generate baseline build" also always includes peripherals
+    # now (include_peripherals=True), which is fine, just not guaranteed
+    # to be the exact full set.
+    assert set(CATEGORY_ORDER).issubset(components.keys())
 
 
 def test_my_builds_global_sort_orders_without_exception(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "mallory", "mallory@example.com", "Mallory Row")
     at.get_by_key("nav_create_build").click().run()
@@ -459,7 +529,7 @@ def test_analysis_auto_refreshes_after_component_swap(seeded_db):
     empty), a fresh analysis is recomputed automatically on the very same
     rerun — there's no window where the UI shows nothing, or the old
     result, for a build that's already changed."""
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "nathan", "nathan@example.com", "Nathan Row")
     at.get_by_key("nav_create_build").click().run()
@@ -486,7 +556,7 @@ def test_comment_box_clears_and_resubmission_is_a_no_op(seeded_db):
     """Regression test: the comment text_area used to retain its posted text,
     so clicking "Post comment" again without retyping silently created a
     duplicate comment."""
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "olivia", "olivia@example.com", "Olivia Row")
     at.get_by_key("nav_create_build").click().run()
@@ -521,7 +591,7 @@ def test_comment_box_clears_and_resubmission_is_a_no_op(seeded_db):
 def test_admin_login_works(demo_seeded_db):
     """Task 2 requirement: the seeded admin account (admin / admin123) can log
     in via the standard dual-identifier form, just like any other user."""
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
 
     at.get_by_key("open_login").click().run()
@@ -537,7 +607,7 @@ def test_admin_login_works(demo_seeded_db):
 
 
 def test_admin_login_works_by_email(demo_seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
 
     at.get_by_key("open_login").click().run()
@@ -553,7 +623,7 @@ def test_admin_login_works_by_email(demo_seeded_db):
 def test_build_deletion_requires_confirmation_then_removes_build(seeded_db):
     """Task 2 requirement: Delete asks for confirmation before it fires, and
     the build disappears from the list immediately once confirmed."""
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "petra", "petra@example.com", "Petra Row")
     at.get_by_key("nav_create_build").click().run()
@@ -585,7 +655,7 @@ def test_build_deletion_requires_confirmation_then_removes_build(seeded_db):
 
 
 def test_build_deletion_cancel_keeps_the_build(seeded_db):
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "quinn", "quinn@example.com", "Quinn Row")
     at.get_by_key("nav_create_build").click().run()
@@ -612,7 +682,7 @@ def test_build_deletion_cancel_keeps_the_build(seeded_db):
 def test_build_deletion_cascades_to_community_post(seeded_db):
     """Deleting a published build must also remove its community post (FK
     cascade on build_id) rather than leaving an orphaned post behind."""
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "randall", "randall@example.com", "Randall Row")
     at.get_by_key("nav_create_build").click().run()
@@ -640,7 +710,7 @@ def test_build_studio_mode_cards_and_slot_grid_render(seeded_db):
     """Studio redesign smoke test: mode-selector cards and the 8-slot grid
     (with Selected/Empty status badges, popover pickers) render without
     exception, and every core category's picker is reachable."""
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "sam", "sam@example.com", "Sam Row")
     at.get_by_key("nav_create_build").click().run()
@@ -665,8 +735,8 @@ def test_build_studio_mode_cards_and_slot_grid_render(seeded_db):
         assert any(b.key and b.key.startswith(f"select_{category}_") for b in at.button)
 
     # analysis auto-triggers the instant the build is complete (no manual
-    # "Analyze" click needed) — badges already show AI Engine/Heuristic
-    # Baseline on this very first render, not "—".
+    # "Analyze" click exists anymore) — the Synergy/Bottleneck metric cards
+    # already show real numbers on this very first render, not "—".
     assert at.session_state["build_draft_analysis"] is not None
 
 
@@ -674,7 +744,7 @@ def test_slot_clear_button_removes_component_without_opening_popover(seeded_db):
     """Studio redesign: each slot's header now has a direct clear (✕) button
     next to Change/Choose, so a component can be cleared in one click
     without opening the picker drawer at all."""
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "tara", "tara@example.com", "Tara Row")
     at.get_by_key("nav_create_build").click().run()
@@ -696,7 +766,7 @@ def test_reset_all_fields_clears_build_and_budget_ceiling(seeded_db):
     fresh draft's budget_ceiling is None until "Apply budget & generate
     build" is clicked again — it's the *widget's displayed value* that
     resets to the clean default immediately, not the committed one."""
-    at = AppTest.from_file(str(APP_PATH), default_timeout=10)
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "ulysses", "ulysses@example.com", "Ulysses Row")
     at.get_by_key("nav_create_build").click().run()

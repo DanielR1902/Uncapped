@@ -2,11 +2,14 @@
 
 Layout: mode selector (or a "change mode" header) → mode-specific generator
 controls → a summary header that stays visible above the part-picker grid
-(with a compact Analyze trigger folded into it for the LLM-backed
-synergy/bottleneck read — auto-run the instant a build first becomes
-complete in ANY mode, see `_maybe_auto_analyze`, with the button there too
-for a manual re-trigger) → a "Reset All Fields" control → the 8 core slots
-in a 2-column grid + optional peripherals → save/publish.
+(four clean numeric metric cards — Total Cost, Compatibility, Synergy,
+Bottleneck; the LLM-backed synergy/bottleneck read still auto-runs the
+instant a build first becomes complete in ANY mode, see
+`_maybe_auto_analyze`, it just no longer surfaces a source badge or a
+manual re-trigger button — a deliberate decluttering, not an oversight) →
+a "Reset All Fields" control → the 8 core slots in a 2-column grid +
+optional peripherals → save/publish (with an optional community post
+description when publishing).
 """
 from __future__ import annotations
 
@@ -140,7 +143,7 @@ def _workload_controls(build_draft: dict) -> None:
         if st.button("Generate baseline build", key="generate_workload_build", type="primary"):
             build_draft["workload_profile"] = profile
             build_draft["tier"] = tier
-            new_selection = solvers.allocate_workload_baseline(profile, target_tier=tier)
+            new_selection = solvers.allocate_workload_baseline(profile, target_tier=tier, include_peripherals=True)
             build_draft["components"] = {category: component.id for category, component in new_selection.items()}
             st.session_state["build_draft_analysis"] = None
             st.rerun()
@@ -269,7 +272,7 @@ def _summary_header(build_draft: dict, build_state: dict) -> None:
             synergy, bottleneck_pct, direction = live
             cols[2].metric(
                 "⚡ Synergy", f"{synergy:.0f}",
-                help="Local estimate — click Analyze for the full AI/heuristic breakdown.",
+                help="Local estimate — the full AI/heuristic breakdown appears automatically once the build is complete.",
                 border=True,
             )
             cols[3].metric(
@@ -280,35 +283,6 @@ def _summary_header(build_draft: dict, build_state: dict) -> None:
         else:
             cols[2].metric("⚡ Synergy", "—", border=True)
             cols[3].metric("📉 Bottleneck", "—", border=True)
-
-        badge_cols = st.columns([1, 1, 1, 2])
-        with badge_cols[0]:
-            if report.is_compatible:
-                st.badge("Compatible", icon=":material/check_circle:", color="green")
-            else:
-                st.badge(f"{len(report.issues)} issue(s)", icon=":material/error:", color="red")
-        if analysis:
-            with badge_cols[1]:
-                is_ai = analysis["source"] == "llm"
-                st.badge(
-                    "AI Engine" if is_ai else "Heuristic Baseline",
-                    icon=":material/smart_toy:" if is_ai else ":material/calculate:",
-                    color="green" if is_ai else "orange",
-                )
-        elif live is not None:
-            with badge_cols[1]:
-                st.badge("Live Estimate", icon=":material/bolt:", color="gray")
-
-        with badge_cols[2]:
-            if st.button("🔮 Analyze", key="run_analysis_compact", use_container_width=True, disabled=len(build_state) < 2):
-                with st.spinner("Analyzing build..."):
-                    response = analyze_build(
-                        build_state,
-                        workload_profile=build_draft.get("workload_profile"),
-                        budget_ceiling=build_draft.get("budget_ceiling"),
-                    )
-                st.session_state["build_draft_analysis"] = response.model_dump()
-                st.rerun()
 
         if report.issues:
             for issue in report.issues:
@@ -322,6 +296,14 @@ def _save_actions(build_draft: dict, build_state: dict) -> None:
     user = current_user()
     name = st.text_input("Build name", value=build_draft.get("name", ""), key="build_name_input")
     publish = st.checkbox("Also publish to Community", key="publish_checkbox")
+
+    community_description = ""
+    if publish:
+        community_description = st.text_area(
+            "Community post description",
+            placeholder="Share your thoughts, use-case, or notes about this build...",
+            key="community_description_input",
+        )
 
     if st.button("💾 Save build", key="save_build", disabled=not build_state, type="primary"):
         report = evaluate_build(build_state)
@@ -343,7 +325,7 @@ def _save_actions(build_draft: dict, build_state: dict) -> None:
             is_public=publish,
         )
         if publish:
-            community_repo.create_post(build.id, user["id"], name or "Untitled build", None)
+            community_repo.create_post(build.id, user["id"], name or "Untitled build", community_description or None)
 
         st.success("Build saved!")
         st.session_state["create_mode"] = None
