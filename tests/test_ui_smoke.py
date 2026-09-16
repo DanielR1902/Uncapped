@@ -215,6 +215,37 @@ def test_free_mode_selection_renders_without_exception(seeded_db):
     assert any(b.key and b.key.startswith("select_CPU_") for b in at.button)
 
 
+def test_free_mode_manual_completion_triggers_auto_analysis(seeded_db):
+    """_maybe_auto_analyze's trigger condition only checks which CORE
+    categories are filled, never `mode` — so it must fire identically
+    whether the build was completed by Budget's/Workload's generate buttons
+    (already covered by test_build_studio_mode_cards_and_slot_grid_render
+    and test_analysis_auto_refreshes_after_component_swap) or by a user
+    manually filling all 8 slots one at a time in Free mode, which had no
+    explicit coverage before this test."""
+    from engine.solvers import CATEGORY_ORDER
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "fiona", "fiona@example.com", "Fiona Row")
+
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+    assert at.session_state["build_draft_analysis"] is None
+
+    for category in CATEGORY_ORDER:
+        candidate_buttons = [
+            b.key for b in at.button if b.key and b.key.startswith(f"select_{category}_")
+        ]
+        assert candidate_buttons, f"no selectable candidate for {category}"
+        at.get_by_key(candidate_buttons[0]).click().run()
+        assert not at.exception
+
+    components = at.session_state["build_draft"]["components"]
+    assert set(CATEGORY_ORDER).issubset(components.keys())
+    assert at.session_state["build_draft_analysis"] is not None
+
+
 def test_budget_mode_generates_full_compatible_build(seeded_db):
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
@@ -756,6 +787,38 @@ def test_slot_clear_button_removes_component_without_opening_popover(seeded_db):
 
     assert not at.exception
     assert "GPU" not in at.session_state["build_draft"]["components"]
+
+
+def test_get_advisory_button_populates_cache_with_suggestions(seeded_db):
+    """AI Build Advisory: the "✨ Get AI Analysis & Upgrade Path" button
+    (separate, click-gated feature from the auto-run synergy/bottleneck
+    read) must exist once a build has at least two components, and clicking
+    it must populate `advisory_cache` with a non-empty within_budget and
+    stretch_budget suggestion list. `_no_live_llm_calls` (autouse) keeps
+    this on the network-free heuristic path, same as the existing
+    auto-analysis fallback test above."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "priya", "priya@example.com", "Priya Row")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    advisory_button = at.get_by_key("get_advisory")
+    assert advisory_button is not None
+    assert advisory_button.disabled is False  # build is complete, well over 2 components
+
+    advisory_button.click().run()
+    assert not at.exception
+
+    cache = at.session_state["advisory_cache"]
+    assert len(cache) == 1
+    advisory = next(iter(cache.values()))
+    assert isinstance(advisory["within_budget"], str) and advisory["within_budget"]
+    assert isinstance(advisory["stretch_budget"], str) and advisory["stretch_budget"]
+    assert isinstance(advisory["pros"], list) and advisory["pros"]
+    assert isinstance(advisory["cons"], list) and advisory["cons"]
+    assert advisory["source"] == "heuristic"
 
 
 def test_reset_all_fields_clears_build_and_budget_ceiling(seeded_db):

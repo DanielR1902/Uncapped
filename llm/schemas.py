@@ -64,3 +64,23 @@ class BuildAnalysisResponse(BaseModel):
     bottleneck: BottleneckAnalysis
     insights: ArchitecturalInsights
     source: Literal["llm", "heuristic"] = "llm"
+
+
+class BuildAdvisoryResponse(BaseModel):
+    """Response shape for the AI Build Advisory feature (pros/cons of the
+    current build, one in-budget optimization tip, and one stretch-budget
+    upgrade suggestion). Flat and JSON-serializable — no nested objects
+    needed, unlike BuildAnalysisResponse. See llm/advisory.py.
+
+    pros/cons/within_budget/stretch_budget are all REQUIRED (no defaults),
+    matching this project's existing precedent for "must always be present"
+    LLM fields (BuildAnalysisResponse's synergy/bottleneck/insights): a real
+    LLM response missing any of these four keys must fail validation here and
+    fall through to the heuristic fallback, rather than silently succeeding
+    with a half-empty result."""
+
+    pros: list[str]
+    cons: list[str]
+    within_budget: str
+    stretch_budget: str
+    source: Literal["llm", "heuristic"] = "llm"

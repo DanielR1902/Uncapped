@@ -7,7 +7,10 @@ Bottleneck; the LLM-backed synergy/bottleneck read still auto-runs the
 instant a build first becomes complete in ANY mode, see
 `_maybe_auto_analyze`, it just no longer surfaces a source badge or a
 manual re-trigger button — a deliberate decluttering, not an oversight) →
-a "Reset All Fields" control → the 8 core slots in a 2-column grid +
+an explicit "✨ Get AI Analysis & Upgrade Path" advisory button (see
+`_advisory_controls`; a separate, click-gated feature from the auto-run
+synergy/bottleneck read above it, available in every mode) → a
+"Reset All Fields" control → the 8 core slots in a 2-column grid +
 optional peripherals → save/publish (with an optional community post
 description when publishing).
 """
@@ -20,6 +23,7 @@ from db.models import WORKLOAD_PROFILES
 from db.repositories import builds_repo, community_repo, components_repo
 from engine import scoring, solvers
 from engine.compatibility import evaluate_build
+from llm.advisory import get_build_advisory
 from llm.client import analyze_build
 from ui import state, theme
 from ui.components.part_picker import render_part_picker
@@ -34,6 +38,16 @@ _MODE_CARDS = (
     ("Workload", "🎯 Workload Profile", "Pick what it's for — Gaming, Video Editing, Programming/AI, Design, or General — and get a tiered baseline instantly."),
     ("Free", "🧩 Free Custom", "Full control from the first part. Every pick is checked live for compatibility against everything else."),
 )
+
+
+def _sanitize_markdown(text: str) -> str:
+    """Defensively strip any literal `$` from LLM-authored text before it
+    reaches st.markdown/st.write. The advisory system prompt already
+    instructs the model to never use standalone dollar signs (a matching
+    "$...$" pair triggers Streamlit's KaTeX/math-mode rendering and garbles
+    plain prices), but this is a last-resort belt-and-suspenders guard in
+    case the model ignores that instruction anyway."""
+    return text.replace("$", "USD ")
 
 
 def _mode_selector() -> None:
@@ -289,6 +303,96 @@ def _summary_header(build_draft: dict, build_state: dict) -> None:
                 st.markdown(theme.tag(issue, "danger"), unsafe_allow_html=True)
 
 
+def _advisory_controls(build_draft: dict, build_state: dict) -> None:
+    """Explicit-click AI Build Advisory (in-budget optimization tips +
+    a stretch-budget upgrade path), rendered below the summary metric cards
+    for all three creation modes — unlike `_maybe_auto_analyze`'s synergy/
+    bottleneck read, this one is never auto-triggered; it costs a real (or
+    heuristic-fallback) `get_build_advisory` call per click, so it stays
+    behind an explicit button, same gating value (`len(build_state) < 2`)
+    the old manual "🔮 Analyze" button used before auto-analysis replaced it.
+
+    Cached in `st.session_state["advisory_cache"]` keyed by a deterministic
+    tuple of (sorted (category, component.id) pairs, mode, current budget-
+    or-cost figure) — component id rather than the Component row itself,
+    since a SQLAlchemy model instance isn't reliably hashable/sortable
+    across reruns. This mirrors `_cached_floor_cost` and `llm/cache.py`'s
+    `llm_cache` table: don't repeat expensive (here, potentially networked)
+    work for an unchanged build just because an unrelated widget elsewhere
+    on the page triggered a Streamlit rerun.
+
+    Which cached result is "currently displayed" is decided by recomputing
+    the CURRENT build's cache key on every render and looking IT up in the
+    cache, rather than remembering "whatever key was last clicked" in a
+    separate session-state slot. That means: (a) the expander keeps showing
+    the same result across reruns that don't touch the build (no need to
+    re-click), and (b) the moment the build/mode/cost actually changes, the
+    new cache key simply has no entry yet, so the stale advisory silently
+    stops being displayed instead of lingering for a build it no longer
+    describes — the same "a change invalidates the old read" philosophy
+    `ui/state.py`'s `_invalidate_analysis` already applies to the synergy/
+    bottleneck card.
+    """
+    mode = build_draft.get("creation_mode")
+    current_budget_or_cost = build_draft.get("budget_ceiling") if mode == "Budget" else None
+    if not current_budget_or_cost:
+        current_budget_or_cost = state.build_total_cost(build_state)
+
+    cache_key = (
+        mode,
+        build_draft.get("workload_profile"),
+        tuple(sorted((category, component.id) for category, component in build_state.items())),
+        round(current_budget_or_cost, 2),
+    )
+    cache = st.session_state.setdefault("advisory_cache", {})
+
+    if st.button(
+        "✨ Get AI Analysis & Upgrade Path",
+        key="get_advisory",
+        use_container_width=True,
+        disabled=len(build_state) < 2,
+    ):
+        if cache_key not in cache:
+            with st.spinner("Getting AI advisory..."):
+                cache[cache_key] = get_build_advisory(
+                    build_state,
+                    mode,
+                    current_budget_or_cost,
+                    profile=build_draft.get("workload_profile"),
+                    bottleneck_info=(st.session_state.get("build_draft_analysis") or {}).get("bottleneck"),
+                )
+
+    advisory = cache.get(cache_key)
+    if advisory is None:
+        return
+
+    stretch_amount = round(current_budget_or_cost * 0.10 / 10) * 10
+    with st.expander("💡 AI Build Advisory & Recommendations", expanded=True):
+        st.caption(
+            "Source: AI-generated" if advisory["source"] == "llm" else "Source: local heuristic estimate"
+        )
+
+        col_pros, col_cons = st.columns(2)
+        with col_pros:
+            st.markdown("##### :green[✔ Pros & Strengths]")
+            for item in advisory.get("pros", []):
+                st.markdown(f"- :green[{_sanitize_markdown(item)}]")
+        with col_cons:
+            st.markdown("##### :red[✖ Cons & Limitations]")
+            for item in advisory.get("cons", []):
+                st.markdown(f"- :red[{_sanitize_markdown(item)}]")
+        st.divider()
+
+        tab1, tab2 = st.tabs([
+            "⚖️ In-Budget Optimization & Balance",
+            f"🚀 Stretch Budget Upgrades (+{stretch_amount:,.0f} USD)",
+        ])
+        with tab1:
+            st.markdown(_sanitize_markdown(advisory["within_budget"]))
+        with tab2:
+            st.markdown(_sanitize_markdown(advisory["stretch_budget"]))
+
+
 def _save_actions(build_draft: dict, build_state: dict) -> None:
     st.markdown("---")
     st.subheader("Save this build")
@@ -363,6 +467,7 @@ def render() -> None:
     build_state = state.resolve_build_state(build_draft)
     _maybe_auto_analyze(build_draft, build_state)
     _summary_header(build_draft, build_state)
+    _advisory_controls(build_draft, build_state)
 
     _reset_controls(build_draft)
     _part_pickers(build_draft, build_state)
