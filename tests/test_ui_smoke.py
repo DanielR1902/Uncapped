@@ -126,6 +126,159 @@ def test_resolve_build_state_handles_empty_draft():
     assert state.resolve_build_state(state.new_build_draft()) == {}
 
 
+def test_new_build_draft_includes_empty_quantities():
+    draft = state.new_build_draft("Free")
+    assert draft["quantities"] == {}
+
+
+def test_get_quantity_defaults_to_one():
+    draft = state.new_build_draft("Free")
+    assert state.get_quantity(draft, "RAM") == 1
+    assert state.get_quantity(draft, "Storage") == 1
+
+
+def test_set_quantity_round_trips():
+    draft = state.new_build_draft("Free")
+    state.set_quantity(draft, "RAM", 2)
+    assert state.get_quantity(draft, "RAM") == 2
+
+
+def test_set_quantity_clamps_to_one():
+    draft = state.new_build_draft("Free")
+    state.set_quantity(draft, "RAM", 0)
+    assert state.get_quantity(draft, "RAM") == 1
+    state.set_quantity(draft, "RAM", -5)
+    assert state.get_quantity(draft, "RAM") == 1
+
+
+def test_remove_component_clears_its_quantity():
+    draft = state.new_build_draft("Free")
+    fake_ram = Component(id=7, category="RAM", name="Fake RAM", brand="Test", price_usd=80.0, specs_json="{}")
+    state.set_component(draft, "RAM", fake_ram)
+    state.set_quantity(draft, "RAM", 2)
+    state.remove_component(draft, "RAM")
+    assert state.get_quantity(draft, "RAM") == 1  # stale multiplier is gone, starts fresh
+
+
+def test_build_total_cost_scales_with_quantities():
+    fake_cpu = Component(id=1, category="CPU", name="A", brand="T", price_usd=100.0, specs_json="{}")
+    fake_ram = Component(id=2, category="RAM", name="B", brand="T", price_usd=50.0, specs_json="{}")
+    build_state = {"CPU": fake_cpu, "RAM": fake_ram}
+
+    # no quantities dict -> every multiplier is 1, identical to before this feature
+    assert state.build_total_cost(build_state) == 150.0
+    assert state.build_total_cost(build_state, None) == 150.0
+
+    assert state.build_total_cost(build_state, {"RAM": 2}) == 200.0
+
+
+# ---------------------------------------------------------------------------
+# resolve_effective_quantity_limit — combines the real physical slot limit
+# (engine.compatibility.resolve_quantity_limit) with a budget-affordability
+# limit for the RAM/Storage quantity stepper, whichever is tighter.
+# ---------------------------------------------------------------------------
+def _fake_mobo(ram_slots: int = 4) -> Component:
+    return Component(
+        id=100, category="Motherboard", name="Fake Mobo", brand="T", price_usd=120.0,
+        specs_json=f'{{"ram_slots": {ram_slots}, "max_ram_gb": 128}}',
+    )
+
+
+def _fake_ram(price: float = 50.0) -> Component:
+    # deliberately no "(NxYGB)" in the name -> _ram_kit_module_count falls
+    # back to 1 module per kit, so physical max == ram_slots exactly.
+    return Component(id=2, category="RAM", name="Fake RAM 8GB", brand="T", price_usd=price, specs_json="{}")
+
+
+def test_resolve_effective_quantity_limit_blocks_when_next_unit_exceeds_budget():
+    """Budget mode: 2 kits already selected at $50 each ($100 total), a 3rd
+    kit would cost $150 which exceeds a $140 ceiling -> incrementing further
+    must be blocked (effective_max stays at the current quantity)."""
+    ram = _fake_ram(price=50.0)
+    build_state = {"RAM": ram}  # no Motherboard -> no physical constraint at all
+    quantities = {"RAM": 2}
+
+    effective_max, reason, limit_kind = state.resolve_effective_quantity_limit(
+        build_state, "RAM", quantities, budget_ceiling=140.0
+    )
+
+    assert effective_max == 2  # current_qty; can't afford a 3rd kit
+    assert limit_kind == "budget"
+    assert reason  # a human-readable explanation is present
+
+
+def test_resolve_effective_quantity_limit_physical_tighter_than_budget():
+    """Budget mode with plenty of headroom, but the motherboard's real
+    2-DIMM-slot limit (1 module per kit here) is tighter than what the
+    budget alone would allow."""
+    mobo = _fake_mobo(ram_slots=2)
+    ram = _fake_ram(price=50.0)
+    build_state = {"Motherboard": mobo, "RAM": ram}
+    quantities = {"RAM": 1}
+
+    effective_max, reason, limit_kind = state.resolve_effective_quantity_limit(
+        build_state, "RAM", quantities, budget_ceiling=100_000.0
+    )
+
+    assert effective_max == 2  # physical limit: 2 slots // 1 module-per-kit
+    assert limit_kind == "physical"
+    assert reason
+
+
+def test_resolve_effective_quantity_limit_ignores_budget_outside_budget_mode():
+    """Workload/Free mode passes budget_ceiling=None -> the financial
+    constraint never applies, effective_max is whatever the physical-only
+    function would return."""
+    mobo = _fake_mobo(ram_slots=2)
+    ram = _fake_ram(price=50.0)
+    build_state = {"Motherboard": mobo, "RAM": ram}
+    quantities = {"RAM": 1}
+
+    effective_max, reason, limit_kind = state.resolve_effective_quantity_limit(
+        build_state, "RAM", quantities, budget_ceiling=None
+    )
+
+    from engine.compatibility import resolve_quantity_limit
+
+    physical_max, physical_reason = resolve_quantity_limit(build_state, "RAM")
+    assert effective_max == physical_max == 2
+    assert reason == physical_reason
+    assert limit_kind == "physical"
+
+
+def test_resolve_effective_quantity_limit_no_data_at_all():
+    """No Motherboard (so no real physical data) and no budget ceiling ->
+    neither constraint has real data to bound this category."""
+    ram = _fake_ram(price=50.0)
+    build_state = {"RAM": ram}
+    quantities = {"RAM": 1}
+
+    result = state.resolve_effective_quantity_limit(build_state, "RAM", quantities, budget_ceiling=None)
+    assert result == (None, "", "none")
+
+
+def test_resolve_effective_quantity_limit_exact_boundary_is_allowed():
+    """Boundary case: spending exactly up to the ceiling is fine, only going
+    OVER it is blocked. 1 kit at $50 is already selected; a ceiling of
+    exactly $100 means a 2nd kit (bringing the total to exactly $100) must
+    still be allowed, since `remaining_for_category // price` with
+    remaining=100 and price=50 floors to exactly 2, not 1.
+    """
+    ram = _fake_ram(price=50.0)
+    build_state = {"RAM": ram}  # no Motherboard -> physical constraint is None
+    quantities = {"RAM": 1}
+
+    effective_max, reason, limit_kind = state.resolve_effective_quantity_limit(
+        build_state, "RAM", quantities, budget_ceiling=100.0
+    )
+
+    # other_components_cost = 0 (RAM is the only category), remaining = 100,
+    # financial_max = int(100 // 50) = 2 -> a 2nd kit (total exactly $100) is allowed.
+    assert effective_max == 2
+    assert limit_kind == "budget"
+    assert reason
+
+
 # ---------------------------------------------------------------------------
 # End-to-end smoke tests via AppTest
 # ---------------------------------------------------------------------------
@@ -814,11 +967,365 @@ def test_get_advisory_button_populates_cache_with_suggestions(seeded_db):
     cache = at.session_state["advisory_cache"]
     assert len(cache) == 1
     advisory = next(iter(cache.values()))
-    assert isinstance(advisory["within_budget"], str) and advisory["within_budget"]
-    assert isinstance(advisory["stretch_budget"], str) and advisory["stretch_budget"]
+    assert isinstance(advisory["within_budget"], dict)
+    assert isinstance(advisory["within_budget"]["explanation"], str) and advisory["within_budget"]["explanation"]
+    assert isinstance(advisory["within_budget"]["swaps"], list)
+    assert isinstance(advisory["stretch_budget"], dict)
+    assert isinstance(advisory["stretch_budget"]["explanation"], str) and advisory["stretch_budget"]["explanation"]
+    assert isinstance(advisory["stretch_budget"]["actions"], list)
     assert isinstance(advisory["pros"], list) and advisory["pros"]
     assert isinstance(advisory["cons"], list) and advisory["cons"]
     assert advisory["source"] == "heuristic"
+
+
+def test_apply_in_budget_optimization_changes_components_and_cost(seeded_db):
+    """Clicking "⚡ Apply In-Budget Optimization" must actually mutate
+    build_draft["components"] for the swapped category to the advisory's
+    `replace_with_id`, and the summary metrics (total cost) must reflect the
+    new build on the very next render — proving the button does real work,
+    not just a no-op rerun."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "apply1", "apply1@example.com", "Apply One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    at.get_by_key("get_advisory").click().run()
+    assert not at.exception
+
+    cache = at.session_state["advisory_cache"]
+    advisory = next(iter(cache.values()))
+    swaps = advisory["within_budget"]["swaps"]
+
+    apply_button = at.get_by_key("btn_apply_in_budget")
+    assert apply_button is not None
+
+    if not swaps:
+        assert apply_button.disabled is True
+        return  # heuristic found no beneficial swap for this build/seed — nothing further to prove here
+
+    assert apply_button.disabled is False
+    build_state_before = state.resolve_build_state(at.session_state["build_draft"])
+    # Record the pre-click id for each category this round's advisory names,
+    # rather than asserting the final id equals `swap["replace_with_id"]`
+    # verbatim: the real (unmocked) heuristic advisory used here may report
+    # can_optimize_further=True after this round, in which case the bounded
+    # auto-optimize loop (up to _MAX_AUTO_OPTIMIZE_ROUNDS) re-queries and
+    # applies a FURTHER refined swap for the same category on a later round
+    # — still a real, correct swap, just not necessarily this exact id.
+    original_ids = {swap["category"]: build_state_before[swap["category"]].id for swap in swaps}
+    before_cost = state.build_total_cost(build_state_before, at.session_state["build_draft"].get("quantities", {}))
+
+    apply_button.click().run()
+    assert not at.exception
+
+    components_after = at.session_state["build_draft"]["components"]
+    for category, original_id in original_ids.items():
+        assert components_after[category] != original_id  # actually swapped away from the original pick
+
+    after_cost = state.build_total_cost(
+        state.resolve_build_state(at.session_state["build_draft"]),
+        at.session_state["build_draft"].get("quantities", {}),
+    )
+    assert after_cost != before_cost  # summary metrics reflect the swapped build
+
+
+def test_apply_in_budget_optimization_terminates_within_round_cap(seeded_db, monkeypatch):
+    """Even when the heuristic keeps reporting can_optimize_further=True,
+    the auto-optimize loop backing "Apply In-Budget Optimization" must not
+    hang or crash — it's hard-capped at
+    ui.views.create_build._MAX_AUTO_OPTIMIZE_ROUNDS rounds. Forces the
+    scenario by monkeypatching get_build_advisory (as imported into
+    ui.views.create_build) to always report can_optimize_further=True with a
+    real, always-valid swap, so every one of the 3 rounds actually re-fires."""
+    from db.repositories import components_repo
+    from engine.solvers import CATEGORY_ORDER
+    import ui.views.create_build as create_build_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "apply2", "apply2@example.com", "Apply Two")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    call_count = {"n": 0}
+
+    def _always_optimizable(
+        build_state, mode, current_budget_or_cost, profile=None, bottleneck_info=None, quantities=None
+    ):
+        call_count["n"] += 1
+        category = "CPU"
+        candidates = [c for c in components_repo.get_by_category(category) if c.id != build_state[category].id]
+        replace_with_id = candidates[0].id if candidates else build_state[category].id
+        return {
+            "pros": ["p"], "cons": ["c"],
+            "within_budget": {
+                "explanation": "keep optimizing",
+                "swaps": [{"category": category, "replace_with_id": replace_with_id}],
+                "can_optimize_further": True,
+            },
+            "stretch_budget": {"explanation": "stretch", "actions": [], "added_cost_usd": 0.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(create_build_module, "get_build_advisory", _always_optimizable)
+
+    at.get_by_key("get_advisory").click().run()
+    assert not at.exception
+
+    apply_button = at.get_by_key("btn_apply_in_budget")
+    assert apply_button.disabled is False
+    apply_button.click().run()
+
+    assert not at.exception  # completes, doesn't hang
+    # 1 call from the initial "Get AI Analysis" click, plus at most one more
+    # per round of the auto-optimize loop (it always re-queries here since
+    # can_optimize_further is forced True every time) — proves the loop
+    # terminates instead of looping forever chasing a False that never comes.
+    assert call_count["n"] <= 1 + create_build_module._MAX_AUTO_OPTIMIZE_ROUNDS
+
+    components = at.session_state["build_draft"]["components"]
+    assert set(CATEGORY_ORDER).issubset(components.keys())
+
+    # a fresh cache entry exists for whatever the final build state is
+    cache = at.session_state["advisory_cache"]
+    final_build_state = state.resolve_build_state(at.session_state["build_draft"])
+    final_cost = state.build_total_cost(final_build_state, at.session_state["build_draft"].get("quantities", {}))
+    final_key = (
+        "Budget",
+        None,
+        tuple(sorted((cat, c.id) for cat, c in final_build_state.items())),
+        round(at.session_state["build_draft"]["budget_ceiling"] or final_cost, 2),
+    )
+    assert final_key in cache
+
+
+def test_apply_stretch_upgrade_locks_per_build(seeded_db, monkeypatch):
+    """Clicking "🚀 Apply Stretch Upgrade (One-Time)" applies the stretch
+    actions and adds the current advisory cache key to
+    st.session_state["stretch_applied_keys"]; clicking it again for the same
+    build (same cache key) must be disabled/a no-op — but the lock is scoped
+    to that one cache key, not a global "ever used" flag.
+
+    Deliberately mocked with a `set_quantity` action rather than the real
+    heuristic: `advisory_cache`'s key is built from (sorted category/
+    component-id pairs, mode, cost) — quantities aren't part of it — so a
+    set_quantity action is guaranteed not to change the cache key on
+    application, keeping the advisory expander (and this button) rendered
+    on the next run so the "still disabled" assertion is actually reachable.
+    A real swap action, by contrast, changes the component-id tuple, which
+    changes the cache key, so the previously-cached advisory (and its Apply
+    button) simply stops rendering for the new build — a separate, already
+    correct behavior, not a lock bug (see `_advisory_controls`'s docstring).
+
+    Ceiling chosen with generous headroom above the solver's own spend (not
+    just distinct from other tests' ceilings): the RAM/Storage quantity
+    stepper is now budget-aware too (`ui.state.resolve_effective_quantity_limit`),
+    and this stretch action deliberately pushes RAM quantity to 2 — a tight
+    ceiling where the solver already spends ~99% of it would leave no
+    budget-effective headroom for that 2nd unit, and the part-picker's own
+    pre-clamp (correctly, generically) would immediately clamp the
+    just-applied quantity back down to 1 on the very next render, which is
+    a real product interaction but not what this test is exercising."""
+    import ui.views.create_build as create_build_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "apply3", "apply3@example.com", "Apply Three")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("budget_ceiling_input").set_value(2000.0).run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    def _set_quantity_stretch_advisory(
+        build_state, mode, current_budget_or_cost, profile=None, bottleneck_info=None, quantities=None
+    ):
+        return {
+            "pros": ["p"], "cons": ["c"],
+            "within_budget": {"explanation": "already optimal", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {
+                "explanation": "add a second RAM kit",
+                "actions": [{"action": "set_quantity", "category": "RAM", "quantity": 2}],
+                "added_cost_usd": 50.0,
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(create_build_module, "get_build_advisory", _set_quantity_stretch_advisory)
+
+    at.get_by_key("get_advisory").click().run()
+    assert not at.exception
+
+    stretch_button = at.get_by_key("btn_apply_stretch")
+    assert stretch_button is not None
+    assert stretch_button.disabled is False
+    locked_before = len(at.session_state["stretch_applied_keys"])
+
+    stretch_button.click().run()
+    assert not at.exception
+
+    assert at.session_state["build_draft"]["quantities"]["RAM"] == 2
+    # relative growth, not an absolute count — see this test's own docstring
+    # for why (the shared-default stretch_applied_keys set() quirk).
+    assert len(at.session_state["stretch_applied_keys"]) == locked_before + 1
+
+    # same build -> same cache key -> button now disabled, no further mutation
+    stretch_button_again = at.get_by_key("btn_apply_stretch")
+    assert stretch_button_again.disabled is True
+
+
+def test_apply_stretch_set_quantity_action_updates_quantity(seeded_db, monkeypatch):
+    """stretch_budget.actions can carry a {"action": "set_quantity", ...}
+    entry (the RAM/Storage multi-slot stretch upgrade) alongside or instead
+    of swaps. Clicking "Apply Stretch Upgrade" must route it through
+    state.set_quantity, landing in build_draft["quantities"], not attempt a
+    catalog lookup meant for swaps.
+
+    Ceiling chosen with generous headroom above the solver's own spend, not
+    just distinct from other tests' ceilings — see
+    test_apply_stretch_upgrade_locks_per_build's docstring: the RAM/Storage
+    quantity stepper is now budget-aware, and a tight ceiling would let its
+    own pre-clamp immediately re-clamp this test's just-applied qty=2 back
+    down to 1 on the next render, which isn't what this test is about."""
+    import ui.views.create_build as create_build_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "apply5", "apply5@example.com", "Apply Five")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    # Distinct ceiling so this cache key can't collide with another test's
+    # default-$1500 budget build (see test_apply_stretch_upgrade_locks_per_build's
+    # docstring for why that matters given the shared-default stretch_applied_keys set).
+    at.get_by_key("budget_ceiling_input").set_value(5000.0).run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    def _set_quantity_stretch_advisory(
+        build_state, mode, current_budget_or_cost, profile=None, bottleneck_info=None, quantities=None
+    ):
+        return {
+            "pros": ["p"], "cons": ["c"],
+            "within_budget": {"explanation": "already optimal", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {
+                "explanation": "add a second RAM kit",
+                "actions": [{"action": "set_quantity", "category": "RAM", "quantity": 2}],
+                "added_cost_usd": 50.0,
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(create_build_module, "get_build_advisory", _set_quantity_stretch_advisory)
+
+    at.get_by_key("get_advisory").click().run()
+    assert not at.exception
+
+    stretch_button = at.get_by_key("btn_apply_stretch")
+    assert stretch_button.disabled is False
+    locked_before = len(at.session_state["stretch_applied_keys"])
+    stretch_button.click().run()
+    assert not at.exception
+
+    assert at.session_state["build_draft"]["quantities"]["RAM"] == 2
+    # relative growth, not an absolute count: `stretch_applied_keys`'s
+    # session-state default is a single set() object shared across every
+    # AppTest session in this process (ui/state.py's _DEFAULTS quirk,
+    # out of scope for this task), so other tests' own locked cache keys
+    # may already be present here.
+    assert len(at.session_state["stretch_applied_keys"]) == locked_before + 1
+
+
+def test_apply_stretch_swap_action_updates_component(seeded_db, monkeypatch):
+    """stretch_budget.actions with an explicit {"action": "swap", ...} entry
+    (the pre-rename shape, now nested one level under "actions" instead of
+    "swaps") must still resolve the id via components_repo and pin it via
+    state.set_component, same as _apply_swaps always did for within_budget."""
+    from db.repositories import components_repo
+    import ui.views.create_build as create_build_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "apply6", "apply6@example.com", "Apply Six")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    # Distinct ceiling so this cache key can't collide with another test's
+    # default-$1500 budget build (see test_apply_stretch_upgrade_locks_per_build's
+    # docstring for why that matters given the shared-default stretch_applied_keys set).
+    at.get_by_key("budget_ceiling_input").set_value(1630.0).run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    current_cpu_id = at.session_state["build_draft"]["components"]["CPU"]
+    other_cpu = next(c for c in components_repo.get_by_category("CPU") if c.id != current_cpu_id)
+
+    def _swap_stretch_advisory(
+        build_state, mode, current_budget_or_cost, profile=None, bottleneck_info=None, quantities=None
+    ):
+        return {
+            "pros": ["p"], "cons": ["c"],
+            "within_budget": {"explanation": "already optimal", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {
+                "explanation": "upgrade the CPU",
+                "actions": [{"action": "swap", "category": "CPU", "replace_with_id": other_cpu.id}],
+                "added_cost_usd": 100.0,
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(create_build_module, "get_build_advisory", _swap_stretch_advisory)
+
+    at.get_by_key("get_advisory").click().run()
+    assert not at.exception
+
+    stretch_button = at.get_by_key("btn_apply_stretch")
+    assert stretch_button.disabled is False
+    locked_before = len(at.session_state["stretch_applied_keys"])
+    stretch_button.click().run()
+    assert not at.exception
+
+    assert at.session_state["build_draft"]["components"]["CPU"] == other_cpu.id
+    # relative growth, not an absolute count — see the analogous comment in
+    # test_apply_stretch_set_quantity_action_updates_quantity.
+    assert len(at.session_state["stretch_applied_keys"]) == locked_before + 1
+
+
+def test_advisory_apply_buttons_disabled_when_no_swaps(seeded_db, monkeypatch):
+    """A build whose advisory has empty `swaps` in either within_budget or
+    stretch_budget renders that tab's Apply button as disabled=True — never
+    crashing, never silently no-opping on a click that shouldn't be
+    reachable in the first place."""
+    import ui.views.create_build as create_build_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "apply4", "apply4@example.com", "Apply Four")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    def _no_swaps_advisory(
+        build_state, mode, current_budget_or_cost, profile=None, bottleneck_info=None, quantities=None
+    ):
+        return {
+            "pros": ["p"], "cons": ["c"],
+            "within_budget": {"explanation": "already optimal", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {"explanation": "no upgrade available", "actions": [], "added_cost_usd": 0.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(create_build_module, "get_build_advisory", _no_swaps_advisory)
+
+    at.get_by_key("get_advisory").click().run()
+    assert not at.exception
+
+    assert at.get_by_key("btn_apply_in_budget").disabled is True
+    assert at.get_by_key("btn_apply_stretch").disabled is True
+
+    # clicking a disabled button is a no-op in AppTest terms (nothing to
+    # click), so just re-confirm the build/components are untouched.
+    components_before = dict(at.session_state["build_draft"]["components"])
+    at.run()
+    assert at.session_state["build_draft"]["components"] == components_before
 
 
 def test_reset_all_fields_clears_build_and_budget_ceiling(seeded_db):
@@ -846,3 +1353,329 @@ def test_reset_all_fields_clears_build_and_budget_ceiling(seeded_db):
     assert at.session_state["build_draft"]["components"] == {}
     assert at.session_state["build_draft"]["budget_ceiling"] is None  # nothing committed yet on the fresh draft
     assert at.get_by_key("budget_ceiling_input").value == 1500.0  # widget redisplays the clean default
+
+
+# ---------------------------------------------------------------------------
+# RAM/Storage quantity stepper — real engine-backed max (part_picker.py's
+# _resolve_quantity_bound replaced a duplicate, now-incorrect local
+# calculation with engine.compatibility.resolve_quantity_limit directly).
+# ---------------------------------------------------------------------------
+def test_ram_quantity_max_respects_real_per_module_count(seeded_db):
+    """A 4-DIMM-slot motherboard (ASRock B550M-HDV: ram_slots=4) with a
+    2-module ("2x8GB") RAM kit selected must cap the Qty stepper at 2 real
+    kits (4 slots // 2 modules per kit) — NOT the old buggy behavior of
+    reporting the raw ram_slots count (4) regardless of kit size."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "quant1", "quant1@example.com", "Quant One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    mobo = next(c for c in components_repo.get_by_category("Motherboard") if c.name == "ASRock B550M-HDV")
+    ram_2_module = next(
+        c for c in components_repo.get_by_category("RAM") if c.name.startswith("Corsair Vengeance LPX 16GB (2x8GB)")
+    )
+
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+    at.get_by_key(f"select_RAM_{ram_2_module.id}").click().run()
+
+    assert not at.exception
+    qty_widget = at.get_by_key("qty_RAM")
+    assert qty_widget.max == 2  # 4 DIMM slots // 2 modules-per-kit, not the raw slot count
+
+
+def test_storage_quantity_max_for_nvme_on_asrock_b550m_hdv(seeded_db):
+    """ASRock B550M-HDV's real seeded m2_slots is 1. Picking an NVMe drive
+    (Kingston NV2) must cap the Storage Qty stepper at exactly 1 — the
+    directive's own boundary case (min_value == max_value == 1) — and this
+    must render without raising Streamlit's native range exception. The
+    caption must also report the real "up to 1" limit."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "quant2", "quant2@example.com", "Quant Two")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    mobo = next(c for c in components_repo.get_by_category("Motherboard") if c.name == "ASRock B550M-HDV")
+    nvme = next(c for c in components_repo.get_by_category("Storage") if c.name.startswith("Kingston NV2"))
+
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+    at.get_by_key(f"select_Storage_{nvme.id}").click().run()
+
+    assert not at.exception  # the min_value == max_value == 1 boundary must not raise
+    qty_widget = at.get_by_key("qty_Storage")
+    assert qty_widget.min == 1
+    assert qty_widget.max == 1
+    assert qty_widget.value == 1
+
+    captions = [c.value for c in at.caption]
+    assert any("up to 1" in c for c in captions)
+
+
+def test_storage_quantity_caption_for_sata_does_not_claim_motherboard_data(seeded_db):
+    """SATA drives have no real motherboard-backed port-count data in this
+    catalog (resolve_quantity_limit correctly returns None for them). The UI
+    must fall back to a clearly-labeled generic cap and must NEVER phrase
+    the caption as if it were a real motherboard-derived fact."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "quant3", "quant3@example.com", "Quant Three")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    mobo = next(c for c in components_repo.get_by_category("Motherboard") if c.name == "ASRock B550M-HDV")
+    sata = next(c for c in components_repo.get_by_category("Storage") if c.name.startswith("Crucial MX500"))
+
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+    at.get_by_key(f"select_Storage_{sata.id}").click().run()
+
+    assert not at.exception
+    qty_widget = at.get_by_key("qty_Storage")
+    assert qty_widget.max == 4  # UI-only fallback cap, not a fabricated motherboard fact
+
+    captions = [c.value for c in at.caption]
+    fallback_captions = [c for c in captions if "safety limit" in c]
+    assert fallback_captions
+    assert not any("motherboard" in c.lower() and "limit reached" in c.lower() for c in fallback_captions)
+    assert not any("Motherboard limit" in c for c in fallback_captions)
+
+
+def test_ram_quantity_clamps_down_when_swapped_kit_shrinks_the_max(seeded_db):
+    """Regression test for the shrink-then-rerun StreamlitAPIException: start
+    with a 1-module ("1x8GB") RAM kit under a 4-slot motherboard (real max 4),
+    push the Qty stepper up to 4, then swap to a 2-module ("2x8GB") kit whose
+    real max is only 2 (4 slots // 2 modules). Before the fix, the stale
+    qty_RAM=4 sitting in st.session_state would make the next st.number_input
+    render raise (its default/current value would be outside the new
+    max_value=2 bound). The fix pre-clamps st.session_state[qty_key] before
+    the widget renders, so this must complete with no exception and the
+    quantity silently clamped down to 2."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "quant4", "quant4@example.com", "Quant Four")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    mobo = next(c for c in components_repo.get_by_category("Motherboard") if c.name == "ASRock B550M-HDV")
+    ram_1_module = next(
+        c for c in components_repo.get_by_category("RAM") if c.name.startswith("Corsair Vengeance 8GB (1x8GB)")
+    )
+    ram_2_module = next(
+        c for c in components_repo.get_by_category("RAM") if c.name.startswith("Corsair Vengeance LPX 16GB (2x8GB)")
+    )
+
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+    at.get_by_key(f"select_RAM_{ram_1_module.id}").click().run()
+    assert at.get_by_key("qty_RAM").max == 4  # 4 slots // 1 module-per-kit
+
+    at.get_by_key("qty_RAM").set_value(4).run()
+    assert not at.exception
+    assert at.session_state["build_draft"]["quantities"]["RAM"] == 4
+
+    # Swap to the 2-module kit: the real max shrinks from 4 to 2, and the
+    # stale quantity of 4 is still sitting in st.session_state["qty_RAM"].
+    at.get_by_key(f"select_RAM_{ram_2_module.id}").click().run()
+
+    assert not at.exception  # must NOT raise StreamlitAPIException
+    qty_widget = at.get_by_key("qty_RAM")
+    assert qty_widget.max == 2
+    assert qty_widget.value == 2  # silently clamped down, not left stale at 4
+    assert at.session_state["build_draft"]["quantities"]["RAM"] == 2
+
+
+def test_resolve_quantity_bound_helper_matches_engine_for_shrink_scenario():
+    """Unit-level check of the clamping helper itself (part_picker.py's
+    _resolve_quantity_bound), independent of AppTest/Streamlit runtime, for
+    the same 1-module -> 2-module shrink scenario as the AppTest regression
+    test above — belt-and-suspenders coverage of the underlying numbers
+    driving the clamp, isolated from any Streamlit widget-rendering nuance."""
+    from db.models import Component
+    from ui.components.part_picker import _resolve_quantity_bound
+
+    motherboard = Component(
+        id=1, category="Motherboard", name="ASRock B550M-HDV", brand="ASRock", price_usd=80.0,
+        specs_json='{"ram_slots": 4, "max_ram_gb": 128}',
+    )
+    ram_1_module = Component(
+        id=2, category="RAM", name="Corsair Vengeance 8GB (1x8GB) DDR4-3200", brand="Corsair",
+        price_usd=19.0, specs_json="{}",
+    )
+    ram_2_module = Component(
+        id=3, category="RAM", name="Corsair Vengeance LPX 16GB (2x8GB) DDR4-3200", brand="Corsair",
+        price_usd=39.0, specs_json="{}",
+    )
+
+    max_before, _, is_real_before = _resolve_quantity_bound("RAM", {"Motherboard": motherboard, "RAM": ram_1_module})
+    assert (max_before, is_real_before) == (4, True)
+
+    max_after, _, is_real_after = _resolve_quantity_bound("RAM", {"Motherboard": motherboard, "RAM": ram_2_module})
+    assert (max_after, is_real_after) == (2, True)
+
+    # the clamp itself: an existing quantity above the new max must be pulled
+    # down to exactly the new max, never left above it.
+    stale_quantity = 4
+    clamped = min(stale_quantity, max_after)
+    assert clamped == 2
+
+
+# ---------------------------------------------------------------------------
+# RAM/Storage quantity stepper — combined physical + budget limit
+# (render_part_picker now calls ui.state.resolve_effective_quantity_limit,
+# which folds a budget-affordability max in alongside the real
+# motherboard/catalog physical max and returns whichever is tighter).
+# ---------------------------------------------------------------------------
+def test_budget_ceiling_blocks_ram_quantity_increment_with_budget_caption(seeded_db):
+    """ASRock B550M-HDV (4 DIMM slots) + a 1-module ("1x8GB", $19) RAM kit has
+    a real physical max of 4 — but a tight budget_ceiling that only leaves
+    room for the single already-selected unit must clamp the stepper's
+    max_value down to 1 (blocking the increment at the widget level, not
+    just after the fact) and show the budget-specific caption, not the
+    physical one."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "budgetqty1", "budgetqty1@example.com", "Budget Qty One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    mobo = next(c for c in components_repo.get_by_category("Motherboard") if c.name == "ASRock B550M-HDV")
+    ram_1_module = next(
+        c for c in components_repo.get_by_category("RAM") if c.name.startswith("Corsair Vengeance 8GB (1x8GB)")
+    )
+    assert mobo.price_usd == 80.0
+    assert ram_1_module.price_usd == 19.0
+
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+    at.get_by_key(f"select_RAM_{ram_1_module.id}").click().run()
+
+    # Sanity: with no budget set yet, the physical limit (4) governs.
+    assert at.get_by_key("qty_RAM").max == 4
+
+    # other_components_cost at qty=1 is just the motherboard ($80). A ceiling
+    # of $105 leaves $25 of headroom for RAM — enough for the 1 unit already
+    # selected ($19) but not a 2nd ($38 total) — so financial_max == 1, which
+    # is tighter than the physical max of 4.
+    at.session_state["build_draft"]["budget_ceiling"] = 105.0
+    at.run()
+
+    assert not at.exception
+    qty_widget = at.get_by_key("qty_RAM")
+    assert qty_widget.max == 1  # budget, not physical (4), is the binding constraint
+    assert qty_widget.value == 1
+
+    captions = [c.value for c in at.caption]
+    assert any("Budget ceiling reached" in c for c in captions)
+    assert not any("Motherboard limit" in c for c in captions)
+
+
+def test_budget_ceiling_wider_than_current_quantity_shows_headroom_caption(seeded_db):
+    """Same setup as above, but with more budget headroom: the effective
+    budget max is 3 while only 1 unit is currently selected, so the caption
+    must be the informational "budget allows up to N" variant, not the
+    "reached" warning — and must state the real number from
+    resolve_effective_quantity_limit, not the physical max."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "budgetqty2", "budgetqty2@example.com", "Budget Qty Two")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    mobo = next(c for c in components_repo.get_by_category("Motherboard") if c.name == "ASRock B550M-HDV")
+    ram_1_module = next(
+        c for c in components_repo.get_by_category("RAM") if c.name.startswith("Corsair Vengeance 8GB (1x8GB)")
+    )
+
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+    at.get_by_key(f"select_RAM_{ram_1_module.id}").click().run()
+
+    # other_components_cost at qty=1 is $80 (motherboard only). A $137
+    # ceiling leaves $57 of RAM headroom -> financial_max = 57 // 19 = 3,
+    # still tighter than the physical max of 4, but wider than the current
+    # quantity of 1.
+    at.session_state["build_draft"]["budget_ceiling"] = 137.0
+    at.run()
+
+    assert not at.exception
+    qty_widget = at.get_by_key("qty_RAM")
+    assert qty_widget.max == 3
+
+    captions = [c.value for c in at.caption]
+    assert any("Budget allows up to 3" in c for c in captions)
+    assert not any("Budget ceiling reached" in c for c in captions)
+    assert not any("Motherboard limit" in c for c in captions)
+
+
+def test_physical_limit_tighter_than_budget_shows_physical_caption(seeded_db):
+    """The inverse direction: ASRock B550M-HDV's real m2_slots is 1, so an
+    NVMe drive's physical max (1) is tighter than an enormous budget ceiling
+    that would otherwise allow far more units. The PHYSICAL caption must
+    win, proving resolve_effective_quantity_limit's "whichever is tighter"
+    logic picks the right limit_kind in both directions, not just when
+    budget happens to be the tighter one."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "budgetqty3", "budgetqty3@example.com", "Budget Qty Three")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    mobo = next(c for c in components_repo.get_by_category("Motherboard") if c.name == "ASRock B550M-HDV")
+    nvme = next(c for c in components_repo.get_by_category("Storage") if c.name.startswith("Kingston NV2"))
+
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+    at.get_by_key(f"select_Storage_{nvme.id}").click().run()
+
+    at.session_state["build_draft"]["budget_ceiling"] = 1_000_000.0
+    at.run()
+
+    assert not at.exception
+    qty_widget = at.get_by_key("qty_Storage")
+    assert qty_widget.max == 1  # physical (m2_slots=1), not budget, is binding
+
+    captions = [c.value for c in at.caption]
+    assert any("Motherboard limit reached: supports up to 1" in c for c in captions)
+    assert not any("Budget" in c for c in captions)
+
+
+def test_free_mode_budget_ceiling_none_never_constrains_quantity_stepper(seeded_db):
+    """Free mode never sets build_draft["budget_ceiling"] (it stays None),
+    which is resolve_effective_quantity_limit's own "no financial
+    constraint" convention. A SATA drive has no real motherboard-backed
+    port-count data (limit_kind "none"), so the stepper must fall back to
+    the UI-only cap (4) regardless of how expensive the pick is, and no
+    budget caption should ever appear."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "budgetqty4", "budgetqty4@example.com", "Budget Qty Four")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    mobo = next(c for c in components_repo.get_by_category("Motherboard") if c.name == "ASRock B550M-HDV")
+    sata = next(c for c in components_repo.get_by_category("Storage") if c.name.startswith("Crucial MX500"))
+
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+    at.get_by_key(f"select_Storage_{sata.id}").click().run()
+
+    assert at.session_state["build_draft"].get("budget_ceiling") is None
+
+    assert not at.exception
+    qty_widget = at.get_by_key("qty_Storage")
+    assert qty_widget.max == 4  # UI-only fallback cap, unaffected by cost since budget_ceiling is None
+
+    captions = [c.value for c in at.caption]
+    assert any("safety limit" in c for c in captions)
+    assert not any("Budget" in c for c in captions)

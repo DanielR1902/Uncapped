@@ -203,6 +203,9 @@ def _part_pickers(build_draft: dict, build_state: dict) -> None:
                 on_select=lambda component, cat=category: state.set_component(build_draft, cat, component),
                 on_remove=lambda cat=category: state.remove_component(build_draft, cat),
                 budget_ceiling=build_draft.get("budget_ceiling"),
+                quantity=state.get_quantity(build_draft, category),
+                on_quantity_change=lambda q, cat=category: state.set_quantity(build_draft, cat, q),
+                quantities=build_draft.get("quantities", {}),
             )
 
     with st.expander("Optional peripherals (Network Card, Sound Card, Optical Drive)"):
@@ -264,8 +267,9 @@ def _summary_header(build_draft: dict, build_state: dict) -> None:
     engage under this Streamlit version's DOM/flex layout — verified live,
     not just assumed — so this is deliberately a normal (non-sticky) card
     at the top of the page rather than shipping CSS that silently no-ops."""
-    total_cost = state.build_total_cost(build_state)
-    report = evaluate_build(build_state)
+    quantities = build_draft.get("quantities", {})
+    total_cost = state.build_total_cost(build_state, quantities)
+    report = evaluate_build(build_state, quantities)
     analysis = st.session_state.get("build_draft_analysis")
     live = scoring.live_bottleneck_and_synergy(build_state) if analysis is None else None
 
@@ -303,6 +307,96 @@ def _summary_header(build_draft: dict, build_state: dict) -> None:
                 st.markdown(theme.tag(issue, "danger"), unsafe_allow_html=True)
 
 
+_MAX_AUTO_OPTIMIZE_ROUNDS = 3
+
+
+def _apply_swaps(build_draft: dict, swaps: list[dict]) -> None:
+    """Resolve each swap's `replace_with_id` to a real Component row and pin
+    it via state.set_component. Every id here is already guaranteed real by
+    llm/advisory.py's _validate_swap_ids (LLM path) or by construction
+    (heuristic path) — the `is not None` check is a defensive belt-and-
+    suspenders guard against a component being deleted from the catalog out
+    from under an already-cached advisory result, never expected in normal
+    operation."""
+    for swap in swaps:
+        component = components_repo.get_by_id(swap["replace_with_id"])
+        if component is not None:
+            state.set_component(build_draft, swap["category"], component)
+
+
+def _apply_stretch_actions(build_draft: dict, actions: list[dict]) -> None:
+    """Apply a stretch_budget.actions list. Each item is either a "swap"
+    (same handling as _apply_swaps: resolve replace_with_id via
+    components_repo.get_by_id then state.set_component) or a
+    "set_quantity" (state.set_quantity(build_draft, category, quantity)
+    directly — no catalog lookup needed, it's a pure count on the
+    already-selected component). Every value here is already validated
+    real by llm/advisory.py; a swap id that somehow doesn't resolve is
+    skipped rather than crashing, mirroring _apply_swaps' own defensive
+    check."""
+    for action in actions:
+        if action.get("action") == "set_quantity":
+            state.set_quantity(build_draft, action["category"], action["quantity"])
+        else:
+            component = components_repo.get_by_id(action["replace_with_id"])
+            if component is not None:
+                state.set_component(build_draft, action["category"], component)
+
+
+def _apply_within_budget_optimization(
+    build_draft: dict, build_state: dict, mode: str, current_budget_or_cost: float, advisory: dict
+) -> None:
+    """Synchronous, single-script-run auto-optimize loop backing Tab 1's
+    "Apply In-Budget Optimization" button. The original ask was to keep
+    re-triggering the advisory loop while `can_optimize_further` stays True
+    "until the system confirms the build is fully optimized" — i.e.
+    unbounded. That's deliberately NOT what this does: a hard cap of
+    `_MAX_AUTO_OPTIMIZE_ROUNDS` rounds guarantees termination and bounds
+    API cost/latency for one click, in case the model or heuristic never
+    converges to `can_optimize_further: False`. Runs entirely within this one
+    callback (no session-state-tracked multi-rerun step machine) — simpler to
+    reason about and inherently bounded.
+
+    `build_state` is recomputed fresh via state.resolve_build_state on every
+    round since state.set_component only mutates build_draft, never the
+    build_state dict passed in here."""
+    current = advisory
+    with st.spinner("Applying optimization..."):
+        for _round_num in range(_MAX_AUTO_OPTIMIZE_ROUNDS):
+            _apply_swaps(build_draft, current["within_budget"]["swaps"])
+            build_state = state.resolve_build_state(build_draft)
+            if not current["within_budget"]["can_optimize_further"]:
+                break
+            new_cost = state.build_total_cost(build_state, build_draft.get("quantities", {}))
+            cost_for_call = (
+                build_draft.get("budget_ceiling")
+                if mode == "Budget" and build_draft.get("budget_ceiling")
+                else new_cost
+            )
+            current = get_build_advisory(
+                build_state, mode, cost_for_call,
+                profile=build_draft.get("workload_profile"),
+                quantities=build_draft.get("quantities", {}),
+            )
+
+        # Cache the final state's advisory under ITS OWN cache key (same
+        # tuple shape _advisory_controls computes on every render) so the
+        # expander shows a coherent result for the build as it now stands,
+        # not a stale one keyed to the pre-swap build.
+        final_cost = (
+            build_draft.get("budget_ceiling")
+            if mode == "Budget" and build_draft.get("budget_ceiling")
+            else state.build_total_cost(build_state, build_draft.get("quantities", {}))
+        )
+        final_key = (
+            mode,
+            build_draft.get("workload_profile"),
+            tuple(sorted((category, component.id) for category, component in build_state.items())),
+            round(final_cost, 2),
+        )
+        st.session_state.setdefault("advisory_cache", {})[final_key] = current
+
+
 def _advisory_controls(build_draft: dict, build_state: dict) -> None:
     """Explicit-click AI Build Advisory (in-budget optimization tips +
     a stretch-budget upgrade path), rendered below the summary metric cards
@@ -336,7 +430,7 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
     mode = build_draft.get("creation_mode")
     current_budget_or_cost = build_draft.get("budget_ceiling") if mode == "Budget" else None
     if not current_budget_or_cost:
-        current_budget_or_cost = state.build_total_cost(build_state)
+        current_budget_or_cost = state.build_total_cost(build_state, build_draft.get("quantities", {}))
 
     cache_key = (
         mode,
@@ -360,6 +454,7 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
                     current_budget_or_cost,
                     profile=build_draft.get("workload_profile"),
                     bottleneck_info=(st.session_state.get("build_draft_analysis") or {}).get("bottleneck"),
+                    quantities=build_draft.get("quantities", {}),
                 )
 
     advisory = cache.get(cache_key)
@@ -388,9 +483,29 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
             f"🚀 Stretch Budget Upgrades (+{stretch_amount:,.0f} USD)",
         ])
         with tab1:
-            st.markdown(_sanitize_markdown(advisory["within_budget"]))
+            st.markdown(_sanitize_markdown(advisory["within_budget"]["explanation"]))
+            if st.button(
+                "⚡ Apply In-Budget Optimization",
+                key="btn_apply_in_budget",
+                disabled=not advisory["within_budget"]["swaps"],
+            ):
+                _apply_within_budget_optimization(build_draft, build_state, mode, current_budget_or_cost, advisory)
+                st.rerun()
         with tab2:
-            st.markdown(_sanitize_markdown(advisory["stretch_budget"]))
+            st.markdown(_sanitize_markdown(advisory["stretch_budget"]["explanation"]))
+            stretch_already_applied = cache_key in st.session_state["stretch_applied_keys"]
+            if st.button(
+                "🚀 Apply Stretch Upgrade (One-Time)",
+                key="btn_apply_stretch",
+                disabled=not advisory["stretch_budget"]["actions"] or stretch_already_applied,
+            ):
+                _apply_stretch_actions(build_draft, advisory["stretch_budget"]["actions"])
+                st.session_state["stretch_applied_keys"].add(cache_key)
+                st.rerun()
+            if not advisory["stretch_budget"]["actions"]:
+                st.caption("No stretch upgrade available for this build right now.")
+            elif stretch_already_applied:
+                st.caption("Already applied for this build — a new advisory result (after further changes) unlocks it again.")
 
 
 def _save_actions(build_draft: dict, build_state: dict) -> None:
@@ -410,7 +525,8 @@ def _save_actions(build_draft: dict, build_state: dict) -> None:
         )
 
     if st.button("💾 Save build", key="save_build", disabled=not build_state, type="primary"):
-        report = evaluate_build(build_state)
+        quantities = build_draft.get("quantities", {})
+        report = evaluate_build(build_state, quantities)
         analysis = st.session_state.get("build_draft_analysis") or {}
         synergy = analysis.get("synergy", {}).get("overall_score")
         bottleneck = analysis.get("bottleneck", {}).get("bottleneck_percentage")
@@ -419,8 +535,11 @@ def _save_actions(build_draft: dict, build_state: dict) -> None:
             user_id=user["id"],
             name=name or "Untitled build",
             creation_mode=build_draft.get("creation_mode") or "Free",
-            components=[builds_repo.BuildComponentInput(component_id=c.id) for c in build_state.values()],
-            total_cost=state.build_total_cost(build_state),
+            components=[
+                builds_repo.BuildComponentInput(component_id=c.id, quantity=state.get_quantity(build_draft, cat))
+                for cat, c in build_state.items()
+            ],
+            total_cost=state.build_total_cost(build_state, quantities),
             compatibility_score=report.compatibility_score,
             workload_profile=build_draft.get("workload_profile"),
             budget_ceiling=build_draft.get("budget_ceiling"),

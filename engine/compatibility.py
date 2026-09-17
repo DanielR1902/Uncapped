@@ -12,6 +12,7 @@ why they compare against different Case fields.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -49,6 +50,20 @@ def _split_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _ram_kit_module_count(component: Component) -> int:
+    """Parses "(NxYGB)" from a RAM component's name to get its real
+    modules-per-kit (e.g. "16GB (2x8GB)" -> 2) — no structured field exists
+    for this in the catalog, so this is a best-effort name parse matching
+    the catalog's consistent naming convention, with a safe fallback of 1
+    module if the pattern isn't found (never fabricates a number beyond
+    what's observably true of the name string)."""
+    if component.name:
+        match = re.search(r"\((\d+)\s*x\s*\d+\s*GB\)", component.name, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return 1
 
 
 def check_cpu_motherboard_socket(build_state: BuildState) -> RuleResult | None:
@@ -202,6 +217,98 @@ def check_psu_headroom(build_state: BuildState) -> RuleResult | None:
     return RuleResult("psu_headroom", passed, message)
 
 
+def check_ram_capacity(build_state: BuildState, quantities: dict[str, int] | None) -> RuleResult | None:
+    motherboard = build_state.get("Motherboard")
+    ram = build_state.get("RAM")
+    if motherboard is None or ram is None:
+        return None
+    mobo_specs = _specs(motherboard)
+    ram_slots = mobo_specs.get("ram_slots")
+    max_ram_gb = mobo_specs.get("max_ram_gb")
+    if ram_slots is None or max_ram_gb is None or ram.capacity_gb is None:
+        return None
+    qty = (quantities or {}).get("RAM", 1)
+    total_capacity = ram.capacity_gb * qty
+    # Real per-module math: a kit's name encodes its actual stick count
+    # ("16GB (2x8GB)" -> 2 modules), so the true physical slot cost of `qty`
+    # kits is qty * modules-per-kit, not qty itself (see
+    # _ram_kit_module_count's docstring for why this is a name parse rather
+    # than a structured field).
+    kit_modules = _ram_kit_module_count(ram)
+    total_modules_used = qty * kit_modules
+    passed = total_modules_used <= ram_slots and total_capacity <= max_ram_gb
+    message = (
+        f"{qty}x {ram.capacity_gb}GB RAM kit(s) ({kit_modules} module(s) per kit, "
+        f"{total_modules_used} module(s) total, {total_capacity}GB total) fits "
+        f"motherboard's {ram_slots} RAM slot(s) and {max_ram_gb}GB max capacity."
+        if passed
+        else f"RAM capacity mismatch: {qty}x {ram.capacity_gb}GB kit(s) ({kit_modules} module(s) per "
+        f"kit, {total_modules_used} module(s) total, {total_capacity}GB total) exceeds motherboard's "
+        f"{ram_slots} RAM slot(s) / {max_ram_gb}GB max capacity."
+    )
+    return RuleResult("ram_capacity", passed, message)
+
+
+def resolve_quantity_limit(build_state: BuildState, category: str) -> tuple[int | None, str]:
+    """Single source of truth for "what's the real, catalog/motherboard-
+    backed max quantity for this category, and why" — used by the quantity-
+    aware rules above, by llm/advisory.py (replacing its own duplicate slot-
+    count logic), and by the UI for a quantity input's max_value/caption.
+
+    Returns (max_allowed, reason). max_allowed is None when no real
+    motherboard/catalog data exists to bound this category's quantity —
+    callers must NOT fabricate a fallback number in that case (a UI layer
+    may apply its own clearly-labeled conservative display cap, but that is
+    a UI convenience, never claimed as a real hardware-derived limit)."""
+    if category not in ("RAM", "Storage"):
+        return None, ""
+    motherboard = build_state.get("Motherboard")
+    if motherboard is None:
+        return None, "Select a Motherboard to see this category's real slot limit."
+    specs = _specs(motherboard)
+
+    if category == "RAM":
+        ram = build_state.get("RAM")
+        ram_slots = specs.get("ram_slots")
+        if ram is None or ram_slots is None:
+            return None, "No RAM selected yet, or this motherboard has no listed DIMM slot count."
+        kit_modules = _ram_kit_module_count(ram)
+        max_qty = max(1, ram_slots // kit_modules)
+        return max_qty, (
+            f"This motherboard supports up to {max_qty} kit(s) of this type "
+            f"({ram_slots} DIMM slots total, {kit_modules} module(s) per kit)."
+        )
+
+    # Storage
+    storage = build_state.get("Storage")
+    if storage is None:
+        return None, "No Storage selected yet."
+    if storage.interface and "NVMe" in storage.interface:
+        m2_slots = specs.get("m2_slots")
+        if m2_slots is None:
+            return None, "This motherboard has no listed M.2 slot count."
+        return m2_slots, f"This motherboard supports up to {m2_slots} M.2 NVMe drive(s)."
+    return None, "No motherboard-specific port-count data exists for this drive's interface in this catalog."
+
+
+def check_storage_slot_capacity(build_state: BuildState, quantities: dict[str, int] | None) -> RuleResult | None:
+    motherboard = build_state.get("Motherboard")
+    storage = build_state.get("Storage")
+    if motherboard is None or storage is None:
+        return None
+    m2_slots = _specs(motherboard).get("m2_slots")
+    if m2_slots is None or not storage.interface or "NVMe" not in storage.interface:
+        return None  # only M.2/NVMe drives have a real slot-count constraint in this catalog
+    qty = (quantities or {}).get("Storage", 1)
+    passed = qty <= m2_slots
+    message = (
+        f"{qty}x NVMe drive(s) fits motherboard's {m2_slots} M.2 slot(s)."
+        if passed
+        else f"Storage slot mismatch: {qty}x NVMe drive(s) exceeds motherboard's {m2_slots} M.2 slot(s)."
+    )
+    return RuleResult("storage_slot_capacity", passed, message)
+
+
 _RULES: tuple[Callable[[BuildState], RuleResult | None], ...] = (
     check_cpu_motherboard_socket,
     check_ram_motherboard_type,
@@ -213,18 +320,27 @@ _RULES: tuple[Callable[[BuildState], RuleResult | None], ...] = (
     check_psu_headroom,
 )
 
+_QUANTITY_RULES: tuple[Callable[[BuildState, dict[str, int] | None], RuleResult | None], ...] = (
+    check_ram_capacity,
+    check_storage_slot_capacity,
+)
 
-def run_all_checks(build_state: BuildState) -> list[RuleResult]:
+
+def run_all_checks(build_state: BuildState, quantities: dict[str, int] | None = None) -> list[RuleResult]:
     results = []
     for rule in _RULES:
         result = rule(build_state)
         if result is not None:
             results.append(result)
+    for quantity_rule in _QUANTITY_RULES:
+        result = quantity_rule(build_state, quantities)
+        if result is not None:
+            results.append(result)
     return results
 
 
-def evaluate_build(build_state: BuildState) -> CompatibilityReport:
-    results = run_all_checks(build_state)
+def evaluate_build(build_state: BuildState, quantities: dict[str, int] | None = None) -> CompatibilityReport:
+    results = run_all_checks(build_state, quantities)
     total = len(results)
     passed = sum(1 for r in results if r.passed)
     score = 100.0 if total == 0 else 100.0 * passed / total

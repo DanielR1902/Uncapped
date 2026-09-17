@@ -170,6 +170,147 @@ def test_psu_headroom_uses_named_constants():
 
 
 # ---------------------------------------------------------------------------
+# compatibility.py — quantity-aware RAM capacity / storage slot rules
+# ---------------------------------------------------------------------------
+def test_ram_capacity_fails_when_quantity_exceeds_slots():
+    motherboard = make_component("Motherboard", id=1, specs={"ram_slots": 2, "max_ram_gb": 128})
+    ram = make_component("RAM", id=2, capacity_gb=16)
+    result = compatibility.check_ram_capacity({"Motherboard": motherboard, "RAM": ram}, {"RAM": 3})
+    assert result is not None
+    assert result.passed is False
+    assert "RAM capacity mismatch" in result.message
+
+
+def test_ram_capacity_fails_when_total_capacity_exceeds_max_ram_gb():
+    motherboard = make_component("Motherboard", id=1, specs={"ram_slots": 4, "max_ram_gb": 64})
+    ram = make_component("RAM", id=2, capacity_gb=32)
+    result = compatibility.check_ram_capacity({"Motherboard": motherboard, "RAM": ram}, {"RAM": 3})
+    assert result is not None
+    assert result.passed is False
+
+
+def test_ram_capacity_passes_within_both_limits():
+    motherboard = make_component("Motherboard", id=1, specs={"ram_slots": 4, "max_ram_gb": 128})
+    ram = make_component("RAM", id=2, capacity_gb=16)
+    result = compatibility.check_ram_capacity({"Motherboard": motherboard, "RAM": ram}, {"RAM": 2})
+    assert result is not None
+    assert result.passed is True
+
+
+def test_ram_capacity_with_no_quantities_behaves_as_quantity_one():
+    motherboard = make_component("Motherboard", id=1, specs={"ram_slots": 4, "max_ram_gb": 32})
+    ram = make_component("RAM", id=2, capacity_gb=32)
+    result_none = compatibility.check_ram_capacity({"Motherboard": motherboard, "RAM": ram}, None)
+    result_explicit_one = compatibility.check_ram_capacity({"Motherboard": motherboard, "RAM": ram}, {"RAM": 1})
+    assert result_none is not None
+    assert result_none.passed is True
+    assert result_none.passed == result_explicit_one.passed
+
+
+# ---------------------------------------------------------------------------
+# compatibility.py — real RAM module-count math (replaces the old
+# "1 kit = 1 slot" approximation) and resolve_quantity_limit
+# ---------------------------------------------------------------------------
+def test_ram_kit_module_count_parses_name():
+    two_module_kit = make_component("RAM", id=1, name="Crucial 16GB (2x8GB) DDR4-3200")
+    one_module_kit = make_component("RAM", id=2, name="Corsair Vengeance 8GB (1x8GB) DDR4-3200")
+    no_pattern = make_component("RAM", id=3, name="Some RAM With No Pattern")
+    assert compatibility._ram_kit_module_count(two_module_kit) == 2
+    assert compatibility._ram_kit_module_count(one_module_kit) == 1
+    assert compatibility._ram_kit_module_count(no_pattern) == 1
+
+
+def test_resolve_quantity_limit_ram_uses_real_module_count_for_2_module_kit():
+    motherboard = make_component("Motherboard", id=1, specs={"ram_slots": 4, "max_ram_gb": 128})
+    ram = make_component("RAM", id=2, name="Crucial 16GB (2x8GB) DDR4-3200", capacity_gb=16)
+    max_qty, reason = compatibility.resolve_quantity_limit({"Motherboard": motherboard, "RAM": ram}, "RAM")
+    assert max_qty == 2  # 4 slots // 2 modules-per-kit, NOT the old "1 kit = 1 slot" value of 4
+    assert reason
+
+
+def test_resolve_quantity_limit_ram_uses_real_module_count_for_1_module_kit():
+    motherboard = make_component("Motherboard", id=1, specs={"ram_slots": 4, "max_ram_gb": 128})
+    ram = make_component("RAM", id=2, name="Corsair Vengeance 8GB (1x8GB) DDR4-3200", capacity_gb=8)
+    max_qty, reason = compatibility.resolve_quantity_limit({"Motherboard": motherboard, "RAM": ram}, "RAM")
+    assert max_qty == 4
+    assert reason
+
+
+def test_resolve_quantity_limit_storage_sata_returns_none_with_honest_reason():
+    motherboard = make_component("Motherboard", id=1, specs={"m2_slots": 2})
+    storage = make_component("Storage", id=2, interface="SATA", capacity_gb=2000)
+    max_qty, reason = compatibility.resolve_quantity_limit({"Motherboard": motherboard, "Storage": storage}, "Storage")
+    assert max_qty is None
+    assert "port-count" in reason.lower() or "port" in reason.lower()
+
+
+def test_resolve_quantity_limit_no_motherboard_returns_none():
+    ram = make_component("RAM", id=1, name="Crucial 16GB (2x8GB) DDR4-3200", capacity_gb=16)
+    max_qty, reason = compatibility.resolve_quantity_limit({"RAM": ram}, "RAM")
+    assert max_qty is None
+    assert reason
+
+
+def test_check_ram_capacity_accepts_2_and_rejects_3_for_4_slot_board_with_2_module_kit():
+    """The real, intentional behavior change: a 4-DIMM-slot motherboard with
+    a 2-module RAM kit now correctly caps quantity at 2 (2 kits x 2 modules
+    = 4 slots), not 4 as the old "1 kit = 1 slot" approximation permitted."""
+    motherboard = make_component("Motherboard", id=1, specs={"ram_slots": 4, "max_ram_gb": 256})
+    ram = make_component("RAM", id=2, name="Crucial 16GB (2x8GB) DDR4-3200", capacity_gb=16)
+    build_state = {"Motherboard": motherboard, "RAM": ram}
+
+    result_2 = compatibility.check_ram_capacity(build_state, {"RAM": 2})
+    assert result_2 is not None
+    assert result_2.passed is True
+
+    result_3 = compatibility.check_ram_capacity(build_state, {"RAM": 3})
+    assert result_3 is not None
+    assert result_3.passed is False
+
+
+def test_storage_slot_capacity_fails_when_nvme_quantity_exceeds_m2_slots():
+    motherboard = make_component("Motherboard", id=1, specs={"m2_slots": 2})
+    storage = make_component("Storage", id=2, interface="NVMe", capacity_gb=1000)
+    result = compatibility.check_storage_slot_capacity({"Motherboard": motherboard, "Storage": storage}, {"Storage": 3})
+    assert result is not None
+    assert result.passed is False
+
+
+def test_storage_slot_capacity_non_nvme_is_unaffected():
+    motherboard = make_component("Motherboard", id=1, specs={"m2_slots": 1})
+    storage = make_component("Storage", id=2, interface="SATA", capacity_gb=2000)
+    result = compatibility.check_storage_slot_capacity({"Motherboard": motherboard, "Storage": storage}, {"Storage": 5})
+    assert result is None
+
+
+def test_run_all_checks_and_evaluate_build_unaffected_without_quantities_arg():
+    """Backward-compat guard: calling run_all_checks/evaluate_build with NO
+    quantities arg, exactly as every existing caller does, must produce
+    identical results to before the quantity-multiplier feature."""
+    build_state = {
+        "CPU": make_component("CPU", id=1, socket="AM5", tdp_watts=105, benchmark_score=80),
+        "Motherboard": make_component("Motherboard", id=2, socket="AM5", ram_type="DDR5", form_factor="ATX"),
+        "RAM": make_component("RAM", id=3, ram_type="DDR5", capacity_gb=32),
+        "GPU": make_component("GPU", id=4, tdp_watts=220, benchmark_score=74, specs={"length_mm": 267}),
+        "PSU": make_component("PSU", id=5, wattage_capacity=750, form_factor="ATX"),
+        "Case": make_component(
+            "Case", id=6, form_factor="ATX,mATX,ITX", max_gpu_length_mm=380, max_cooler_height_mm=170,
+            psu_form_factor_support="ATX",
+        ),
+        "Cooler": make_component("Cooler", id=7, socket="AM4,AM5,LGA1700", specs={"cooler_type": "Air", "height_mm": 160}),
+    }
+    results_no_arg = compatibility.run_all_checks(build_state)
+    report_no_arg = compatibility.evaluate_build(build_state)
+    assert report_no_arg.is_compatible is True
+    assert report_no_arg.compatibility_score == 100.0
+    assert report_no_arg.issues == []
+    # identical to explicitly passing quantities=None
+    assert [r.message for r in results_no_arg] == [
+        r.message for r in compatibility.run_all_checks(build_state, None)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # compatibility.py — full-build audit
 # ---------------------------------------------------------------------------
 def test_evaluate_build_fully_compatible_scores_100():

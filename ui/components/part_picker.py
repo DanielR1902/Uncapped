@@ -12,8 +12,18 @@ import streamlit as st
 
 from db.models import Component
 from engine import scoring
-from engine.compatibility import BuildState, evaluate_build
+from engine.compatibility import BuildState, evaluate_build, resolve_quantity_limit
 from engine.solvers import CATEGORY_ORDER, cheapest_fill_cost
+from ui.state import resolve_effective_quantity_limit
+
+# UI-only conservative display cap used ONLY when engine.compatibility's
+# resolve_quantity_limit returns (None, ...) — i.e. no real motherboard/
+# catalog data exists to bound this category's quantity (no Motherboard
+# picked, no RAM/Storage slot-count field, or a non-NVMe Storage interface
+# with no real port-count data in this catalog). This number is never
+# presented as a hardware fact — see _resolve_quantity_bound's docstring
+# and render_part_picker's caption handling below.
+_FALLBACK_QUANTITY_CAP = 4
 
 SORT_OPTIONS = ("Cost", "Compatibility", "ValueIndex")
 _MAX_CANDIDATES_SHOWN = 25
@@ -86,6 +96,23 @@ def _key_specs(component: Component) -> list[str]:
     return chips[:3]
 
 
+def _resolve_quantity_bound(category: str, build_state: BuildState) -> tuple[int, str, bool]:
+    """Thin wrapper around engine.compatibility.resolve_quantity_limit — the
+    single source of truth for the real, motherboard-backed max quantity.
+    Returns (max_value_for_widget, reason, is_real):
+    - is_real=True: max_value_for_widget IS the real motherboard/catalog
+      limit (e.g. real ram_slots // modules-per-kit, or real m2_slots for
+      NVMe Storage) and `reason` is the engine's own honest explanation.
+    - is_real=False: no real motherboard/catalog data exists to bound this
+      category's quantity, so max_value_for_widget is this UI's own
+      clearly-labeled conservative fallback cap (_FALLBACK_QUANTITY_CAP) —
+      never presented to the user as a real hardware fact."""
+    max_allowed, reason = resolve_quantity_limit(build_state, category)
+    if max_allowed is not None:
+        return max_allowed, reason, True
+    return _FALLBACK_QUANTITY_CAP, reason, False
+
+
 def _min_reserve_for_other_slots(category: str, build_state: BuildState, candidate: Component) -> float:
     """Cheapest possible cost to fill every OTHER core category that's still
     empty (excluding `category`, the slot currently being picked), GIVEN
@@ -107,6 +134,9 @@ def _min_reserve_for_other_slots(category: str, build_state: BuildState, candida
     return cheapest_fill_cost(hypothetical, other_categories)
 
 
+_QUANTITY_CATEGORIES = ("RAM", "Storage")
+
+
 def render_part_picker(
     category: str,
     build_state: BuildState,
@@ -114,6 +144,9 @@ def render_part_picker(
     on_select: Callable[[Component], None],
     on_remove: Callable[[], None] | None = None,
     budget_ceiling: float | None = None,
+    quantity: int = 1,
+    on_quantity_change: Callable[[int], None] | None = None,
+    quantities: dict[str, int] | None = None,
 ) -> None:
     current = build_state.get(category)
     sort_criteria = st.session_state.get("sort_criteria", "Cost")
@@ -130,10 +163,96 @@ def render_part_picker(
             st.markdown(f"{icon} **{category}**")
             if current is not None:
                 st.badge("Selected", icon=":material/check_circle:", color="green")
-                st.caption(f"{current.name} · ${current.price_usd:,.2f}")
+                if category in _QUANTITY_CATEGORIES and quantity > 1:
+                    st.caption(
+                        f"{current.name} · ${current.price_usd:,.2f} × {quantity} = "
+                        f"${current.price_usd * quantity:,.2f}"
+                    )
+                else:
+                    st.caption(f"{current.name} · ${current.price_usd:,.2f}")
                 specs_line = " · ".join(_key_specs(current))
                 if specs_line:
                     st.caption(specs_line)
+                if category in _QUANTITY_CATEGORIES and on_quantity_change is not None:
+                    # Combined physical + budget bound: resolve_effective_quantity_limit
+                    # (ui/state.py) folds engine.compatibility.resolve_quantity_limit's
+                    # real motherboard/catalog max together with a budget-affordability
+                    # max (holding every other category's cost fixed), returning
+                    # whichever is tighter as (effective_max, reason, limit_kind).
+                    # limit_kind == "none" means NEITHER constraint has real data to
+                    # bound this category (per that function's own logic this only
+                    # happens when budget_ceiling is also None, since a real ceiling
+                    # always yields a real financial max) — fall back to this UI's
+                    # own conservative cap exactly as before.
+                    effective_max, reason, limit_kind = resolve_effective_quantity_limit(
+                        build_state, category, quantities or {}, budget_ceiling
+                    )
+                    max_qty = effective_max if effective_max is not None else _FALLBACK_QUANTITY_CAP
+                    qty_key = f"qty_{category}"
+
+                    # Streamlit widget-key-persistence gotcha: a widget created
+                    # with a stable key= persists its value in
+                    # st.session_state across reruns, and on every rerun AFTER
+                    # the first, Streamlit renders using the EXISTING
+                    # session-state value for that key — the value= argument
+                    # below is only honored the very first time this widget is
+                    # ever created. Since resolve_quantity_limit now uses real
+                    # per-module math, swapping in a RAM kit with more modules
+                    # per kit (or a Storage pick with a tighter slot count) can
+                    # make max_qty legitimately SHRINK between reruns. If the
+                    # OLD quantity is still sitting in
+                    # st.session_state[qty_key] from before the swap and now
+                    # exceeds the NEW (smaller) max_qty, st.number_input raises
+                    # a raw StreamlitAPIException ("the default value ... is
+                    # outside the bounds") the moment it tries to render. The
+                    # fix is to clamp the session-state value down BEFORE
+                    # instantiating the widget with that same key (never
+                    # after, which raises a different Streamlit exception) —
+                    # this silently re-clamps the stepper instead of crashing.
+                    number_input_kwargs: dict = {"min_value": 1, "max_value": max_qty, "step": 1, "key": qty_key}
+                    if qty_key in st.session_state:
+                        if st.session_state[qty_key] > max_qty:
+                            st.session_state[qty_key] = max_qty
+                    else:
+                        # `value=` is only ever honored the very first time
+                        # this key is created (see comment above) — passing it
+                        # again on later reruns, once st.session_state already
+                        # owns the key, is not just redundant but also trips
+                        # Streamlit's own "widget had a default value but its
+                        # value was also set via the Session State API"
+                        # warning on the exact rerun where we clamp above, so
+                        # it's only included for that true first-render case.
+                        number_input_kwargs["value"] = min(quantity, max_qty)
+
+                    new_quantity = st.number_input("Qty", **number_input_kwargs)
+                    if new_quantity != quantity:
+                        on_quantity_change(int(new_quantity))
+                        st.rerun()
+
+                    if limit_kind == "physical":
+                        if new_quantity >= max_qty:
+                            st.caption(
+                                f"ℹ️ Motherboard limit reached: supports up to {max_qty} of this component type."
+                            )
+                        else:
+                            st.caption(f"ℹ️ Motherboard limit: up to {max_qty} of this component. {reason}")
+                    elif limit_kind == "budget":
+                        if new_quantity >= max_qty:
+                            st.caption("⚠️ Budget ceiling reached for additional units.")
+                        else:
+                            st.caption(
+                                f"💰 Budget allows up to {max_qty} of this component at the current ceiling."
+                            )
+                    else:
+                        # "drive type" matches the directive's own Storage/SATA
+                        # wording verbatim; RAM gets the equivalent honest
+                        # phrasing for its own no-data cases (e.g. no
+                        # Motherboard picked yet).
+                        noun = "drive type" if category == "Storage" else "component type"
+                        st.caption(
+                            f"No motherboard-specific slot data for this {noun} — "
+                            "quantity capped at 4 as a general safety limit."
+                        )
             else:
                 st.badge("Empty", icon=":material/radio_button_unchecked:", color="gray")
                 st.caption("Not selected yet")
