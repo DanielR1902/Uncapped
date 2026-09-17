@@ -33,6 +33,7 @@ def create_build(
     total_cost: float,
     compatibility_score: float,
     workload_profile: str | None = None,
+    workload_tier: str | None = None,
     budget_ceiling: float | None = None,
     synergy_score: float | None = None,
     bottleneck_percentage: float | None = None,
@@ -44,6 +45,7 @@ def create_build(
             name=name,
             creation_mode=creation_mode,
             workload_profile=workload_profile,
+            workload_tier=workload_tier,
             budget_ceiling=budget_ceiling,
             total_cost=total_cost,
             synergy_score=synergy_score,
@@ -128,6 +130,14 @@ def set_public(build_id: int, is_public: bool) -> None:
         if build is None:
             raise ValueError(f"No build with id={build_id}")
         build.is_public = is_public
+
+
+def set_workload_tier(build_id: int, workload_tier: str) -> None:
+    with session_scope() as session:
+        build = session.get(Build, build_id)
+        if build is None:
+            raise ValueError(f"No build with id={build_id}")
+        build.workload_tier = workload_tier
 
 
 def delete_build(build_id: int) -> None:

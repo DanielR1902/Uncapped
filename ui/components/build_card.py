@@ -6,7 +6,7 @@ from typing import Callable
 import streamlit as st
 
 from db.models import Build
-from ui.format import humanize_profile
+from ui.format import humanize_profile, sanitize_markdown
 
 
 def render_build_card(
@@ -18,7 +18,7 @@ def render_build_card(
     Yes/Cancel step before firing their callback — a destructive action
     should never be a single misclick away."""
     with st.container(border=True):
-        st.markdown(f"#### {build.name}")
+        st.markdown(sanitize_markdown(f"#### {build.name}"))
 
         cols = st.columns(4)
         cols[0].metric("Cost", f"${build.total_cost:,.2f}", border=True)
@@ -37,6 +37,8 @@ def render_build_card(
         caption = f"{build.creation_mode} build"
         if build.workload_profile:
             caption += f" · {humanize_profile(build.workload_profile)}"
+        if build.workload_tier is not None:
+            caption += f" · Tier: {build.workload_tier}"
         caption += f" · {build.created_at:%Y-%m-%d}"
         st.caption(caption)
 

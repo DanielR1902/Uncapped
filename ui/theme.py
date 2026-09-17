@@ -25,6 +25,14 @@ def tag(text: str, kind: str = "danger") -> str:
     return f'<span class="uncapped-tag-{kind}">{text}</span>'
 
 
+def section_header(text: str) -> str:
+    """Left-accent-bordered section heading (e.g. grouping build cards by
+    workload profile in my_builds.py) — a step up from a bare `####` without
+    hardcoding a color outside this module. Render via
+    `st.markdown(section_header(...), unsafe_allow_html=True)`."""
+    return f'<div class="uncapped-section-header">{text}</div>'
+
+
 def inject_css() -> None:
     st.markdown(
         f"""
@@ -40,6 +48,14 @@ def inject_css() -> None:
         .uncapped-tag-success {{ color: {PRIMARY_ACCENT}; font-weight: 600; }}
         .uncapped-tag-warning {{ color: {WARNING_ACCENT}; font-weight: 600; }}
         .uncapped-muted {{ color: {TEXT_MUTED}; font-size: 0.85rem; }}
+        .uncapped-section-header {{
+            border-left: 4px solid {PRIMARY_ACCENT};
+            padding: 0.35rem 0.9rem;
+            margin: 1.5rem 0 0.75rem;
+            font-size: 1.15rem;
+            font-weight: 600;
+            color: {TEXT_PRIMARY};
+        }}
         /* Best-effort: push the sidebar's last element (Logout) toward the
         bottom via flex layout. Streamlit's internal sidebar DOM structure can
         shift between versions, so this degrades gracefully to a normal

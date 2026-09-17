@@ -7,6 +7,18 @@ from auth.session import current_user
 from db.repositories import builds_repo, community_repo, users_repo
 from ui import state
 from ui.components.build_card import render_build_card
+from ui.format import humanize_profile, sanitize_markdown
+
+
+def _post_subtitle(build, created_at) -> str:
+    if (
+        build.creation_mode == "Workload"
+        and build.workload_profile is not None
+        and build.workload_tier is not None
+    ):
+        domain = humanize_profile(build.workload_profile)
+        return f"Workload build · {domain} · Tier: {build.workload_tier} · {created_at:%Y-%m-%d}"
+    return f"{build.creation_mode} build · {created_at:%Y-%m-%d}"
 
 
 def _fork_into_studio(build) -> None:
@@ -37,6 +49,7 @@ def _save_to_my_builds(build) -> None:
         total_cost=build.total_cost,
         compatibility_score=build.compatibility_score,
         workload_profile=build.workload_profile,
+        workload_tier=build.workload_tier,
         budget_ceiling=build.budget_ceiling,
         synergy_score=build.synergy_score,
         bottleneck_percentage=build.bottleneck_percentage,
@@ -113,12 +126,76 @@ def render() -> None:
         st.info("No builds shared yet — be the first from your Previous Builds page!")
         return
 
-    for post in posts:
-        with st.container(border=True):
-            st.markdown(f"### {post.title}")
-            st.caption(
-                f"{post.build.creation_mode} build · ${post.build.total_cost:,.2f} · {post.created_at:%Y-%m-%d}"
+    mode_filter = st.selectbox(
+        "Filter by Build Type", ["All", "Budget", "Workload", "Free"], key="community_mode_filter"
+    )
+
+    price_ceiling: float | None = None
+    domain_filter = "All"
+    tier_filter = "All"
+
+    if mode_filter == "Budget":
+        budget_costs = [p.build.total_cost for p in posts if p.build.creation_mode == "Budget"]
+        if budget_costs:
+            max_cost = max(budget_costs)
+            price_steps = []
+            step = 1000
+            while True:
+                price_steps.append(step)
+                if step >= max_cost:
+                    break
+                step += 500
+            price_choice = st.selectbox(
+                "Max Price Limit",
+                ["All Prices"] + [f"${p:,.0f}" for p in price_steps],
+                key="community_price_filter",
             )
+            if price_choice != "All Prices":
+                price_ceiling = float(price_choice.replace("$", "").replace(",", ""))
+    elif mode_filter == "Workload":
+        col_domain, col_tier = st.columns(2)
+        domains = sorted(
+            {
+                humanize_profile(p.build.workload_profile)
+                for p in posts
+                if p.build.creation_mode == "Workload" and p.build.workload_profile is not None
+            }
+        )
+        tiers = sorted(
+            {
+                p.build.workload_tier
+                for p in posts
+                if p.build.creation_mode == "Workload" and p.build.workload_tier is not None
+            },
+            key=lambda t: ("Entry", "Mid", "High", "Enthusiast").index(t),
+        )
+        domain_filter = col_domain.selectbox("Domain", ["All"] + domains, key="community_domain_filter")
+        tier_filter = col_tier.selectbox("Tier", ["All"] + tiers, key="community_tier_filter")
+
+    filtered_posts = posts
+    if mode_filter != "All":
+        filtered_posts = [p for p in filtered_posts if p.build.creation_mode == mode_filter]
+    if mode_filter == "Budget" and price_ceiling is not None:
+        filtered_posts = [p for p in filtered_posts if p.build.total_cost <= price_ceiling]
+    if mode_filter == "Workload":
+        if domain_filter != "All":
+            filtered_posts = [
+                p
+                for p in filtered_posts
+                if p.build.workload_profile is not None
+                and humanize_profile(p.build.workload_profile) == domain_filter
+            ]
+        if tier_filter != "All":
+            filtered_posts = [p for p in filtered_posts if p.build.workload_tier == tier_filter]
+
+    if not filtered_posts:
+        st.info("No community builds match the selected filters.")
+        return
+
+    for post in filtered_posts:
+        with st.container(border=True):
+            st.markdown(sanitize_markdown(f"### {post.title} | ${post.build.total_cost:,.2f}"))
+            st.caption(_post_subtitle(post.build, post.created_at))
             if st.button("View", key=f"view_post_{post.id}"):
                 st.session_state["selected_post_id"] = post.id
                 st.rerun()

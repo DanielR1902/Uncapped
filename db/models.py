@@ -142,6 +142,7 @@ class Build(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     creation_mode: Mapped[str] = mapped_column(Text, nullable=False)
     workload_profile: Mapped[str | None] = mapped_column(Text)
+    workload_tier: Mapped[str | None] = mapped_column(Text)
     budget_ceiling: Mapped[float | None] = mapped_column(Float)
     total_cost: Mapped[float] = mapped_column(Float, nullable=False)
     synergy_score: Mapped[float | None] = mapped_column(Float)
@@ -178,6 +179,10 @@ class Build(Base):
         CheckConstraint(
             "workload_profile IS NULL OR " + _in_list_sql("workload_profile", WORKLOAD_PROFILES),
             name="ck_builds_workload_profile",
+        ),
+        CheckConstraint(
+            "workload_tier IS NULL OR " + _in_list_sql("workload_tier", WORKLOAD_TIERS),
+            name="ck_builds_workload_tier",
         ),
         Index("idx_builds_user_created", "user_id", "created_at"),
         Index("idx_builds_public_created", "is_public", "created_at"),

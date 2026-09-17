@@ -69,9 +69,37 @@ def session_scope() -> Iterator[Session]:
         session.close()
 
 
+def _ensure_builds_workload_tier_column() -> None:
+    """One-time, idempotent, additive migration: db/models.py added
+    Build.workload_tier after this project's `builds` table already existed
+    (populated by real usage) in some environments — Base.metadata.create_all
+    only creates missing TABLES, never ALTERs existing ones to add a missing
+    column, so this must be done explicitly. Purely additive (ADD COLUMN,
+    nullable, no data touched or removed) — never drops/recreates anything.
+
+    Must run AFTER Base.metadata.create_all() so `builds` is guaranteed to
+    exist (a genuinely fresh DB gets the column correctly from create_all
+    already, so this just no-ops on it)."""
+    engine = get_engine()
+    if engine.dialect.name != "sqlite":
+        return  # this project's only other target is Postgres in cloud deploy; a
+                 # real migration tool would be needed there, out of scope here
+    with engine.connect() as conn:
+        table_exists = conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='builds'"
+        ).fetchone()
+        if table_exists is None:
+            return
+        existing_columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(builds)")}
+        if "workload_tier" not in existing_columns:
+            conn.exec_driver_sql("ALTER TABLE builds ADD COLUMN workload_tier TEXT")
+            conn.commit()
+
+
 def init_db() -> None:
     """Create all tables that don't already exist."""
     Base.metadata.create_all(get_engine())
+    _ensure_builds_workload_tier_column()
 
 
 def reset_db() -> None:

@@ -27,7 +27,7 @@ from llm.advisory import get_build_advisory
 from llm.client import analyze_build
 from ui import state, theme
 from ui.components.part_picker import render_part_picker
-from ui.format import humanize_profile
+from ui.format import humanize_profile, sanitize_markdown
 
 CORE_CATEGORIES = solvers.CATEGORY_ORDER
 PERIPHERAL_CATEGORIES = solvers.PERIPHERAL_CATEGORIES
@@ -38,16 +38,6 @@ _MODE_CARDS = (
     ("Workload", "🎯 Workload Profile", "Pick what it's for — Gaming, Video Editing, Programming/AI, Design, or General — and get a tiered baseline instantly."),
     ("Free", "🧩 Free Custom", "Full control from the first part. Every pick is checked live for compatibility against everything else."),
 )
-
-
-def _sanitize_markdown(text: str) -> str:
-    """Defensively strip any literal `$` from LLM-authored text before it
-    reaches st.markdown/st.write. The advisory system prompt already
-    instructs the model to never use standalone dollar signs (a matching
-    "$...$" pair triggers Streamlit's KaTeX/math-mode rendering and garbles
-    plain prices), but this is a last-resort belt-and-suspenders guard in
-    case the model ignores that instruction anyway."""
-    return text.replace("$", "USD ")
 
 
 def _mode_selector() -> None:
@@ -471,11 +461,11 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
         with col_pros:
             st.markdown("##### :green[✔ Pros & Strengths]")
             for item in advisory.get("pros", []):
-                st.markdown(f"- :green[{_sanitize_markdown(item)}]")
+                st.markdown(f"- :green[{sanitize_markdown(item)}]")
         with col_cons:
             st.markdown("##### :red[✖ Cons & Limitations]")
             for item in advisory.get("cons", []):
-                st.markdown(f"- :red[{_sanitize_markdown(item)}]")
+                st.markdown(f"- :red[{sanitize_markdown(item)}]")
         st.divider()
 
         tab1, tab2 = st.tabs([
@@ -483,7 +473,7 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
             f"🚀 Stretch Budget Upgrades (+{stretch_amount:,.0f} USD)",
         ])
         with tab1:
-            st.markdown(_sanitize_markdown(advisory["within_budget"]["explanation"]))
+            st.markdown(sanitize_markdown(advisory["within_budget"]["explanation"]))
             if st.button(
                 "⚡ Apply In-Budget Optimization",
                 key="btn_apply_in_budget",
@@ -492,7 +482,7 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
                 _apply_within_budget_optimization(build_draft, build_state, mode, current_budget_or_cost, advisory)
                 st.rerun()
         with tab2:
-            st.markdown(_sanitize_markdown(advisory["stretch_budget"]["explanation"]))
+            st.markdown(sanitize_markdown(advisory["stretch_budget"]["explanation"]))
             stretch_already_applied = cache_key in st.session_state["stretch_applied_keys"]
             if st.button(
                 "🚀 Apply Stretch Upgrade (One-Time)",
@@ -542,6 +532,7 @@ def _save_actions(build_draft: dict, build_state: dict) -> None:
             total_cost=state.build_total_cost(build_state, quantities),
             compatibility_score=report.compatibility_score,
             workload_profile=build_draft.get("workload_profile"),
+            workload_tier=build_draft.get("tier") if build_draft.get("creation_mode") == "Workload" else None,
             budget_ceiling=build_draft.get("budget_ceiling"),
             synergy_score=synergy,
             bottleneck_percentage=bottleneck,

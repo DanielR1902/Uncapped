@@ -6,7 +6,7 @@ import streamlit as st
 from auth.session import current_user
 from db.models import WORKLOAD_PROFILES
 from db.repositories import builds_repo, community_repo
-from ui import state
+from ui import state, theme
 from ui.components.build_card import render_build_card
 from ui.format import humanize_profile
 
@@ -80,9 +80,10 @@ def render() -> None:
             grouped.setdefault(group_name, []).append(build)
 
         for group_name, group_builds in grouped.items():
-            st.markdown(f"#### {group_name}")
+            st.markdown(theme.section_header(group_name), unsafe_allow_html=True)
             for build in group_builds:
                 render_build_card(build, actions=_card_actions(build), confirm_labels=frozenset({_DELETE_LABEL}))
+            st.divider()
     else:
         sort_label = st.selectbox("Sort by", list(_SORT_LABELS.values()), key="my_builds_sort")
         sort_key = next(key for key, label in _SORT_LABELS.items() if label == sort_label)
@@ -92,7 +93,7 @@ def render() -> None:
             st.info("You haven't saved any builds yet — head to the Build Studio to create one.")
             return
 
-        cols = st.columns(3)
+        cols = st.columns(2)
         for index, build in enumerate(builds):
-            with cols[index % 3]:
+            with cols[index % 2]:
                 render_build_card(build, actions=_card_actions(build), confirm_labels=frozenset({_DELETE_LABEL}))
