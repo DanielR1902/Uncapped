@@ -27,6 +27,7 @@ _DEFAULTS = {
     "selected_post_id": None,
     "fork_source_build_id": None,
     "stretch_applied_keys": set(),  # per-cache-key lock for the advisory's one-time stretch-upgrade apply button
+    "concierge_messages": [],  # sidebar AI Concierge chat history: [{"role": "user"|"assistant", "content": str}, ...]
 }
 
 

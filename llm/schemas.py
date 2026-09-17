@@ -126,6 +126,70 @@ class StretchBudgetAdvice(BaseModel):
     added_cost_usd: float
 
 
+class ConciergeLoadBuildAction(BaseModel):
+    """One machine-executable "load these real catalog components into a new
+    build" instruction produced by the Concierge chat feature (llm/concierge.py)
+    in response to a "build me a PC with X" style request. `components` maps
+    category -> a real catalog component id drawn ONLY from the
+    `catalog_summary` the caller supplied — enforced both by the system
+    prompt's zero-hallucination rule and, authoritatively, by
+    llm/concierge.py's post-parse guard (never trust the prompt alone, same
+    precedent as SwapAction/QuantityAction above)."""
+
+    type: Literal["load_build"] = "load_build"
+    components: dict[str, int]
+    explanation: str
+
+
+class ConciergeNavigateAction(BaseModel):
+    """A pure page-navigation intent (e.g. "take me to Community") — no build
+    mutation involved. `navigate_to` is constrained to this app's real page
+    keys by the Literal type itself (Pydantic rejects anything else at parse
+    time, no extra runtime check needed for this one field)."""
+
+    type: Literal["navigate"] = "navigate"
+    navigate_to: Literal["create_build", "my_builds", "community"]
+
+
+class ConciergeModifyBuildAction(BaseModel):
+    """An incremental patch to the user's CURRENTLY ACTIVE build draft (e.g.
+    "add a network card and bump storage to 2") — as opposed to
+    ConciergeLoadBuildAction, which describes a whole NEW build from scratch.
+    `components` maps ONLY the categories being added/changed (never a full
+    8-category set) to a real catalog id; `quantities` maps ONLY "RAM"/
+    "Storage" to a requested count — the ACTUAL physical-slot/budget clamp on
+    that number is NOT this module's job (llm/ has no engine/db access) —
+    the caller (ui/) re-validates the real achievable quantity via
+    engine.compatibility.resolve_quantity_limit /
+    ui.state.resolve_effective_quantity_limit before applying, exactly like
+    the manual quantity stepper already does. Both dicts may be empty (e.g.
+    a components-only or quantities-only patch) but not both empty AND no
+    navigate_to — that combination means nothing was actually asked to change,
+    which should just be a plain conversational reply with action: null
+    instead of a no-op action."""
+
+    type: Literal["modify_build"] = "modify_build"
+    components: dict[str, int] = {}
+    quantities: dict[str, int] = {}
+    explanation: str
+
+
+class ConciergeResponse(BaseModel):
+    """Response shape for the Concierge chat feature (see llm/concierge.py).
+    `reply` is always present (conversational answer to the user's message).
+    `action` is populated for a "build me a PC" style request that resolved to
+    real catalog ids (`load_build`), an incremental patch to the active build
+    draft (`modify_build`), or a pure page-navigation intent (`navigate`); it
+    is `None` for catalog-question and community-recommendation intents, and
+    also `None` (with `reply` saying so) when a named part could not be found
+    in `catalog_summary` at all, or when a modify request has no active build
+    to modify."""
+
+    reply: str
+    action: ConciergeLoadBuildAction | ConciergeModifyBuildAction | ConciergeNavigateAction | None = None
+    source: Literal["llm", "heuristic"] = "llm"
+
+
 class BuildAdvisoryResponse(BaseModel):
     """Response shape for the AI Build Advisory feature (pros/cons of the
     current build, one in-budget optimization tip, and one stretch-budget

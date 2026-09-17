@@ -1679,3 +1679,219 @@ def test_free_mode_budget_ceiling_none_never_constrains_quantity_stepper(seeded_
     captions = [c.value for c in at.caption]
     assert any("safety limit" in c for c in captions)
     assert not any("Budget" in c for c in captions)
+
+
+# ---------------------------------------------------------------------------
+# Sidebar AI Concierge widget (ui/components/chat_assistant.py) — zero-click
+# apply: a load_build/modify_build/navigate action now takes effect the
+# instant the LLM's reply lands, no confirmation button exists anymore.
+# ---------------------------------------------------------------------------
+def test_concierge_expander_renders_for_logged_in_user(seeded_db):
+    """The sidebar expander must exist for an authenticated user, below the
+    3 nav buttons, and not blow up the app on render."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge1", "concierge1@example.com", "Concierge One")
+
+    assert not at.exception
+    expander_labels = [e.label for e in at.expander]
+    assert any("AI Concierge" in label for label in expander_labels)
+
+
+def test_concierge_message_round_trips_without_crash(seeded_db, monkeypatch):
+    """Sending a message must append both turns to concierge_messages and
+    not crash, using a mocked get_concierge_response (the same pattern as
+    get_build_advisory/analyze_build mocking elsewhere in this file) so no
+    real network call is attempted."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, current_build_context=None):
+        assert catalog_summary  # real catalog was actually pre-fetched
+        return {"reply": "Here are some CPUs.", "action": None, "source": "heuristic"}
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge2", "concierge2@example.com", "Concierge Two")
+
+    chat_input = at.get_by_key("concierge_chat_input")
+    chat_input.set_value("What CPUs do you have?").run()
+
+    assert not at.exception
+    messages = at.session_state["concierge_messages"]
+    assert messages[-2] == {"role": "user", "content": "What CPUs do you have?"}
+    assert messages[-1] == {"role": "assistant", "content": "Here are some CPUs."}
+
+
+def test_concierge_load_build_action_applies_immediately_no_confirmation(seeded_db, monkeypatch):
+    """A load_build action from a turn must land in build_draft/create_mode/
+    page on the very same rerun the reply arrives — no button, no
+    intermediate click, and no confirmation-button key exists anymore."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    cpu = components_repo.get_by_category("CPU")[0]
+
+    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, current_build_context=None):
+        return {
+            "reply": "Built it.",
+            "action": {
+                "type": "load_build",
+                "components": {"CPU": cpu.id},
+                "explanation": "Picked a solid CPU.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge3", "concierge3@example.com", "Concierge Three")
+
+    at.get_by_key("concierge_chat_input").set_value("Build me a PC").run()
+
+    assert not at.exception
+    assert at.session_state["build_draft"]["components"] == {"CPU": cpu.id}
+    assert at.session_state["build_draft"]["creation_mode"] == "Free"
+    assert at.session_state["create_mode"] == "Free"
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["build_draft_analysis"] is None
+    assert not any(b.key == "concierge_confirm_load" for b in at.button)
+
+
+def test_concierge_never_calls_live_llm_without_api_key(seeded_db):
+    """No mocking at all: with no OPENROUTER_API_KEY/MODEL configured (the
+    _no_live_llm_calls autouse fixture clears both), sending a message must
+    still round-trip cleanly through the real heuristic fallback path,
+    proving the plumbing works end-to-end without ever hitting the network."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge4", "concierge4@example.com", "Concierge Four")
+
+    at.get_by_key("concierge_chat_input").set_value("What CPUs do you have?").run()
+
+    assert not at.exception
+    messages = at.session_state["concierge_messages"]
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"]  # some non-empty heuristic reply rendered
+
+
+def test_concierge_modify_build_patches_without_disturbing_other_categories(seeded_db, monkeypatch):
+    """A modify_build action naming only new peripheral categories must add
+    those to the existing build_draft while leaving every already-selected
+    core category (e.g. the manually-picked CPU/GPU) completely untouched —
+    a PATCH, not a replacement."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge5", "concierge5@example.com", "Concierge Five")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    at.get_by_key(f"select_GPU_{gpu.id}").click().run()
+
+    network_card = components_repo.get_by_category("NetworkCard")[0]
+    optical_drive = components_repo.get_by_category("OpticalDrive")[0]
+
+    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, current_build_context=None):
+        assert current_build_context is not None
+        assert current_build_context["components"]["CPU"]["id"] == cpu.id
+        return {
+            "reply": "Added a network card and an optical drive.",
+            "action": {
+                "type": "modify_build",
+                "components": {"NetworkCard": network_card.id, "OpticalDrive": optical_drive.id},
+                "quantities": {},
+                "explanation": "Added the requested peripherals.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Add a network card and an optical drive").run()
+
+    assert not at.exception
+    components = at.session_state["build_draft"]["components"]
+    assert components["CPU"] == cpu.id  # untouched
+    assert components["GPU"] == gpu.id  # untouched
+    assert components["NetworkCard"] == network_card.id
+    assert components["OpticalDrive"] == optical_drive.id
+
+
+def test_concierge_modify_build_quantity_request_is_clamped_to_real_limit(seeded_db, monkeypatch):
+    """llm/concierge.py has no engine/db access, so it cannot itself clamp a
+    requested quantity to a real physical/budget limit — a modify_build
+    action requesting far more units than the motherboard's real DIMM slots
+    allow must be clamped down to the same effective max
+    ui.state.resolve_effective_quantity_limit (and the manual stepper) would
+    ever allow, never applied verbatim."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge6", "concierge6@example.com", "Concierge Six")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    # ASRock B550M-HDV: 4 DIMM slots; a 2-module ("2x8GB") kit caps the real
+    # max at 2 (4 slots // 2 modules per kit) — same fixture as
+    # test_ram_quantity_max_respects_real_per_module_count above.
+    mobo = next(c for c in components_repo.get_by_category("Motherboard") if c.name == "ASRock B550M-HDV")
+    ram_2_module = next(
+        c for c in components_repo.get_by_category("RAM") if c.name.startswith("Corsair Vengeance LPX 16GB (2x8GB)")
+    )
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+    at.get_by_key(f"select_RAM_{ram_2_module.id}").click().run()
+
+    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, current_build_context=None):
+        return {
+            "reply": "Bumped your RAM quantity.",
+            "action": {
+                "type": "modify_build",
+                "components": {},
+                "quantities": {"RAM": 10},  # far beyond the real 2-kit physical max
+                "explanation": "Requested 10 kits.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Bump my RAM to 10 kits").run()
+
+    assert not at.exception
+    assert at.session_state["build_draft"]["quantities"]["RAM"] == 2  # clamped, not applied verbatim
+    assert at.get_by_key("qty_RAM").value == 2
+
+
+def test_concierge_navigate_action_sets_page_immediately_no_click(seeded_db, monkeypatch):
+    """A navigate action must set st.session_state["page"] on the same
+    rerun the reply arrives, with no button or extra click involved."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, current_build_context=None):
+        return {
+            "reply": "Taking you to Community.",
+            "action": {"type": "navigate", "navigate_to": "community"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge7", "concierge7@example.com", "Concierge Seven")
+
+    at.get_by_key("concierge_chat_input").set_value("Take me to Community").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"

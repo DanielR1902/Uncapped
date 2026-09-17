@@ -6,6 +6,7 @@ import streamlit as st
 
 from auth.session import log_out
 from ui import router, state, theme
+from ui.components.chat_assistant import render_concierge_widget
 
 st.set_page_config(page_title="Uncapped", page_icon="🖥️", layout="wide")
 
@@ -28,6 +29,8 @@ with st.sidebar:
             if st.button(label, key=f"sidebar_nav_{target_page}", use_container_width=True):
                 st.session_state["page"] = target_page
                 st.rerun()
+
+        render_concierge_widget()
 
         st.markdown('<div class="uncapped-sidebar-spacer"></div>', unsafe_allow_html=True)
         if st.button("Logout", key="logout_button", use_container_width=True):
