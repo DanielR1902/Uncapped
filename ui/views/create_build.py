@@ -20,7 +20,7 @@ import streamlit as st
 
 from auth.session import current_user
 from db.models import WORKLOAD_PROFILES
-from db.repositories import builds_repo, community_repo, components_repo
+from db.repositories import builds_repo, community_repo, components_repo, drafts_repo
 from engine import scoring, solvers
 from engine.compatibility import evaluate_build
 from llm.advisory import get_build_advisory
@@ -504,48 +504,75 @@ def _save_actions(build_draft: dict, build_state: dict) -> None:
 
     user = current_user()
     name = st.text_input("Build name", value=build_draft.get("name", ""), key="build_name_input")
-    publish = st.checkbox("Also publish to Community", key="publish_checkbox")
+    # Mutually exclusive with publishing: a draft is an in-progress checkpoint
+    # in the lightweight draft_builds table (§3.9), never a scored, shareable
+    # Build row — there is no "publish a draft" path anywhere in this app's
+    # real architecture (community_repo.create_post/builds_repo.set_public
+    # only ever operate on a real Build row, same precedent as the AI
+    # Concierge's own save_build/destination:"draft" branch, spec.md §6.7
+    # intent 7). The publish checkbox (and its description field) is only
+    # ever rendered when NOT saving as a draft.
+    save_as_draft = st.checkbox("Save as draft", key="save_as_draft_checkbox")
 
+    publish = False
     community_description = ""
-    if publish:
-        community_description = st.text_area(
-            "Community post description",
-            placeholder="Share your thoughts, use-case, or notes about this build...",
-            key="community_description_input",
-        )
+    if not save_as_draft:
+        publish = st.checkbox("Also publish to Community", key="publish_checkbox")
+        if publish:
+            community_description = st.text_area(
+                "Community post description",
+                placeholder="Share your thoughts, use-case, or notes about this build...",
+                key="community_description_input",
+            )
 
     if st.button("💾 Save build", key="save_build", disabled=not build_state, type="primary"):
         quantities = build_draft.get("quantities", {})
-        report = evaluate_build(build_state, quantities)
-        analysis = st.session_state.get("build_draft_analysis") or {}
-        synergy = analysis.get("synergy", {}).get("overall_score")
-        bottleneck = analysis.get("bottleneck", {}).get("bottleneck_percentage")
 
-        build = builds_repo.create_build(
-            user_id=user["id"],
-            name=name or "Untitled build",
-            creation_mode=build_draft.get("creation_mode") or "Free",
-            components=[
-                builds_repo.BuildComponentInput(component_id=c.id, quantity=state.get_quantity(build_draft, cat))
-                for cat, c in build_state.items()
-            ],
-            total_cost=state.build_total_cost(build_state, quantities),
-            compatibility_score=report.compatibility_score,
-            workload_profile=build_draft.get("workload_profile"),
-            workload_tier=build_draft.get("tier") if build_draft.get("creation_mode") == "Workload" else None,
-            budget_ceiling=build_draft.get("budget_ceiling"),
-            synergy_score=synergy,
-            bottleneck_percentage=bottleneck,
-            is_public=publish,
-        )
-        if publish:
-            community_repo.create_post(build.id, user["id"], name or "Untitled build", community_description or None)
+        if save_as_draft:
+            draft_name = name or "Untitled Draft"
+            drafts_repo.save_draft(
+                user_id=user["id"],
+                name=draft_name,
+                mode=build_draft.get("creation_mode") or "Free",
+                components=build_draft.get("components", {}),
+                quantities=quantities,
+            )
+            st.success(f"Saved as draft: '{draft_name}'")
+            destination_page = "drafts"
+        else:
+            report = evaluate_build(build_state, quantities)
+            analysis = st.session_state.get("build_draft_analysis") or {}
+            synergy = analysis.get("synergy", {}).get("overall_score")
+            bottleneck = analysis.get("bottleneck", {}).get("bottleneck_percentage")
 
-        st.success("Build saved!")
+            build = builds_repo.create_build(
+                user_id=user["id"],
+                name=name or "Untitled build",
+                creation_mode=build_draft.get("creation_mode") or "Free",
+                components=[
+                    builds_repo.BuildComponentInput(component_id=c.id, quantity=state.get_quantity(build_draft, cat))
+                    for cat, c in build_state.items()
+                ],
+                total_cost=state.build_total_cost(build_state, quantities),
+                compatibility_score=report.compatibility_score,
+                workload_profile=build_draft.get("workload_profile"),
+                workload_tier=build_draft.get("tier") if build_draft.get("creation_mode") == "Workload" else None,
+                budget_ceiling=build_draft.get("budget_ceiling"),
+                synergy_score=synergy,
+                bottleneck_percentage=bottleneck,
+                is_public=publish,
+            )
+            if publish:
+                community_repo.create_post(build.id, user["id"], name or "Untitled build", community_description or None)
+
+            st.success("Build saved!")
+            destination_page = "my_builds"
+
         st.session_state["create_mode"] = None
         st.session_state["build_draft"] = None
         st.session_state["build_draft_analysis"] = None
-        st.session_state["page"] = "my_builds"
+        st.session_state["has_unsaved_build_changes"] = False
+        st.session_state["page"] = destination_page
         st.rerun()
 
 
@@ -562,9 +589,12 @@ def render() -> None:
     header_cols = st.columns([1, 5])
     with header_cols[0]:
         if st.button("⬅ Change mode", key="change_mode"):
-            st.session_state["create_mode"] = None
-            st.session_state["build_draft"] = None
-            st.session_state["build_draft_analysis"] = None
+            # ui.state.teardown_builder resets create_mode/build_draft/
+            # build_draft_analysis, landing back on the mode-selection screen
+            # (spec.md §7.9). No database write — an unsaved build not
+            # explicitly checkpointed via the "Save as draft" checkbox below
+            # is simply discarded, per an explicit product decision.
+            state.teardown_builder()
             st.rerun()
     with header_cols[1]:
         st.caption(f"Mode: **{humanize_profile(mode)}**")

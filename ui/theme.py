@@ -66,6 +66,32 @@ def inject_css() -> None:
             min-height: 100vh;
         }}
         .uncapped-sidebar-spacer {{ flex-grow: 1; }}
+
+        /* Lock the sidebar to a fixed width and remove the native
+        collapse/expand control — the app's own nav (Home/Create/Drafts/
+        Previous Builds/Community) and the AI Concierge live only in the
+        sidebar, so letting a user accidentally collapse or resize it away
+        would strand them with no way back short of a manual page reload.
+        Verified live (both selectors match Streamlit 1.63.0's real sidebar
+        DOM) — degrades gracefully (no-op, not a crash) if a future
+        Streamlit version renames either testid.
+
+        `width` (not just `min-width`/`max-width`) must be set here too —
+        confirmed live that Streamlit's own draggable-resize logic writes a
+        plain (non-!important) inline `width: <Npx>` on this exact element,
+        and `min-width`/`max-width` ALONE (without an accompanying `width`
+        override) did NOT clamp the rendered box in this Streamlit version
+        despite being `!important` — only overriding `width` itself here,
+        with `!important` so it beats the non-important inline value,
+        actually changed the rendered size. */
+        /* No tag qualifier — confirmed live this element is actually a
+        <div>, not a <button> as its testid name might suggest. */
+        [data-testid="stSidebarCollapseButton"] {{ display: none !important; }}
+        section[data-testid="stSidebar"] {{
+            width: 320px !important;
+            min-width: 320px !important;
+            max-width: 320px !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,

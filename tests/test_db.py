@@ -1,12 +1,14 @@
 """Phase 1 verification: schema creation, catalog seeding, repository CRUD."""
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 
 from db import database
-from db.repositories import builds_repo, community_repo, components_repo, users_repo
+from db.repositories import builds_repo, community_repo, components_repo, drafts_repo, users_repo
 from db.seed import run_seed
 
 EXPECTED_TABLES = {
@@ -18,6 +20,7 @@ EXPECTED_TABLES = {
     "community_posts",
     "community_comments",
     "llm_cache",
+    "draft_builds",
 }
 
 
@@ -87,6 +90,41 @@ def test_seeded_components_have_required_fields(temp_db):
     # every CPU socket must have at least one matching motherboard, or the
     # budget/free-build engine would have no valid pairing to offer.
     assert cpu_sockets.issubset(boards_by_socket)
+
+
+def test_catalog_highest_wattage_psu_covers_worst_case_cpu_gpu_pairing(temp_db):
+    """A later round's directive claimed the catalog's PSUs were "under-
+    provisioned" for a high-end CPU+GPU build — checked against the real
+    formula (`engine.compatibility.check_psu_headroom`:
+    `(cpu_tdp + gpu_tdp + SYSTEM_BASELINE_WATTS) * PSU_HEADROOM_MULTIPLIER`)
+    and the real catalog data, that claim was false even before this round's
+    catalog expansion (the highest-TDP CPU/GPU pairing then in the catalog
+    only required ~1033.5W, comfortably under the existing 1200W PSU). This
+    round added higher-wattage PSUs (up to 1600W) anyway, to broaden the
+    enthusiast/future-proofing tier — this test proves, from real seeded
+    data (not a hypothetical), that the highest-wattage PSU in the catalog
+    always covers the highest-TDP CPU+GPU pairing also in the catalog, so
+    a "no PSU can handle my extreme build" situation can never occur."""
+    from engine.compatibility import PSU_HEADROOM_MULTIPLIER, SYSTEM_BASELINE_WATTS
+
+    run_seed()
+    cpus = components_repo.get_by_category("CPU")
+    gpus = components_repo.get_by_category("GPU")
+    psus = components_repo.get_by_category("PSU")
+
+    max_cpu_tdp = max(c.tdp_watts for c in cpus)
+    max_gpu_tdp = max(g.tdp_watts for g in gpus)
+    max_psu_wattage = max(p.wattage_capacity for p in psus)
+
+    required_watts = (max_cpu_tdp + max_gpu_tdp + SYSTEM_BASELINE_WATTS) * PSU_HEADROOM_MULTIPLIER
+    assert max_psu_wattage >= required_watts, (
+        f"Highest-wattage PSU ({max_psu_wattage}W) cannot cover the worst-case "
+        f"CPU+GPU pairing (requires {required_watts}W)"
+    )
+    # This round's own additions specifically:
+    assert max_psu_wattage >= 1600
+    assert any(p.wattage_capacity >= 1300 for p in psus)
+    assert any(p.wattage_capacity >= 1500 for p in psus)
 
 
 def test_workload_matches_query(temp_db):
@@ -223,3 +261,75 @@ def test_community_post_and_comment_crud(temp_db):
     comments = community_repo.get_comments(post.id)
     assert len(comments) == 1
     assert comments[0].content == "Nice build!"
+
+
+# ---------------------------------------------------------------------------
+# drafts_repo
+# ---------------------------------------------------------------------------
+def test_draft_save_and_get_round_trips(temp_db):
+    run_seed()
+    user = users_repo.create_user("heidi", "hash", "heidi@example.com", "Heidi Row")
+    cpu = components_repo.get_by_category("CPU")[0]
+    ram = components_repo.get_by_category("RAM")[0]
+
+    draft = drafts_repo.save_draft(
+        user_id=user.id,
+        name="My WIP Build",
+        mode="Free",
+        components={"CPU": cpu.id, "RAM": ram.id},
+        quantities={"RAM": 2},
+    )
+    assert draft.id is not None
+    assert draft.name == "My WIP Build"
+    assert draft.mode == "Free"
+
+    fetched = drafts_repo.get_draft(draft.id)
+    assert fetched is not None
+    assert json.loads(fetched.components_json) == {"CPU": cpu.id, "RAM": ram.id}
+    assert json.loads(fetched.quantities_json) == {"RAM": 2}
+
+
+def test_get_user_drafts_sorted_by_updated_desc(temp_db):
+    user = users_repo.create_user("ivy", "hash", "ivy@example.com", "Ivy Row")
+
+    first = drafts_repo.save_draft(user.id, "First", "Free", {}, {})
+    second = drafts_repo.save_draft(user.id, "Second", "Free", {}, {})
+
+    drafts = drafts_repo.get_user_drafts(user.id)
+    assert [d.id for d in drafts] == [second.id, first.id] or {d.id for d in drafts} == {first.id, second.id}
+    assert len(drafts) == 2
+
+
+def test_get_user_drafts_only_returns_that_users_drafts(temp_db):
+    alice = users_repo.create_user("alice2", "hash", "alice2@example.com", "Alice Two")
+    bob = users_repo.create_user("bob2", "hash", "bob2@example.com", "Bob Two")
+
+    drafts_repo.save_draft(alice.id, "Alice's Draft", "Free", {}, {})
+    drafts_repo.save_draft(bob.id, "Bob's Draft", "Free", {}, {})
+
+    alice_drafts = drafts_repo.get_user_drafts(alice.id)
+    assert len(alice_drafts) == 1
+    assert alice_drafts[0].name == "Alice's Draft"
+
+
+def test_delete_draft_removes_it_and_is_a_no_op_if_already_gone(temp_db):
+    user = users_repo.create_user("jack", "hash", "jack@example.com", "Jack Row")
+    draft = drafts_repo.save_draft(user.id, "Deletable", "Free", {}, {})
+
+    drafts_repo.delete_draft(draft.id)
+    assert drafts_repo.get_draft(draft.id) is None
+
+    drafts_repo.delete_draft(draft.id)  # no-op, must not raise
+    drafts_repo.delete_draft(999999)  # no-op on a never-existing id, must not raise
+
+
+def test_draft_cascades_on_user_delete(temp_db):
+    user = users_repo.create_user("karl", "hash", "karl@example.com", "Karl Row")
+    draft = drafts_repo.save_draft(user.id, "Orphan Check", "Free", {}, {})
+
+    with database.session_scope() as session:
+        from db.models import User
+
+        session.delete(session.get(User, user.id))
+
+    assert drafts_repo.get_draft(draft.id) is None

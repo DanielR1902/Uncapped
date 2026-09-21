@@ -8,6 +8,7 @@ compile."
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,18 @@ def demo_seeded_db(tmp_path):
     run_demo_seed()
     yield
     database.get_engine().dispose()
+
+
+def _session_value(at: AppTest, key: str, default=None):
+    """AppTest's session_state proxy raises (not returns None) for a missing
+    key, unlike a plain dict's .get() — this mirrors .get()'s semantics for
+    keys that are only ever set once something has actually happened (e.g.
+    `pending_community_filters`, which doesn't exist in _DEFAULTS until a
+    Concierge navigation-with-filters action first stages it)."""
+    try:
+        return at.session_state[key]
+    except (KeyError, AttributeError):
+        return default
 
 
 def _register(at: AppTest, username: str, email: str, full_name: str, password: str = "Passw0rd!") -> AppTest:
@@ -558,6 +571,86 @@ def test_publish_and_view_in_community_thread(seeded_db):
     assert not at.exception
 
 
+def test_save_as_draft_checkbox_hides_publish_checkbox(seeded_db):
+    """The "Save as draft" checkbox (spec.md §7.4 step 9) is mutually
+    exclusive with "Also publish to Community" — a draft has no publish path
+    anywhere in this app's real architecture, the same precedent as the AI
+    Concierge's own save_build/destination:"draft" branch. Checking it hides
+    the publish checkbox entirely; unchecking it brings the publish checkbox
+    back."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draftcheck1", "draftcheck1@example.com", "Draft Check One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    assert at.get_by_key("publish_checkbox") is not None  # visible by default
+
+    at.get_by_key("save_as_draft_checkbox").check().run()
+    assert not at.exception
+    with pytest.raises(KeyError):
+        at.get_by_key("publish_checkbox")
+
+    at.get_by_key("save_as_draft_checkbox").uncheck().run()
+    assert not at.exception
+    assert at.get_by_key("publish_checkbox") is not None  # reappears
+
+
+def test_save_as_draft_checkbox_persists_to_drafts_table(seeded_db):
+    """Checking "Save as draft" and clicking "Save build" calls
+    drafts_repo.save_draft (never builds_repo.create_build) under the
+    literal typed name, resets the builder to a clean slate, and redirects
+    to the drafts page — the manual counterpart to the silent exit
+    auto-save (spec.md §7.9)."""
+    from db.repositories import builds_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draftcheck2", "draftcheck2@example.com", "Draft Check Two")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Draft Check Two's WIP")
+    at.get_by_key("save_as_draft_checkbox").check().run()
+
+    user_id = at.session_state["auth_user"]["id"]
+    at.get_by_key("save_build").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "drafts"
+    assert at.session_state["create_mode"] is None
+    assert at.session_state["build_draft"] is None
+    assert at.session_state["has_unsaved_build_changes"] is False
+
+    drafts = drafts_repo.get_user_drafts(user_id)
+    assert len(drafts) == 1
+    assert drafts[0].name == "Draft Check Two's WIP"
+    assert drafts[0].mode == "Budget"
+    # Never a real, scored Build row — no publish path for a draft.
+    assert builds_repo.get_builds_for_user(user_id) == []
+
+
+def test_save_as_draft_checkbox_blank_name_defaults_to_untitled(seeded_db):
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draftcheck3", "draftcheck3@example.com", "Draft Check Three")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("save_as_draft_checkbox").check().run()
+
+    user_id = at.session_state["auth_user"]["id"]
+    at.get_by_key("save_build").click().run()
+
+    assert not at.exception
+    from db.repositories import drafts_repo
+
+    drafts = drafts_repo.get_user_drafts(user_id)
+    assert len(drafts) == 1
+    assert drafts[0].name == "Untitled Draft"
+
+
 def test_community_description_saved_and_displayed(seeded_db):
     """The optional 'Community post description' text area (shown only
     once 'Also publish to Community' is checked) must actually reach the
@@ -596,6 +689,56 @@ def test_community_description_saved_and_displayed(seeded_db):
 
     assert not at.exception
     assert any(note in m.value for m in at.markdown)
+
+
+def test_community_thread_view_shows_quantity_badge_for_multi_unit_storage(seeded_db):
+    """`BuildComponent.quantity` is already persisted and used functionally
+    elsewhere (forking preserves it), but `_thread_view`'s per-component
+    list previously always rendered "- **Storage**: <name> ($<unit price>)"
+    with no indication a slot held more than one unit. A quantity > 1 must
+    now show as "Storage (x3): <name> ($<unit price * 3>)" — the real total
+    for that many units, not just one."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "quantbadge1", "quantbadge1@example.com", "Quant Badge One")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    import json as _json
+
+    def _m2_slots(mobo) -> int:
+        return (_json.loads(mobo.specs_json) if mobo.specs_json else {}).get("m2_slots") or 0
+
+    mobo = max(components_repo.get_by_category("Motherboard"), key=_m2_slots)
+    assert _m2_slots(mobo) >= 2
+    cpu = next(c for c in components_repo.get_by_category("CPU") if c.socket == mobo.socket)
+    storage = next(c for c in components_repo.get_by_category("Storage") if c.interface == "NVMe")
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    at.get_by_key(f"select_Storage_{storage.id}").click().run()
+    at.get_by_key("qty_Storage").set_value(2).run()
+    assert at.session_state["build_draft"]["quantities"]["Storage"] == 2
+
+    at.get_by_key("build_name_input").input("Multi-Storage Rig")
+    at.get_by_key("publish_checkbox").check().run()
+    at.get_by_key("save_build").click().run()
+    assert not at.exception
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    view_buttons = [b.key for b in at.button if b.key and b.key.startswith("view_post_")]
+    assert view_buttons
+    at.get_by_key(view_buttons[0]).click().run()
+    assert not at.exception
+
+    expected_total = storage.price_usd * 2
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert f"Storage (x2)" in page_text
+    assert f"${expected_total:,.2f}" in page_text
+    # A single-unit category (CPU is always qty 1) must NOT get a badge.
+    assert "CPU (x1)" not in page_text
+    assert "CPU (x" not in page_text
 
 
 def test_community_description_omitted_when_left_blank(seeded_db):
@@ -651,6 +794,47 @@ def test_fork_from_community_loads_build_studio(seeded_db):
     assert set(CATEGORY_ORDER).issubset(components.keys())
 
 
+def test_fork_from_community_sets_unsaved_changes_flag(seeded_db):
+    """Real, confirmed bug: `_fork_into_studio` populates `build_draft`
+    ["components"] as a direct dict literal rather than replaying picks
+    through `ui.state.set_component` (the usual place `has_unsaved_build_
+    changes` gets set) — so a freshly-forked build, which can carry a full
+    8+ category pick set, silently reported NO unsaved changes. Fixed so the
+    flag is correctly tracked (spec.md §7.9) even though, per the CURRENT
+    design, leaving the builder afterward without explicitly using "Save as
+    draft" discards the fork with no database write either way."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "forkflag1", "forkflag1@example.com", "Fork Flag One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Fork Flag Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click().run()
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    view_buttons = [b.key for b in at.button if b.key and b.key.startswith("view_post_")]
+    at.get_by_key(view_buttons[0]).click().run()
+    at.get_by_key("fork_build").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["has_unsaved_build_changes"] is True
+
+    user_id = at.session_state["auth_user"]["id"]
+    at.get_by_key("sidebar_nav_community").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"  # navigates immediately, no database write
+    assert at.session_state["has_unsaved_build_changes"] is False
+    assert at.session_state["create_mode"] is None
+    assert at.session_state["build_draft"] is None
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
 def test_my_builds_grouped_view_clone_loads_full_build(seeded_db):
     from engine.solvers import CATEGORY_ORDER
 
@@ -678,6 +862,39 @@ def test_my_builds_grouped_view_clone_loads_full_build(seeded_db):
     # now (include_peripherals=True), which is fine, just not guaranteed
     # to be the exact full set.
     assert set(CATEGORY_ORDER).issubset(components.keys())
+
+
+def test_my_builds_clone_sets_unsaved_changes_flag(seeded_db):
+    """Same real bug/fix as test_fork_from_community_sets_unsaved_changes_flag
+    above, for my_builds.py's own `_clone_into_studio` (backing BOTH the
+    "Clone" and "Edit" card actions) — an identical dict-literal `components`
+    write that bypassed `has_unsaved_build_changes` entirely."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "cloneflag1", "cloneflag1@example.com", "Clone Flag One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_workload").click().run()
+    at.get_by_key("generate_workload_build").click().run()
+    at.get_by_key("build_name_input").input("Clone Flag Rig")
+    at.get_by_key("save_build").click().run()
+
+    clone_buttons = [b.key for b in at.button if b.key and b.key.startswith("Clone_")]
+    assert clone_buttons
+    at.get_by_key(clone_buttons[0]).click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["has_unsaved_build_changes"] is True
+
+    user_id = at.session_state["auth_user"]["id"]
+    at.get_by_key("sidebar_nav_community").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert at.session_state["has_unsaved_build_changes"] is False
+    assert drafts_repo.get_user_drafts(user_id) == []
 
 
 def test_my_builds_global_sort_orders_without_exception(seeded_db):
@@ -1491,6 +1708,65 @@ def test_ram_quantity_clamps_down_when_swapped_kit_shrinks_the_max(seeded_db):
     assert at.session_state["build_draft"]["quantities"]["RAM"] == 2
 
 
+def test_concierge_quantity_bump_is_reflected_by_the_stepper_widget_immediately(seeded_db, monkeypatch):
+    """Closes a previously-known, documented architectural gap: a keyed
+    st.number_input only honors `value=` the very first time its key is
+    created, so an out-of-band quantity write straight to
+    build_draft["quantities"] (e.g. a Concierge modify_build action) used to
+    have no effect on what the stepper actually DISPLAYED — it kept showing
+    whatever was cached in st.session_state["qty_{category}"] from before.
+    ui.state.set_quantity now syncs that widget key directly. This must not
+    raise StreamlitWidgetAlreadyInstantiatedError (ui.state._sync_qty_widget_key
+    silently no-ops in the one context where Streamlit forbids the write —
+    a call from the stepper's own on-change callback, which needs no sync
+    anyway since the widget's own interaction already set the value)."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    ram = components_repo.get_by_category("RAM")[0]
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Increased RAM to 2 units.",
+            "action": {
+                "type": "modify_build",
+                "components": {},
+                "quantities": {"RAM": 2},
+                "explanation": "Doubled the RAM.",
+            },
+            "source": "heuristic",
+        }
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "qtysync1", "qtysync1@example.com", "Qty Sync One")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    at.get_by_key(f"select_RAM_{ram.id}").click().run()
+
+    # The stepper renders (and its widget key gets created) at quantity 1
+    # before the Concierge ever touches it.
+    assert at.get_by_key("qty_RAM").value == 1
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("bump my ram to 2").run()
+
+    assert not at.exception
+    assert at.session_state["build_draft"]["quantities"]["RAM"] == 2
+    # The actual rendered widget — not just the underlying build_draft dict —
+    # must reflect the new quantity on this very next render.
+    assert at.get_by_key("qty_RAM").value == 2
+
+
 def test_resolve_quantity_bound_helper_matches_engine_for_shrink_scenario():
     """Unit-level check of the clamping helper itself (part_picker.py's
     _resolve_quantity_bound), independent of AppTest/Streamlit runtime, for
@@ -1705,7 +1981,14 @@ def test_concierge_message_round_trips_without_crash(seeded_db, monkeypatch):
     real network call is attempted."""
     import ui.components.chat_assistant as chat_assistant_module
 
-    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, current_build_context=None):
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
         assert catalog_summary  # real catalog was actually pre-fetched
         return {"reply": "Here are some CPUs.", "action": None, "source": "heuristic"}
 
@@ -1724,6 +2007,175 @@ def test_concierge_message_round_trips_without_crash(seeded_db, monkeypatch):
     assert messages[-1] == {"role": "assistant", "content": "Here are some CPUs."}
 
 
+def test_concierge_message_history_display_shows_full_scrollback(seeded_db):
+    """render_concierge_widget renders the FULL conversation history inside
+    the bounded, scrollable st.container(height=...) — a deliberate reversal
+    of an earlier round's display-only [-4:] slice, which made older turns
+    permanently unreachable in the UI. The fixed-height container (not a
+    message-count slice) is what keeps a long conversation from pushing the
+    sidebar's nav buttons/Logout off-screen; scrolling within it must still
+    reach every earlier turn. `st.session_state["concierge_messages"]` stays
+    untouched either way, since `conversation_history` construction in the
+    same function independently re-slices the full list to its own
+    `[-_MAX_HISTORY_MESSAGES:]` window for what's sent to the LLM — a
+    separate, token-cost concern, not a display one."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge_hist1", "concierge_hist1@example.com", "Concierge History One")
+
+    # 8 messages (4 user/assistant turns) — more than would fit on screen at
+    # once, but all of them must still be rendered (scrollable, not dropped).
+    full_history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i}"}
+        for i in range(8)
+    ]
+    at.session_state["concierge_messages"] = full_history
+    at.run()
+
+    assert not at.exception
+
+    # Every message is rendered as a chat_message element, in order — none
+    # dropped from the DOM just because it's scrolled out of the visible
+    # 380px window.
+    rendered = at.chat_message
+    assert len(rendered) == 8
+    assert [m.name for m in rendered] == ["user", "assistant"] * 4
+    assert [m.markdown[0].value for m in rendered] == [f"message {i}" for i in range(8)]
+
+    # The FULL list survives untouched in session state — not trimmed.
+    assert at.session_state["concierge_messages"] == full_history
+    assert len(at.session_state["concierge_messages"]) == 8
+
+    # st.chat_input must still exist below the bounded history, and sending a
+    # new message must still work (no live network call — _no_live_llm_calls
+    # forces the deterministic heuristic fallback since OPENROUTER_API_KEY is
+    # cleared).
+    assert len(at.chat_input) >= 1
+    at.get_by_key("concierge_chat_input").set_value("Hello again").run()
+    assert not at.exception
+    assert at.session_state["concierge_messages"][-2] == {"role": "user", "content": "Hello again"}
+    assert len(at.session_state["concierge_messages"]) == 10
+
+
+def test_concierge_english_reply_rendering_unchanged(seeded_db, monkeypatch):
+    """Regression guard for ui/components/chat_assistant.py's Hebrew/RTL
+    rendering addition: a plain, non-Hebrew message must still render EXACTLY
+    as before — the raw reply text handed straight to st.markdown, no RTL
+    `<div>` wrapper, no HTML-escaping. Inspects the raw string passed to
+    st.markdown via AppTest's `at.markdown[i].value` (the same inspection
+    pattern already used elsewhere in this file for markdown content)."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {"reply": "Here are some CPUs.", "action": None, "source": "heuristic"}
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge_en1", "concierge_en1@example.com", "Concierge English One")
+
+    at.get_by_key("concierge_chat_input").set_value("What CPUs do you have?").run()
+
+    assert not at.exception
+    markdown_values = [m.value for m in at.markdown]
+    # Both turns appear verbatim, unwrapped — exactly the pre-existing shape
+    # (an exact-string match already rules out any RTL <div> wrapper, since a
+    # wrapped value would not equal the bare reply/user text).
+    assert "Here are some CPUs." in markdown_values
+    assert "What CPUs do you have?" in markdown_values
+    assert not any("direction: rtl" in v for v in markdown_values)
+
+
+def test_concierge_hebrew_reply_gets_rtl_styling(seeded_db, monkeypatch):
+    """Any Hebrew-containing chat message — regardless of role or source —
+    must render through ui/components/chat_assistant.py's RTL/BiDi wrapper;
+    `_render_chat_message`/`_looks_like_hebrew` key off the message content
+    alone, not off which role produced it. This is exercised here via a
+    mocked assistant reply for a simple, deterministic repro, even though
+    `llm/concierge.py`'s ENGLISH-ONLY RULE means a real assistant reply won't
+    actually be Hebrew any more — a Hebrew-typing user's OWN message still
+    hits this same rendering path and still needs correct RTL styling.
+    Verified by inspecting the raw string handed to st.markdown (AppTest's
+    `at.markdown[i].value`) for the `direction: rtl` style, rather than
+    assuming the helper fired just because the code exists."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    hebrew_reply = "בניתי לך מחשב מעולה בתקציב שלך."
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {"reply": hebrew_reply, "action": None, "source": "heuristic"}
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge_he1", "concierge_he1@example.com", "Concierge Hebrew One")
+
+    at.get_by_key("concierge_chat_input").set_value("תבנה לי מחשב").run()
+
+    assert not at.exception
+    markdown_values = [m.value for m in at.markdown]
+    rtl_values = [v for v in markdown_values if "direction: rtl" in v]
+    # Both the Hebrew user message and the Hebrew assistant reply get the
+    # symmetric RTL treatment (this module's own docstring documents choosing
+    # "either role", not assistant-only, for visual consistency in one thread).
+    assert any(hebrew_reply in v for v in rtl_values)
+    assert any("תבנה לי מחשב" in v for v in rtl_values)
+
+
+def test_concierge_hebrew_reply_with_html_like_content_is_escaped_not_live(seeded_db, monkeypatch):
+    """The actual security requirement behind the RTL wrapper's `html.escape()`
+    call: a reply that looks like it carries an HTML/script tag (e.g. from a
+    compromised/malicious API response) must never reach the page as a live,
+    unescaped tag inside the `unsafe_allow_html=True` wrapper — this asserts
+    the escaped form (`&lt;img`) is what's actually present and the raw tag
+    text is not, proving the XSS-safety design is real and tested, not just
+    documented in a docstring."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    malicious_reply = "<img src=x onerror=alert(1)> שלום"
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {"reply": malicious_reply, "action": None, "source": "heuristic"}
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge_he2", "concierge_he2@example.com", "Concierge Hebrew Two")
+
+    at.get_by_key("concierge_chat_input").set_value("שלום").run()
+
+    assert not at.exception
+    markdown_values = [m.value for m in at.markdown]
+    rtl_values = [v for v in markdown_values if "direction: rtl" in v]
+    assert rtl_values  # the RTL wrapper actually fired for this Hebrew reply
+    assert any("&lt;img" in v for v in rtl_values)
+    assert not any("<img src=x onerror=alert(1)>" in v for v in rtl_values)
+
+
 def test_concierge_load_build_action_applies_immediately_no_confirmation(seeded_db, monkeypatch):
     """A load_build action from a turn must land in build_draft/create_mode/
     page on the very same rerun the reply arrives — no button, no
@@ -1733,7 +2185,14 @@ def test_concierge_load_build_action_applies_immediately_no_confirmation(seeded_
 
     cpu = components_repo.get_by_category("CPU")[0]
 
-    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, current_build_context=None):
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
         return {
             "reply": "Built it.",
             "action": {
@@ -1778,6 +2237,167 @@ def test_concierge_never_calls_live_llm_without_api_key(seeded_db):
     assert messages[-1]["content"]  # some non-empty heuristic reply rendered
 
 
+def test_concierge_apply_action_failure_degrades_gracefully_without_crashing(seeded_db, monkeypatch, capsys):
+    """`_apply_concierge_action` used to have zero exception handling of its
+    own: any genuinely unexpected failure inside it (a real bug, an
+    unforeseen None somewhere) would propagate uncaught and crash the whole
+    Streamlit rerun with a raw error screen. `render_concierge_widget` now
+    wraps that call in a try/except mirroring llm/concierge.py's own
+    never-raise-but-never-silently-swallow convention: the full traceback is
+    printed to stderr first, then the reply degrades gracefully instead of
+    crashing.
+
+    Forces the scenario by monkeypatching `components_repo.get_by_id` (as
+    imported into ui.components.chat_assistant) to raise on its first call
+    only, then delegate normally — the first call happens inside
+    `_apply_concierge_action`'s own component-resolution loop for a
+    load_build action, so it fails exactly once, precisely where a real bug
+    would surface; every later call (this same rerun's remaining renders,
+    e.g. the landing page) resolves normally, so nothing outside the action
+    application itself is disturbed."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    original_get_by_id = components_repo.get_by_id
+    call_count = {"n": 0}
+
+    def _raise_once_then_delegate(component_id):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated unexpected failure in _apply_concierge_action")
+        return original_get_by_id(component_id)
+
+    monkeypatch.setattr(chat_assistant_module.components_repo, "get_by_id", _raise_once_then_delegate)
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Built it.",
+            "action": {
+                "type": "load_build",
+                "components": {"CPU": cpu.id},
+                "explanation": "Picked a solid CPU.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge_fail1", "concierge_fail1@example.com", "Concierge Fail One")
+    page_before = at.session_state["page"]
+    build_draft_before = at.session_state["build_draft"]
+
+    at.get_by_key("concierge_chat_input").set_value("Build me a PC").run()
+
+    # The core requirement: the page must NOT crash, despite the genuinely
+    # unexpected exception raised deep inside the action-application path.
+    assert not at.exception
+
+    # The exception fired before any of build_draft/page were ever written
+    # (the raise happens on the very first component-resolution call, before
+    # _apply_concierge_action's own session_state writes), so both are left
+    # exactly as they were — nothing silently half-applied.
+    assert at.session_state["build_draft"] == build_draft_before
+    assert at.session_state["page"] == page_before
+
+    # The assistant's message still gets appended, degraded rather than
+    # dropped outright.
+    messages = at.session_state["concierge_messages"]
+    assert messages[-2] == {"role": "user", "content": "Build me a PC"}
+    assert messages[-1]["role"] == "assistant"
+    assert "Built it." in messages[-1]["content"]
+    assert "something went wrong applying this action" in messages[-1]["content"]
+
+    # Whether stderr capture is reliable through Streamlit's AppTest harness
+    # (which runs the script in its own thread/script-runner context, not a
+    # plain in-process function call) isn't guaranteed by any existing test
+    # in this file — no prior test in this suite asserts on captured
+    # stdout/stderr through AppTest. Attempt it anyway (best-effort, not
+    # load-bearing for this test's core requirement above): if the traceback
+    # text is visible via capsys, assert it; if AppTest's execution context
+    # doesn't route through this process's captured stderr, don't fail the
+    # test over a capture-mechanism gap unrelated to the actual behavior
+    # being verified.
+    captured = capsys.readouterr()
+    if captured.err:
+        assert "RuntimeError" in captured.err or "Traceback" in captured.err
+
+
+def test_concierge_build_request_succeeds_from_community_starting_page(seeded_db, monkeypatch):
+    """Permanent regression guard for the exact scenario a prior directive
+    worried about (an AI Concierge request throwing the heuristic
+    fallback/crashing when used from a page other than create_build) — which
+    did NOT reproduce on independent audit (see this module's docstring and
+    ui/components/chat_assistant.py's `_current_build_context`/
+    `_advisory_context`/`_apply_concierge_action`, all of which already use
+    `.get()`-based session-state access with no assumption that any
+    create_build-only widget key exists). Drives the widget from "community"
+    — a page reached with no build in progress at all this session — through
+    a full "build me a PC" request, using the same mocked
+    `get_concierge_response` pattern as this file's other load_build tests."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    cpu = components_repo.get_by_category("CPU")[0]
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        # No build has ever been touched this session -> both context
+        # helpers must resolve to None/empty, not raise.
+        assert current_build_context is None
+        assert advisory_context is None
+        return {
+            "reply": "Built it.",
+            "action": {
+                "type": "load_build",
+                "components": {"CPU": cpu.id},
+                "explanation": "Picked a solid CPU.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge_np1", "concierge_np1@example.com", "Concierge NonPage One")
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert at.session_state["build_draft"] is None  # nothing touched yet this session
+
+    at.get_by_key("concierge_chat_input").set_value("Build me a PC").run()
+
+    assert not at.exception
+    messages = at.session_state["concierge_messages"]
+    assert messages[-2] == {"role": "user", "content": "Build me a PC"}
+    # The authoritative total-cost line (ui.state.build_total_cost) is
+    # appended after the mocked reply — see chat_assistant.py's "AUTHORITATIVE
+    # TOTAL-COST LINE" docstring section — so check the reply is a prefix
+    # rather than an exact match.
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"].startswith("Built it.")
+    assert f"USD {cpu.price_usd:,.2f}" in messages[-1]["content"]
+    assert at.session_state["build_draft"]["components"] == {"CPU": cpu.id}
+    assert at.session_state["page"] == "create_build"  # load_build's own page transition
+
+
 def test_concierge_modify_build_patches_without_disturbing_other_categories(seeded_db, monkeypatch):
     """A modify_build action naming only new peripheral categories must add
     those to the existing build_draft while leaving every already-selected
@@ -1800,7 +2420,14 @@ def test_concierge_modify_build_patches_without_disturbing_other_categories(seed
     network_card = components_repo.get_by_category("NetworkCard")[0]
     optical_drive = components_repo.get_by_category("OpticalDrive")[0]
 
-    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, current_build_context=None):
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
         assert current_build_context is not None
         assert current_build_context["components"]["CPU"]["id"] == cpu.id
         return {
@@ -1824,6 +2451,18 @@ def test_concierge_modify_build_patches_without_disturbing_other_categories(seed
     assert components["GPU"] == gpu.id  # untouched
     assert components["NetworkCard"] == network_card.id
     assert components["OpticalDrive"] == optical_drive.id
+
+    # Independent proof the Concierge-driven peripheral picks actually render
+    # in create_build.py's "Optional peripherals" expander with zero glue
+    # code: that expander's render_part_picker calls are generic over
+    # PERIPHERAL_CATEGORIES/build_state regardless of how a component got
+    # into build_draft, so a filled NetworkCard/OpticalDrive slot must show
+    # the same "cleared via ✕" button (key=f"clear_{category}") a manually
+    # picked slot would — its mere presence (get_by_key raises if the widget
+    # wasn't rendered at all) confirms the expander picked up the LLM-added
+    # peripherals on this same render, with no create_build.py changes needed.
+    assert at.get_by_key("clear_NetworkCard") is not None
+    assert at.get_by_key("clear_OpticalDrive") is not None
 
 
 def test_concierge_modify_build_quantity_request_is_clamped_to_real_limit(seeded_db, monkeypatch):
@@ -1852,7 +2491,14 @@ def test_concierge_modify_build_quantity_request_is_clamped_to_real_limit(seeded
     at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
     at.get_by_key(f"select_RAM_{ram_2_module.id}").click().run()
 
-    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, current_build_context=None):
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
         return {
             "reply": "Bumped your RAM quantity.",
             "action": {
@@ -1878,7 +2524,14 @@ def test_concierge_navigate_action_sets_page_immediately_no_click(seeded_db, mon
     rerun the reply arrives, with no button or extra click involved."""
     import ui.components.chat_assistant as chat_assistant_module
 
-    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, current_build_context=None):
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
         return {
             "reply": "Taking you to Community.",
             "action": {"type": "navigate", "navigate_to": "community"},
@@ -1895,3 +2548,1408 @@ def test_concierge_navigate_action_sets_page_immediately_no_click(seeded_db, mon
 
     assert not at.exception
     assert at.session_state["page"] == "community"
+
+
+def test_concierge_navigate_action_to_landing_home_page(seeded_db, monkeypatch):
+    """A real, previously-confirmed bug: `navigate_to` had no "landing" option
+    at all, so a "take me home"/"go to the dashboard" request was always
+    forced onto one of the 3 other page keys (observed live: it consistently
+    guessed "create_build", with a reply falsely claiming to be "taking you
+    home"). Now that ConciergeNavigateAction accepts "landing", this must
+    actually route there — never silently fall back to create_build."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Taking you home.",
+            "action": {"type": "navigate", "navigate_to": "landing"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge_home1", "concierge_home1@example.com", "Concierge Home")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+
+    at.get_by_key("concierge_chat_input").set_value("Take me to the home page").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "landing"
+
+
+def test_concierge_navigate_action_to_drafts_page(seeded_db, monkeypatch):
+    """navigate_to now also accepts "drafts" (ui/views/drafts.py's page key)
+    — a real, previously-missing destination the Concierge could not route
+    to at all."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Taking you to your drafts.",
+            "action": {"type": "navigate", "navigate_to": "drafts"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge_drafts1", "concierge_drafts1@example.com", "Concierge Drafts")
+
+    at.get_by_key("concierge_chat_input").set_value("Take me to drafts").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "drafts"
+
+
+def test_concierge_navigate_to_community_resets_stale_selected_post_id(seeded_db, monkeypatch):
+    """Real, confirmed bug: navigating to "community" (via ANY entry point)
+    never used to reset a stale `selected_post_id` left over from previously
+    viewing one specific post's thread — so "take me back to the main feed"
+    while a thread was open would silently re-render that SAME thread
+    instead of the feed. `ui.state.navigate_to_page` now clears it centrally
+    whenever the target is "community"; this exercises that fix through the
+    Concierge's own `navigate` action specifically."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "navback1", "navback1@example.com", "Nav Back One")
+
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Feed Reset Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click().run()
+
+    real_post = community_repo.get_feed()[0]
+    at.session_state["page"] = "community"
+    at.session_state["selected_post_id"] = real_post.id
+    at.run()
+    assert at.session_state["selected_post_id"] == real_post.id  # thread view genuinely open
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Taking you back to the main feed.",
+            "action": {"type": "navigate", "navigate_to": "community"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("take me back to the main feed").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert at.session_state["selected_post_id"] is None
+
+
+def test_concierge_reset_mode_without_unsaved_changes_resets_immediately(seeded_db, monkeypatch):
+    """A `reset_mode: true` navigate action with nothing unsaved to protect
+    mirrors the existing "⬅ Change mode" button exactly — no dialog, no
+    extra confirmation, just a clean reset landing on the mode-selection
+    screen."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "resetmode1", "resetmode1@example.com", "Reset Mode One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    # Manually clear the flag to isolate this test from interception —
+    # covered separately below.
+    at.session_state["has_unsaved_build_changes"] = False
+    at.run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Sure, let's pick a new mode.",
+            "action": {"type": "navigate", "navigate_to": "create_build", "reset_mode": True},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("let me select a new mode").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["create_mode"] is None
+    assert at.session_state["build_draft"] is None
+    assert at.session_state["build_draft_analysis"] is None
+    # Landed on the mode-selection screen, not a leftover build.
+    assert at.get_by_key("mode_free") is not None
+    assert at.get_by_key("mode_budget") is not None
+    assert at.get_by_key("mode_workload") is not None
+
+
+def test_concierge_reset_mode_with_unsaved_changes_resets_with_no_draft_created(seeded_db, monkeypatch):
+    """A `reset_mode: true` request against an ACTIVE unsaved build routes
+    through `ui.state.teardown_builder()` (spec.md §7.9) — resetting
+    immediately with NO database write, landing on the mode-selection
+    screen. An unsaved build not explicitly checkpointed via the "Save as
+    draft" checkbox is simply discarded."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "resetmode2", "resetmode2@example.com", "Reset Mode Two")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    assert at.session_state["has_unsaved_build_changes"] is True
+    user_id = at.session_state["auth_user"]["id"]
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Sure, let's pick a new mode.",
+            "action": {"type": "navigate", "navigate_to": "create_build", "reset_mode": True},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("let me select a new mode").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["create_mode"] is None
+    assert at.session_state["build_draft"] is None
+    assert at.session_state["has_unsaved_build_changes"] is False
+    assert at.get_by_key("mode_free") is not None
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_change_mode_button_with_unsaved_changes_resets_with_no_draft_created(seeded_db):
+    """Real, confirmed gap (from an earlier round): the manual "⬅ Change
+    mode" button (`ui/views/create_build.py`) used to reset `create_mode`/
+    `build_draft`/`build_draft_analysis` unconditionally, discarding an
+    in-progress unsaved build with zero warning. It now calls `ui.state.
+    teardown_builder()` (spec.md §7.9) — resetting immediately with NO
+    database write (per the CURRENT, later product decision: the "Save as
+    draft" checkbox is the single explicit way to create a draft), exactly
+    mirroring the Concierge's own `reset_mode` handling
+    (test_concierge_reset_mode_with_unsaved_changes_resets_with_no_draft_created
+    above)."""
+    from db.repositories import components_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "changemode1", "changemode1@example.com", "Change Mode One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    assert at.session_state["has_unsaved_build_changes"] is True
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("change_mode").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["create_mode"] is None
+    assert at.session_state["build_draft"] is None
+    assert at.session_state["has_unsaved_build_changes"] is False
+    assert at.get_by_key("mode_free") is not None
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_change_mode_button_without_unsaved_changes_resets_with_no_draft_created(seeded_db):
+    """No unsaved changes (nothing picked yet in the fresh mode) -> "⬅ Change
+    mode" resets right away with no draft created — `teardown_builder()`
+    never writes to the database at all."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "changemode2", "changemode2@example.com", "Change Mode Two")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+    assert at.session_state["has_unsaved_build_changes"] is False
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("change_mode").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["create_mode"] is None
+    assert at.session_state["build_draft"] is None
+    assert at.get_by_key("mode_free") is not None
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_concierge_open_community_build_action_lands_on_thread_view(seeded_db, monkeypatch):
+    """A mocked `open_community_build` action must land the user directly on
+    `page == "community"` with `selected_post_id` set to the real post id,
+    and the thread view must actually render for that specific post — proven
+    by asserting the post's own real title appears on the page, not just
+    that no exception was raised."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "opencb1", "opencb1@example.com", "Open Community Build One")
+
+    # Create and publish a real, queryable post to open — same setup shape
+    # as the existing publish/community tests above.
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Open Me Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click().run()
+
+    from db.repositories import community_repo
+
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    real_post = feed[0]
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        # community_summary must carry this real post's post_id (and a
+        # distinct build_id) — confirms the caller-assembled context this
+        # action would really be resolved against.
+        matching = [p for p in community_summary if p["post_id"] == real_post.id]
+        assert matching
+        return {
+            "reply": "Here's your Open Me Rig.",
+            "action": {"type": "open_community_build", "post_id": real_post.id},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Open my Open Me Rig from community").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert at.session_state["selected_post_id"] == real_post.id
+
+    page_text = "\n".join(m.value for m in at.markdown) + " ".join(t.value for t in at.title)
+    assert "Open Me Rig" in page_text
+
+
+def test_concierge_save_build_action_persists_real_build_and_records_last_saved(seeded_db, monkeypatch):
+    """A save_build action with destination "build" must actually call
+    builds_repo.create_build and land a real row for the logged-in user,
+    under the user's own literal name — the chat equivalent of clicking
+    "Save build" — record the new build's id/name in
+    st.session_state["concierge_last_saved_build"] for a later publish_build
+    action to resolve against, reset has_unsaved_build_changes, and leave
+    build_draft/create_mode/page untouched (no forced navigation away)."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import builds_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge8", "concierge8@example.com", "Concierge Eight")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    at.get_by_key(f"select_GPU_{gpu.id}").click().run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        assert current_build_context is not None
+        return {
+            "reply": "Saved as 'Weekend Gaming Rig'! Would you like to publish it to the Community as well?",
+            "action": {
+                "type": "save_build",
+                "name": "Weekend Gaming Rig",
+                "destination": "build",
+                "explanation": "Saving your build.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Save this as Weekend Gaming Rig, a finished build").run()
+
+    assert not at.exception
+    user_id = at.session_state["auth_user"]["id"]
+    saved_builds = builds_repo.get_builds_for_user(user_id)
+    assert len(saved_builds) == 1
+    assert saved_builds[0].is_public is False
+    assert saved_builds[0].name == "Weekend Gaming Rig"  # the user's own literal name, not an auto-generated one
+
+    last_saved = at.session_state["concierge_last_saved_build"]
+    assert last_saved is not None
+    assert last_saved["build_id"] == saved_builds[0].id
+    assert last_saved["name"] == "Weekend Gaming Rig"
+
+    assert at.session_state["has_unsaved_build_changes"] is False
+    # build_draft/create_mode/page are deliberately left intact — a chat-triggered
+    # save does not forcibly navigate the user away like the manual save flow does.
+    assert at.session_state["build_draft"]["components"]["CPU"] == cpu.id
+    assert at.session_state["create_mode"] == "Free"
+    assert at.session_state["page"] == "create_build"
+
+
+def test_concierge_save_build_action_with_draft_destination_persists_draft_not_build(seeded_db, monkeypatch):
+    """A save_build action with destination "draft" must persist a real
+    DraftBuild row (via drafts_repo, the real draft_builds table) under the
+    user's own literal name, must NOT create a real Build row, and must NOT
+    set concierge_last_saved_build — a draft has no publish path."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import builds_repo, components_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge-draft1", "concierge-draft1@example.com", "Concierge Draft One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    at.get_by_key(f"select_GPU_{gpu.id}").click().run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        assert current_build_context is not None
+        return {
+            "reply": "Saved 'WIP Rig' as a draft.",
+            "action": {
+                "type": "save_build",
+                "name": "WIP Rig",
+                "destination": "draft",
+                "explanation": "Saving your build as a draft.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Save this as WIP Rig, just as a draft for now").run()
+
+    assert not at.exception
+    user_id = at.session_state["auth_user"]["id"]
+
+    drafts = drafts_repo.get_user_drafts(user_id)
+    assert len(drafts) == 1
+    assert drafts[0].name == "WIP Rig"
+    assert json.loads(drafts[0].components_json)["CPU"] == cpu.id
+
+    # No real Build row was created, and there's nothing to publish.
+    assert builds_repo.get_builds_for_user(user_id) == []
+    assert at.session_state["concierge_last_saved_build"] is None
+
+    assert at.session_state["has_unsaved_build_changes"] is False
+    assert at.session_state["build_draft"]["components"]["CPU"] == cpu.id
+    assert at.session_state["page"] == "create_build"
+
+
+def test_concierge_save_build_action_noop_without_active_build(seeded_db, monkeypatch):
+    """A save_build action arriving with no active build_draft (mode not
+    even chosen yet) must not crash and must not create a build or draft."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import builds_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge9", "concierge9@example.com", "Concierge Nine")
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "You don't have an active build to save yet.",
+            "action": {
+                "type": "save_build",
+                "name": "Nothing To Save",
+                "destination": "build",
+                "explanation": "Nothing to save.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Save this PC to my list").run()
+
+    assert not at.exception
+    user_id = at.session_state["auth_user"]["id"]
+    assert builds_repo.get_builds_for_user(user_id) == []
+    assert drafts_repo.get_user_drafts(user_id) == []
+    assert at.session_state["concierge_last_saved_build"] is None
+
+
+def test_concierge_publish_build_action_uses_last_saved_build(seeded_db, monkeypatch):
+    """A publish_build action must resolve WHICH build to publish via
+    st.session_state["concierge_last_saved_build"] (pre-set here, standing in
+    for a save_build action from an earlier turn) — never a build id on the
+    action itself, which the LLM has no way to know — and call the real
+    builds_repo.set_public + community_repo.create_post pair, using the
+    saved build's own name as the post title and the action's author_notes."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import builds_repo, community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge10", "concierge10@example.com", "Concierge Ten")
+
+    user_id = at.session_state["auth_user"]["id"]
+    build = builds_repo.create_build(
+        user_id=user_id,
+        name="Pre-saved via Concierge",
+        creation_mode="Free",
+        components=[],
+        total_cost=0.0,
+        compatibility_score=100.0,
+    )
+    at.session_state["concierge_last_saved_build"] = {"build_id": build.id, "name": build.name}
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Published to the Community!",
+            "action": {"type": "publish_build", "author_notes": "Solid budget pick."},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Yes, publish it").run()
+
+    assert not at.exception
+    refreshed = builds_repo.get_build(build.id)
+    assert refreshed.is_public is True
+
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    assert feed[0].build_id == build.id
+    assert feed[0].title == "Pre-saved via Concierge"
+    assert feed[0].author_notes == "Solid budget pick."
+
+
+def test_concierge_publish_build_action_is_noop_without_a_saved_build(seeded_db, monkeypatch):
+    """A publish_build action arriving with nothing saved this session
+    (concierge_last_saved_build is None, its real default) must not crash —
+    a graceful no-op, since this should be rare given the prompt design but
+    must never blow up the chat session."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge11", "concierge11@example.com", "Concierge Eleven")
+
+    assert at.session_state["concierge_last_saved_build"] is None
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Published!",
+            "action": {"type": "publish_build", "author_notes": None},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Yes, publish it").run()
+
+    assert not at.exception
+    assert community_repo.get_feed() == []
+
+
+def test_concierge_load_build_appends_authoritative_total_overriding_wrong_llm_claim(seeded_db, monkeypatch):
+    """Reproduces the real, confirmed bug: a live (non-mocked) LLM call once
+    returned a syntactically-correct load_build action with real catalog ids
+    whose REAL summed price was far below the figure the model's own `reply`
+    text claimed (it had parroted back the user's REQUESTED budget instead of
+    computing the actual total). The caller must append the REAL,
+    Python-computed total (ui.state.build_total_cost) to the last assistant
+    message, and that real total must be what's shown — not the wrong number
+    the mocked reply states. The expected total is computed here independently
+    (summing each component's raw price_usd directly), not by calling
+    ui.state.build_total_cost, so this assertion isn't tautological against
+    the same function chat_assistant.py calls internally."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    # A KNOWN, fixed set of real catalog ids across all 8 core categories.
+    picks = {category: components_repo.get_by_category(category)[0] for category in (
+        "CPU", "Motherboard", "GPU", "RAM", "Storage", "PSU", "Case", "Cooler",
+    )}
+    expected_total = sum(component.price_usd for component in picks.values())
+    # A deliberately WRONG aggregate, mimicking the real bug (the model
+    # parroting back a requested budget figure far from the real sum).
+    wrong_claimed_total = expected_total + 1500.0
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": f"I built you a {wrong_claimed_total:,.2f} USD PC with a great CPU and GPU pairing.",
+            "action": {
+                "type": "load_build",
+                "components": {category: component.id for category, component in picks.items()},
+                "explanation": "Picked a balanced set of real parts.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge12", "concierge12@example.com", "Concierge Twelve")
+
+    at.get_by_key("concierge_chat_input").set_value("Build me a 4000 dollar PC").run()
+
+    assert not at.exception
+    last_message = at.session_state["concierge_messages"][-1]
+    assert last_message["role"] == "assistant"
+    authoritative_line = f"**Total: USD {expected_total:,.2f}**"
+    wrong_authoritative_line = f"**Total: USD {wrong_claimed_total:,.2f}**"
+    # The real, Python-computed total must be present as the authoritative
+    # line...
+    assert authoritative_line in last_message["content"]
+    # ...and the wrong number the mocked reply claimed must NOT be what's
+    # presented as that authoritative line (the model's own untouched prose
+    # sentence containing the wrong figure is still allowed to remain — see
+    # the module docstring for why append-not-replace is the deliberate
+    # design — but it must never be mistaken for/formatted as the real
+    # total line itself).
+    assert wrong_authoritative_line not in last_message["content"]
+    assert expected_total != wrong_claimed_total
+
+
+def test_concierge_navigate_and_save_build_actions_never_append_a_total_line(seeded_db, monkeypatch):
+    """navigate/save_build actions involve no build-total concept at all —
+    the authoritative-total line must never be appended for them."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge13", "concierge13@example.com", "Concierge Thirteen")
+
+    def _fake_navigate_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Taking you to Community.",
+            "action": {"type": "navigate", "navigate_to": "community"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_navigate_response)
+    at.get_by_key("concierge_chat_input").set_value("Take me to community").run()
+
+    assert not at.exception
+    nav_message = at.session_state["concierge_messages"][-1]
+    assert nav_message["content"] == "Taking you to Community."
+    assert "Total:" not in nav_message["content"]
+
+    # Build a real, active draft so save_build has something to persist — a
+    # full 8-category build isn't required (save_build only needs a non-empty
+    # build_state, same precondition as
+    # test_concierge_save_build_action_persists_real_build_and_records_last_saved
+    # above, which uses this identical CPU+GPU-only shortcut).
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    at.get_by_key(f"select_GPU_{gpu.id}").click().run()
+
+    def _fake_save_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Saved your build! Want to publish it to Community too?",
+            "action": {
+                "type": "save_build",
+                "name": "Total-Line Test Build",
+                "destination": "build",
+                "explanation": "Saving the current build.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_save_response)
+    at.get_by_key("concierge_chat_input").set_value("Save this build").run()
+
+    assert not at.exception
+    save_message = at.session_state["concierge_messages"][-1]
+    assert save_message["content"] == "Saved your build! Want to publish it to Community too?"
+    assert "Total:" not in save_message["content"]
+    assert at.session_state["concierge_last_saved_build"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Drafts (db.repositories.drafts_repo) + leaving Build Studio
+# (ui.state.teardown_builder, ui/views/drafts.py) — spec.md §7.9.
+#
+# The CURRENT of four designs this exact concern has gone through (see
+# spec.md §7.9's own history note): an LLM-controlled `save_as_draft` field,
+# an explicit "Save Draft or Discard?" confirmation dialog
+# (ui/components/nav_guard.py, deleted), and a silent unconditional
+# auto-save-on-exit with a flash banner — ALL removed by a later, explicit
+# product decision. Every real exit from Build Studio now performs NO
+# database write of any kind and resets the builder immediately; the "Save
+# as draft" checkbox in create_build.py's manual Save UI is the single,
+# explicit source of truth for creating a draft.
+# ---------------------------------------------------------------------------
+def test_picking_a_component_sets_unsaved_changes_flag(seeded_db):
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft1", "draft1@example.com", "Draft One")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    assert at.session_state["has_unsaved_build_changes"] is False
+
+    cpu_button = next(b.key for b in at.button if b.key and b.key.startswith("select_CPU_"))
+    at.get_by_key(cpu_button).click().run()
+
+    assert not at.exception
+    assert at.session_state["has_unsaved_build_changes"] is True
+
+
+def test_sidebar_nav_with_unsaved_changes_navigates_with_no_draft_created(seeded_db):
+    """Clicking a different page's sidebar nav button while build_draft has
+    unsaved changes navigates immediately and discards the build — NO
+    database write, no dialog, no flash banner (spec.md §7.9's CURRENT
+    design: the "Save as draft" checkbox is the only explicit way to create
+    a draft)."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft2", "draft2@example.com", "Draft Two")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu_button = next(b.key for b in at.button if b.key and b.key.startswith("select_CPU_"))
+    at.get_by_key(cpu_button).click().run()
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("sidebar_nav_community").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert at.session_state["has_unsaved_build_changes"] is False
+    assert at.session_state["build_draft"] is None
+    assert at.session_state["create_mode"] is None
+    assert drafts_repo.get_user_drafts(user_id) == []
+    assert len(at.success) == 0  # no flash banner — that mechanism was removed entirely
+
+
+def test_sidebar_nav_without_unsaved_changes_navigates_with_no_draft_created(seeded_db):
+    """No unsaved changes yet (a fresh Free-mode draft with nothing picked)
+    -> the sidebar nav button navigates right away with no draft created."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft3", "draft3@example.com", "Draft Three")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("sidebar_nav_community").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert drafts_repo.get_user_drafts(user_id) == []
+    assert len(at.success) == 0
+
+
+def test_teardown_only_applies_when_leaving_create_build(seeded_db):
+    """Teardown is scoped to leaving an in-progress create_build —
+    has_unsaved_build_changes being (artificially) True while already on
+    another page must not trigger a reset of anything (there is nothing to
+    save regardless, since no exit vector ever writes to the database)."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft4", "draft4@example.com", "Draft Four")
+    at.get_by_key("sidebar_nav_my_builds").click().run()
+    at.session_state["has_unsaved_build_changes"] = True
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("sidebar_nav_community").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_sidebar_nav_home_navigates_to_landing_with_no_active_build(seeded_db):
+    """The 🏠 Home sidebar button (sidebar_nav_landing) navigates straight to
+    landing.py's content when there's no unsaved build in progress — plain,
+    uneventful navigation, same as the other nav targets."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "home1", "home1@example.com", "Home One")
+    at.get_by_key("sidebar_nav_my_builds").click().run()
+
+    at.get_by_key("sidebar_nav_landing").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "landing"
+    assert at.title[0].value == "Uncapped"
+
+
+def test_sidebar_nav_home_with_unsaved_changes_navigates_with_no_draft_created(seeded_db):
+    """Clicking Home mid-build with unsaved changes navigates straight to
+    landing and discards the build — no database write, same as every other
+    nav target."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "home2", "home2@example.com", "Home Two")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu_button = next(b.key for b in at.button if b.key and b.key.startswith("select_CPU_"))
+    at.get_by_key(cpu_button).click().run()
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("sidebar_nav_landing").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "landing"
+    assert at.session_state["has_unsaved_build_changes"] is False
+    assert at.session_state["build_draft"] is None
+    assert at.session_state["create_mode"] is None
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_sidebar_nav_create_build_self_click_does_not_reset(seeded_db):
+    """Clicking 🛠️ Create New PC (sidebar_nav_create_build) while ALREADY on
+    create_build with unsaved changes must never trigger teardown — you
+    can't "leave" the page you're already on. app.py's guard condition
+    explicitly excludes `target_page == "create_build"`."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "selfnav1", "selfnav1@example.com", "Self Nav One")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu_button = next(b.key for b in at.button if b.key and b.key.startswith("select_CPU_"))
+    at.get_by_key(cpu_button).click().run()
+    assert at.session_state["has_unsaved_build_changes"] is True
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("sidebar_nav_create_build").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    # The in-progress pick must survive too — nothing was reset.
+    assert at.session_state["build_draft"]["components"]["CPU"] is not None
+    assert at.session_state["has_unsaved_build_changes"] is True
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_sidebar_nav_my_builds_with_unsaved_changes_navigates_with_no_draft_created(seeded_db):
+    """Clicking 📂 Previous Builds (sidebar_nav_my_builds) mid-build with
+    unsaved changes navigates straight to my_builds and discards the build —
+    no database write."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "mybuilds1", "mybuilds1@example.com", "My Builds One")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu_button = next(b.key for b in at.button if b.key and b.key.startswith("select_CPU_"))
+    at.get_by_key(cpu_button).click().run()
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("sidebar_nav_my_builds").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "my_builds"
+    assert at.session_state["has_unsaved_build_changes"] is False
+    assert at.session_state["build_draft"] is None
+    assert at.session_state["create_mode"] is None
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_sidebar_nav_drafts_with_unsaved_changes_navigates_with_no_draft_created(seeded_db):
+    """Clicking 📝 View Drafts (sidebar_nav_drafts) mid-build with unsaved
+    changes navigates straight to the (empty) Drafts page — the in-progress
+    build is discarded, not auto-saved; the Drafts list must NOT show a
+    phantom entry for it."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draftsnav1", "draftsnav1@example.com", "Drafts Nav One")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu_button = next(b.key for b in at.button if b.key and b.key.startswith("select_CPU_"))
+    at.get_by_key(cpu_button).click().run()
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("sidebar_nav_drafts").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "drafts"
+    assert at.session_state["has_unsaved_build_changes"] is False
+    assert at.session_state["build_draft"] is None
+    assert at.session_state["create_mode"] is None
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_save_build_resets_unsaved_changes_flag(seeded_db):
+    """has_unsaved_build_changes is only ever set True by
+    ui.state.set_component/remove_component/set_quantity — Budget/Workload's
+    "generate" buttons write build_draft["components"] directly rather than
+    through those mutators (a pre-existing, deliberately out-of-scope
+    behavior of this feature, per its own spec), so a manual Free-mode pick
+    is used here to actually exercise the flag before checking it resets on
+    save."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft8", "draft8@example.com", "Draft Eight")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu_button = next(b.key for b in at.button if b.key and b.key.startswith("select_CPU_"))
+    at.get_by_key(cpu_button).click().run()
+
+    assert at.session_state["has_unsaved_build_changes"] is True
+
+    at.get_by_key("build_name_input").input("Draft Eight's Rig")
+    at.get_by_key("save_build").click()
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["has_unsaved_build_changes"] is False
+
+
+def test_logout_with_unsaved_changes_logs_out_with_no_draft_created(seeded_db):
+    """Clicking Logout while create_build has unsaved changes completes the
+    logout immediately with NO database write (the same `ui.state.
+    teardown_builder()` every other exit vector calls) — no dialog, no
+    auto-save."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft9", "draft9@example.com", "Draft Nine")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu_button = next(b.key for b in at.button if b.key and b.key.startswith("select_CPU_"))
+    at.get_by_key(cpu_button).click().run()
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("logout_button").click().run()
+
+    assert not at.exception
+    assert at.session_state["auth_user"] is None
+    assert at.session_state["page"] == "landing"
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_logout_without_unsaved_changes_logs_out_with_no_draft_created(seeded_db):
+    """No unsaved changes -> Logout completes immediately with no draft
+    created — the save step is skipped, matching every other exit vector."""
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft10", "draft10@example.com", "Draft Ten")
+    user_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("logout_button").click().run()
+
+    assert not at.exception
+    assert at.session_state["auth_user"] is None
+    assert at.session_state["page"] == "landing"
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_drafts_page_lists_saved_draft_with_part_count_and_mode(seeded_db):
+    from db.repositories import components_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft9", "draft9@example.com", "Draft Nine")
+
+    user_id = at.session_state["auth_user"]["id"]
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+    drafts_repo.save_draft(
+        user_id=user_id, name="Saved WIP", mode="Free",
+        components={"CPU": cpu.id, "GPU": gpu.id}, quantities={},
+    )
+
+    at.get_by_key("sidebar_nav_drafts").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "drafts"
+    markdown_text = " ".join(m.value for m in at.markdown)
+    assert "Saved WIP" in markdown_text
+    caption_text = " ".join(c.value for c in at.caption)
+    assert "Free draft" in caption_text
+    assert "2 part(s) selected" in caption_text
+
+
+def test_drafts_page_empty_state_when_no_drafts(seeded_db):
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft10", "draft10@example.com", "Draft Ten")
+
+    at.get_by_key("sidebar_nav_drafts").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "drafts"
+    assert any("No saved drafts yet" in i.value for i in at.info)
+
+
+def test_drafts_load_into_builder_restores_components(seeded_db):
+    from db.repositories import components_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft11", "draft11@example.com", "Draft Eleven")
+
+    user_id = at.session_state["auth_user"]["id"]
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+    draft = drafts_repo.save_draft(
+        user_id=user_id, name="Reload Me", mode="Budget",
+        components={"CPU": cpu.id, "GPU": gpu.id}, quantities={},
+    )
+
+    at.get_by_key("sidebar_nav_drafts").click().run()
+    at.get_by_key(f"load_draft_{draft.id}").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["create_mode"] == "Budget"
+    components = at.session_state["build_draft"]["components"]
+    assert components["CPU"] == cpu.id
+    assert components["GPU"] == gpu.id
+
+
+def test_drafts_delete_requires_confirmation_then_removes_draft(seeded_db):
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft12", "draft12@example.com", "Draft Twelve")
+
+    user_id = at.session_state["auth_user"]["id"]
+    draft = drafts_repo.save_draft(user_id=user_id, name="Disposable Draft", mode="Free", components={}, quantities={})
+
+    at.get_by_key("sidebar_nav_drafts").click().run()
+    at.get_by_key(f"delete_draft_{draft.id}").click().run()
+
+    # first click only arms the confirmation — draft must still exist
+    assert not at.exception
+    assert len(drafts_repo.get_user_drafts(user_id)) == 1
+    yes_button = at.get_by_key(f"confirm_delete_draft_{draft.id}_yes")
+    assert yes_button is not None
+
+    yes_button.click().run()
+
+    assert not at.exception
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_drafts_delete_cancel_keeps_the_draft(seeded_db):
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "draft13", "draft13@example.com", "Draft Thirteen")
+
+    user_id = at.session_state["auth_user"]["id"]
+    draft = drafts_repo.save_draft(user_id=user_id, name="Keep This Draft", mode="Free", components={}, quantities={})
+
+    at.get_by_key("sidebar_nav_drafts").click().run()
+    at.get_by_key(f"delete_draft_{draft.id}").click().run()
+    at.get_by_key(f"confirm_delete_draft_{draft.id}_cancel").click().run()
+
+    assert not at.exception
+    assert [d.name for d in drafts_repo.get_user_drafts(user_id)] == ["Keep This Draft"]
+
+
+# ---------------------------------------------------------------------------
+# Concierge navigate action extension: `filters` (community pre-population)
+# — see llm/schemas.py's ConciergeNavigateFilters/ConciergeNavigateAction and
+# ui/components/chat_assistant.py's navigate branch /
+# ui/views/community.py::_apply_pending_community_filters. The now-removed
+# `save_as_draft` (auto-stash to Drafts) mechanism is covered by the
+# regression tests below (test_concierge_navigate_never_creates_draft_*),
+# which confirm the OPPOSITE: a navigate action never creates a draft.
+# ---------------------------------------------------------------------------
+def test_concierge_navigate_with_budget_filters_prepopulates_community_widgets(seeded_db, monkeypatch):
+    """A navigate action to "community" carrying a Budget-shaped `filters`
+    payload must actually pre-populate the REAL `community_mode_filter`/
+    `community_price_filter` widget session-state keys the next time
+    community.py renders — not just set `st.session_state["page"]`. Also
+    confirms the one-shot staging key is consumed (popped), not left
+    lingering."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "navfilter1", "navfilter1@example.com", "Nav Filter One")
+
+    # A real, currently-shared Budget build is required for the price-step
+    # selectbox to render at all (ui/views/community.py hides it entirely
+    # when no Budget builds are shared).
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Nav Filter Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click().run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Here are the budget builds under 1200 USD.",
+            "action": {
+                "type": "navigate",
+                "navigate_to": "community",
+                "filters": {"build_type": "Budget", "max_price": 1200.0, "domain": None, "tier": None},
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Show budget builds under 1200").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert not _session_value(at, "pending_community_filters")  # one-shot: consumed, not lingering
+
+    mode_widget = at.get_by_key("community_mode_filter")
+    assert mode_widget.value == "Budget"
+
+    price_widget = at.get_by_key("community_price_filter")
+    assert price_widget.value != "All Prices"  # a real max_price was requested and matched
+    assert price_widget.value in price_widget.options  # never a value outside the real options
+
+
+def test_concierge_navigate_with_workload_filters_prepopulates_community_widgets(seeded_db, monkeypatch):
+    """Same as the Budget case above, but for the Workload domain/tier
+    sub-filter — also exercises case-insensitive matching against the real,
+    currently-shared domain/tier strings."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "navfilter2", "navfilter2@example.com", "Nav Filter Two")
+
+    # A real, currently-shared Workload build (default profile "General",
+    # default tier "Mid" — see generate_workload_build's own defaults).
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_workload").click().run()
+    at.get_by_key("generate_workload_build").click().run()
+    at.get_by_key("build_name_input").input("Nav Filter Workload Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click().run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Here are the general-purpose builds.",
+            "action": {
+                "type": "navigate",
+                "navigate_to": "community",
+                # Deliberately lowercase/differently-cased from the real
+                # stored "General"/"Mid" values, to exercise the
+                # case-insensitive match.
+                "filters": {"build_type": "Workload", "max_price": None, "domain": "general", "tier": "mid"},
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Show general workload builds").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert not _session_value(at, "pending_community_filters")
+
+    assert at.get_by_key("community_mode_filter").value == "Workload"
+    domain_widget = at.get_by_key("community_domain_filter")
+    tier_widget = at.get_by_key("community_tier_filter")
+    assert domain_widget.value == "General"  # matched real, currently-shared value, not the lowercased request
+    assert tier_widget.value == "Mid"
+    assert domain_widget.value in domain_widget.options
+    assert tier_widget.value in tier_widget.options
+
+
+def test_concierge_navigate_with_unmatched_filters_falls_back_gracefully(seeded_db, monkeypatch):
+    """A domain/tier that doesn't match anything currently shared must fall
+    back to "All" rather than crash with a raw StreamlitAPIException (a
+    keyed selectbox given a session-state value outside its own `options`
+    list) — the exact class of footgun this feature has to guard against
+    since the real option strings are live data unknown to the LLM."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "navfilter5", "navfilter5@example.com", "Nav Filter Five")
+
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_workload").click().run()
+    at.get_by_key("generate_workload_build").click().run()
+    at.get_by_key("build_name_input").input("Nav Filter Workload Rig 2")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click().run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Here you go.",
+            "action": {
+                "type": "navigate",
+                "navigate_to": "community",
+                "filters": {
+                    "build_type": "Workload",
+                    "max_price": None,
+                    "domain": "Nonexistent Domain",
+                    "tier": "Nonexistent Tier",
+                },
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Show me nonexistent-domain builds").run()
+
+    assert not at.exception  # no StreamlitAPIException from an out-of-options selectbox value
+    assert at.get_by_key("community_domain_filter").value == "All"
+    assert at.get_by_key("community_tier_filter").value == "All"
+
+
+def test_concierge_navigate_never_creates_draft_even_with_active_unsaved_build(
+    seeded_db, monkeypatch
+):
+    """The core "no phantom drafts" regression guarantee: a plain Concierge
+    navigate request away from an unsaved build must NEVER create a
+    DraftBuild row — `ui.state.teardown_builder()` (spec.md §7.9's CURRENT
+    design) performs no database write of any kind, entirely independent of
+    anything the model returns. This also proves a stale/non-compliant
+    mocked response that still carries the long-REMOVED `save_as_draft: true`
+    field (from an even earlier, since-replaced design) has no effect of its
+    own: `ConciergeNavigateAction` no longer declares it at all, and
+    `_apply_concierge_action`'s `navigate` branch never looks for it."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "navfilter3", "navfilter3@example.com", "Nav Filter Three")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+
+    assert at.session_state["has_unsaved_build_changes"] is True
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        assert current_build_context is not None
+        return {
+            "reply": "Taking you to Community.",
+            # A stale/non-compliant mock still returning the long-removed
+            # field — must be silently inert, never acted upon.
+            "action": {
+                "type": "navigate",
+                "navigate_to": "community",
+                "filters": None,
+                "save_as_draft": True,
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Take me to Community").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert at.session_state["has_unsaved_build_changes"] is False
+    assert at.session_state["build_draft"] is None
+    assert at.session_state["create_mode"] is None
+
+    user_id = at.session_state["auth_user"]["id"]
+    assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_concierge_navigate_creates_no_draft_without_active_build_either(seeded_db, monkeypatch):
+    """Same guarantee as above, for the simpler case of no active build_draft
+    at all (mode not even chosen yet) — must not crash and must not create a
+    draft row."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "navfilter4", "navfilter4@example.com", "Nav Filter Four")
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+    ):
+        return {
+            "reply": "Taking you to Community.",
+            "action": {
+                "type": "navigate",
+                "navigate_to": "community",
+                "filters": None,
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("Take me to Community").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    user_id = at.session_state["auth_user"]["id"]
+    assert drafts_repo.get_user_drafts(user_id) == []

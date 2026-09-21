@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 
 import streamlit as st
+from streamlit.errors import StreamlitWidgetAlreadyInstantiatedError
 
 from db.models import Component
 from db.repositories import components_repo
@@ -28,6 +29,14 @@ _DEFAULTS = {
     "fork_source_build_id": None,
     "stretch_applied_keys": set(),  # per-cache-key lock for the advisory's one-time stretch-upgrade apply button
     "concierge_messages": [],  # sidebar AI Concierge chat history: [{"role": "user"|"assistant", "content": str}, ...]
+    "has_unsaved_build_changes": False,  # True once build_draft has any pick the user hasn't saved (build or draft) yet
+    "concierge_last_saved_build": None,  # {"build_id": int, "name": str} for the most recent Concierge `save_build`
+    # action applied this session, or None if none has happened yet. The ONLY way `ui/components/chat_assistant.py`
+    # can later resolve which real database build a follow-up `publish_build` action (arriving on a LATER chat
+    # turn, once the user confirms "yes, publish it") should act on — the LLM itself never sees/invents a build id.
+    # Deliberately a NEW, distinctly-named key rather than reusing the retired `concierge_pending_action` key (that
+    # one was dead code from an unrelated, now-retired confirm-before-apply mechanism). Plain `None` default needs
+    # no `copy.deepcopy` (see init_session_state's docstring) — only ever wholesale-reassigned, never mutated in place.
 }
 
 
@@ -46,6 +55,60 @@ def init_session_state() -> None:
     for key, default in _DEFAULTS.items():
         if key not in st.session_state:
             st.session_state[key] = copy.deepcopy(default)
+
+
+def navigate_to_page(target_page: str) -> None:
+    """Single source of truth for a plain page transition (`st.session_state
+    ["page"] = target_page`), used by every real navigation entry point
+    (`app.py`'s sidebar buttons, `ui/components/chat_assistant.py`'s
+    Concierge `navigate` action) instead of each writing `page` directly.
+
+    The one thing this centralizes beyond the raw assignment: navigating TO
+    `"community"` always clears `selected_post_id` first. Without this, a
+    user viewing one specific community post's thread (`selected_post_id`
+    set) who then navigates to `"community"` from anywhere else would land
+    back on `community.py::render()`, which checks `selected_post_id` at the
+    very top of its own function and re-shows the SAME stale thread instead
+    of the feed — a real, confirmed bug this function exists to fix at every
+    call site at once rather than requiring each one to remember it."""
+    if target_page == "community":
+        st.session_state["selected_post_id"] = None
+    st.session_state["page"] = target_page
+
+
+def teardown_builder() -> None:
+    """Leaving Build Studio (spec.md §7.9) — called by every real exit vector
+    (`app.py`'s sidebar nav buttons and Logout button, `ui/views/create_build.py`'s
+    "⬅ Change mode" button, `ui/components/chat_assistant.py`'s Concierge
+    `navigate`/`open_community_build`/`reset_mode` handling) BEFORE the target
+    transition itself (a page change, a mode reset, or `log_out()`).
+
+    Per an explicit, later product decision, this performs NO database write
+    of any kind — it unconditionally resets `create_mode`/`build_draft`/
+    `build_draft_analysis` to `None` and `has_unsaved_build_changes` to
+    `False`, so `ui/views/create_build.py`'s own `create_mode is None or
+    build_draft is None` gate (§7.4 step 1) shows the mode-selection screen
+    the next time Build Studio is entered, never a leftover build. An
+    in-progress, unsaved build that hasn't been explicitly checkpointed via
+    the "Save as draft" checkbox (§7.4 step 9) or a full "Save build" is
+    simply discarded — the same tradeoff a plain "close the tab" would have.
+    Does NOT itself change `st.session_state["page"]` or log out — the
+    caller does that immediately afterward, since what "leaving" means
+    differs per entry point (a page key, or `auth.session.log_out()`).
+
+    This function previously (two designs ago) silently auto-saved an
+    unsaved build to `draft_builds` on exit and staged a flash banner
+    (`st.session_state["_draft_saved_banner"]`, rendered by `app.py`) — both
+    REMOVED ENTIRELY by a later, explicit product decision: the "Save as
+    draft" checkbox in the manual Save UI is now the single, explicit source
+    of truth for creating a draft, and a silent background write on every
+    exit was judged more surprising than useful once that explicit checkbox
+    existed. See spec.md §7.9 for the full history of this feature's
+    redesigns."""
+    st.session_state["create_mode"] = None
+    st.session_state["build_draft"] = None
+    st.session_state["build_draft_analysis"] = None
+    st.session_state["has_unsaved_build_changes"] = False
 
 
 def new_build_draft(creation_mode: str | None = None) -> dict:
@@ -74,9 +137,43 @@ def resolve_build_state(build_draft: dict | None) -> BuildState:
     return build_state
 
 
+def _sync_qty_widget_key(category: str, value: int | None) -> None:
+    """Best-effort sync of `ui/components/part_picker.py`'s Qty stepper
+    widget key (`qty_{category}`) to `value` (or removes it entirely when
+    `value` is `None`) — `None` when a slot is emptied, an int when a
+    quantity is set. Streamlit forbids writing to (or popping) a widget's
+    session-state key AFTER that widget has already been instantiated in the
+    CURRENT script run (`StreamlitWidgetAlreadyInstantiatedError`) — this
+    happens for real whenever `set_quantity`/`remove_component` is called
+    from the stepper's OWN on-change callback (the widget already rendered
+    earlier in this exact run, using the just-typed value) or from
+    create_build.py code that runs after the part-picker grid (e.g. the
+    stretch-upgrade advisory's `set_quantity` action). In the on-change case
+    the write would be redundant anyway (the widget's own interaction
+    already put the same value there); in the after-the-grid case, skipping
+    it here is safe too — `build_draft["quantities"]` is already correct,
+    and the widget's own pre-render clamp/sync logic reconciles it against
+    the real value on the very next fresh render, before that key's widget
+    has been instantiated in THAT run. Silently swallowing this specific,
+    well-understood exception is what makes the sync possible at all for
+    the OTHER (safe) call sites — e.g. the AI Concierge applying a
+    `modify_build` quantity change, which runs before `router.render()`
+    reaches the widget at all — without also having to duplicate this
+    caller-context check at every call site."""
+    key = f"qty_{category}"
+    try:
+        if value is None:
+            st.session_state.pop(key, None)
+        else:
+            st.session_state[key] = value
+    except StreamlitWidgetAlreadyInstantiatedError:
+        pass
+
+
 def set_component(build_draft: dict, category: str, component: Component) -> None:
     build_draft.setdefault("components", {})[category] = component.id
     _invalidate_analysis()
+    st.session_state["has_unsaved_build_changes"] = True
 
 
 def remove_component(build_draft: dict, category: str) -> None:
@@ -84,7 +181,19 @@ def remove_component(build_draft: dict, category: str) -> None:
     # A freshly-emptied slot starts back at quantity 1 if it's ever re-filled,
     # rather than inheriting a stale multiplier from whatever was there before.
     build_draft.get("quantities", {}).pop(category, None)
+    # `ui/components/part_picker.py`'s Qty stepper is a keyed widget
+    # (`qty_{category}`) that only ever honors a fresh `value=` argument the
+    # very first time that key is created — every rerun after that, it
+    # renders from whatever's already cached in st.session_state[key],
+    # regardless of what this function just wrote to build_draft. Popping
+    # the stale widget key here means a re-filled slot's stepper gets to
+    # honor `value=` again on its next render, rather than silently
+    # resurrecting whatever quantity the PREVIOUS component in this slot
+    # happened to have. See `_sync_qty_widget_key`'s own docstring for why
+    # this pop is wrapped defensively.
+    _sync_qty_widget_key(category, None)
     _invalidate_analysis()
+    st.session_state["has_unsaved_build_changes"] = True
 
 
 def get_quantity(build_draft: dict, category: str) -> int:
@@ -94,9 +203,25 @@ def get_quantity(build_draft: dict, category: str) -> int:
 def set_quantity(build_draft: dict, category: str, quantity: int) -> None:
     clamped = max(1, quantity)
     build_draft.setdefault("quantities", {})[category] = clamped
+    # Keep the Qty stepper's own widget key (`ui/components/part_picker.py`,
+    # `qty_{category}`) in lockstep with the real value this function just
+    # wrote. Without this, any OUT-OF-BAND quantity write — this function is
+    # called not just from the manual stepper's own callback but also from
+    # the AI Concierge's `modify_build` handling and the advisory's
+    # stretch-upgrade "set_quantity" action — has no effect on what the
+    # stepper actually DISPLAYS: a keyed Streamlit widget only ever honors a
+    # fresh `value=` argument the very first time its key is created: every
+    # later rerun renders from whatever's already cached in
+    # st.session_state[key] and simply ignores `value=` entirely. Writing
+    # the key directly here, at the single source of truth for this value,
+    # closes that gap for every caller at once rather than requiring each
+    # one to remember to do it themselves. See `_sync_qty_widget_key`'s own
+    # docstring for why this write is wrapped defensively.
+    _sync_qty_widget_key(category, clamped)
     # A quantity change affects cost/compatibility just like a component
     # swap, so the last synergy/bottleneck read must go stale too.
     _invalidate_analysis()
+    st.session_state["has_unsaved_build_changes"] = True
 
 
 def _invalidate_analysis() -> None:

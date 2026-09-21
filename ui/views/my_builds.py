@@ -27,6 +27,11 @@ def _clone_into_studio(build) -> None:
     st.session_state["build_draft"] = draft
     st.session_state["create_mode"] = build.creation_mode
     st.session_state["build_draft_analysis"] = None
+    # Same as ui/views/community.py::_fork_into_studio: writing
+    # draft["components"] as a plain dict literal bypasses ui.state.
+    # set_component (the usual place this flag gets set). Set explicitly so
+    # a cloned/edited build is correctly tracked as having unsaved picks.
+    st.session_state["has_unsaved_build_changes"] = True
     st.session_state["page"] = "create_build"
     st.rerun()
 

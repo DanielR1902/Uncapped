@@ -3,17 +3,18 @@ from __future__ import annotations
 
 import streamlit as st
 
-from ui.views import community, create_build, landing, my_builds
+from ui.views import community, create_build, drafts, landing, my_builds
 
 _VIEWS = {
     "landing": landing.render,
     "create_build": create_build.render,
     "my_builds": my_builds.render,
     "community": community.render,
+    "drafts": drafts.render,
 }
 
 # Every page except landing requires auth (intent.txt: "all buttons locked" pre-login).
-_GATED_PAGES = {"create_build", "my_builds", "community"}
+_GATED_PAGES = {"create_build", "my_builds", "community", "drafts"}
 
 
 def render() -> None:

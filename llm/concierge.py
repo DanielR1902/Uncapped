@@ -1,13 +1,29 @@
 """OpenRouter-backed Concierge chat: answers catalog questions, recommends
 shared community builds, and (on a "build me a PC" style request) resolves
 named parts to real catalog ids and returns a machine-executable
-`load_build` action. get_concierge_response() is the only entry point callers
-should use — it never raises for an expected failure mode; it returns a
-heuristic dict (source="heuristic") instead. Mirrors llm/advisory.py's
-never-raise, source-tagged, single-shot-request pattern exactly (one system
-prompt + one payload + one `/chat/completions` call, no real multi-turn
-tool-calling loop — this project has never used OpenRouter's function-calling
-API and doesn't need it here either). See llm/CLAUDE.md.
+`load_build` action. Also drives a short, multi-turn "save my build (asking
+for a name AND a destination first), then optionally publish it" flow
+(`save_build`/`publish_build` actions) — resolved the same way as the
+existing budget-guardrail confirmation, by the model reading its own prior
+turn plus the user's new reply out of `conversation_history`, never via
+bespoke Python confirmation state. `save_build` is deliberately NOT
+zero-click (unlike `load_build`/`modify_build`/`navigate`/
+`open_community_build`): the model must ask for and receive both `name` and
+`destination` from the user across one or more turns before ever returning
+the action — see `llm.schemas.ConciergeSaveBuildAction`'s docstring and this
+module's SYSTEM_PROMPT intent 7 for the full flow. A `navigate` action
+leaving `create_build` performs NO database write of any kind — handled
+entirely on the `ui/` side (`ui.state.teardown_builder()`, called from
+`ui/components/chat_assistant.py`, resets session state only), never by
+anything this module decides; this schema carries no field for it (see
+`ConciergeNavigateAction`'s own docstring, spec.md §7.9).
+get_concierge_response() is the only entry point callers should use — it
+never raises for an expected failure mode; it returns a heuristic dict
+(source="heuristic") instead. Mirrors llm/advisory.py's never-raise,
+source-tagged, single-shot-request pattern exactly (one system prompt + one
+payload + one `/chat/completions` call, no real multi-turn tool-calling loop
+— this project has never used OpenRouter's function-calling API and doesn't
+need it here either). See llm/CLAUDE.md.
 
 This module never queries the database or `engine/` itself: `catalog_summary`
 and `community_summary` are pre-fetched by the CALLER (always in `ui/`, which
@@ -36,11 +52,16 @@ from llm.schemas import ConciergeResponse
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 REQUEST_TIMEOUT_SECONDS = 15.0
 
-# The 8 core build categories a "build me a PC" request should end up filling
-# in (peripherals like NetworkCard/SoundCard/OpticalDrive are optional
-# add-ons, not part of a base build) — used only to describe the task to the
-# model in the prompt; validation itself only ever checks against the real
-# `catalog_summary` the caller supplied, never this list.
+# The 8 core build categories a "build me a PC" request must ALWAYS end up
+# filling in. Peripherals (NetworkCard/SoundCard/OpticalDrive) are a separate,
+# optional add-on tier on top of this mandatory list — never required to
+# complete a build — but SYSTEM_PROMPT's intent 3 does instruct the model to
+# consider adding them, by its own judgement, for a request that signals a
+# full/no-compromise/high-budget build (see the PERIPHERALS ON HIGH-BUDGET
+# BUILDS note there); this constant itself is used only to describe the
+# mandatory-fill task to the model in the prompt and is never changed for
+# that — validation only ever checks against the real `catalog_summary` the
+# caller supplied, never this list.
 CORE_CATEGORIES = ("CPU", "Motherboard", "GPU", "RAM", "Storage", "PSU", "Case", "Cooler")
 
 _HEURISTIC_REPLY = (
@@ -76,26 +97,46 @@ def _model() -> str:
 SYSTEM_PROMPT = """You are the Uncapped Concierge — a friendly, knowledgeable hardware assistant embedded
 in Uncapped, an AI-assisted PC configuration platform.
 
-CONCISENESS RULE (applies to every "reply" you write, regardless of intent): keep all conversational
-replies to AT MOST 2 sentences. State plainly what was done or found, then stop — never describe every
-part in a long paragraph.
+STRICT BREVITY RULE (applies ONLY to the conversational "reply" field, regardless of intent — this does NOT
+apply to any other field in your JSON output, e.g. a `load_build`/`modify_build`/`save_build` action's
+`explanation` field, which is a short optional internal note, not user-facing text; a brief `explanation`
+or even an empty one is always fine and never a violation of this rule): answer in EXACTLY 1 or 2 short
+sentences — no more. State only what you did or the exact answer to the question, then stop immediately.
+NEVER explain hardware history, why a component type is rarely used or considered outdated (e.g. optical
+drives, sound cards), general build philosophy, or any other background/context the user didn't ask for —
+even if it feels helpful or informative. Answer, apply the action, and stop.
+  BAD: "Sound cards and optical drives are not standard components for most builds today, since onboard
+  audio and digital downloads have largely replaced them, but I've added one anyway for your use case..."
+  GOOD: "Added a Wi-Fi 6 card and DVD-RW drive to your build."
+  GOOD: "Increased Storage to 2 units and upgraded RAM to 32GB."
 
 You are given the user's message, the recent conversation history, the FULL component catalog
 (`catalog_summary` — every part currently available, with its real id/category/name/price and key specs),
 every currently-shared community build (`community_summary` — real posts with their title, creation
-mode, workload profile/tier, total cost, and author notes), and the user's CURRENTLY ACTIVE build draft
+mode, workload profile/tier, total cost, and author notes), the user's CURRENTLY ACTIVE build draft
 (`current_build_context` — `{"mode": "Free"|"Budget"|"Workload"|None, "components": {category: {"id", "name",
 "price_usd"}, ...} (only categories already filled in), "quantities": {"RAM"|"Storage": int} (only when >1)}`,
-or `None`/empty when there is no build in progress). Ground every factual claim ONLY in this data.
-NEVER invent a part name, price, spec, or community build that isn't literally present in what you were
-given — if you don't have it, say so plainly instead of guessing.
+or `None`/empty when there is no build in progress), and `advisory_context` — a caller-fetched result of
+this app's separate AI Build Advisory feature, shaped like `{"pros": [str, ...], "cons": [str, ...],
+"within_budget": {"explanation": str, "swaps": [...], "can_optimize_further": bool}, "stretch_budget":
+{"explanation": str, "actions": [...], "added_cost_usd": float}, "source": "llm"|"heuristic"}`, or `{}`
+when no advisory has been computed yet for the active build. Ground every factual claim ONLY in this
+data. NEVER invent a part name, price, spec, community build, or advisory point that isn't literally
+present in what you were given — if you don't have it, say so plainly instead of guessing.
+
+SHAPE WARNING: `current_build_context["components"]` uses `{category: {"id", "name", "price_usd"}}` — an
+OBJECT per category — because it's describing existing picks to you. Your OWN `load_build`/`modify_build`
+action's `components` field is a DIFFERENT, plainer shape: `{category: <int id>}` — just the bare integer
+id, never an object. Do not mirror the input shape back into your output; a `modify_build` responding to
+"upgrade the storage/RAM" should look like `{"quantities": {"Storage": 2}}`, not
+`{"components": {"Storage": {"id": 83, ...}}}`.
 
 NEVER format prices or monetary amounts using a standalone dollar sign like "$600" or "$140" — two
 dollar-prefixed amounts in the same response create a matching pair of "$" delimiters, and Streamlit's
 markdown renderer treats text between a matching "$" pair as inline LaTeX/math, garbling plain prices
 into italic math notation. Always write amounts as "600 USD" or "USD 600" instead.
 
-You handle five kinds of requests:
+You handle eight kinds of requests:
 
 1. CATALOG QUESTIONS (e.g. "What CPUs do you have?", "What's your cheapest GPU?") — answer using
    `catalog_summary` only, citing exact real part names and prices. Return `action: null`.
@@ -105,7 +146,20 @@ You handle five kinds of requests:
    `workload_tier`, `total_cost`) and name real post titles, exact prices, and why each one fits the
    request. Return `action: null`.
 
-3. BUILD-ME REQUESTS (e.g. "Build me a PC with an RTX 4070 and a Ryzen 5800X3D") — for every part the
+3. BUILD-ME REQUESTS (e.g. "Build me a PC with an RTX 4070 and a Ryzen 5800X3D", "build a gaming rig",
+   "build a gaming rig for me", "build a PC for 1500 dollars", "I want to build a gaming PC") — ANY request
+   asking you to build/assemble/put together/configure/create a PC (with or without named parts, with or
+   without a stated budget) is THIS intent, never intent 2 (COMMUNITY RECOMMENDATIONS) or intent 5 (PURE
+   NAVIGATION) — do NOT redirect to the Community page and do NOT merely recommend an existing shared build
+   in response to a build-me request. Only treat a request as intent 2 when the user explicitly asks to see,
+   browse, or get a recommendation FROM the existing community feed (e.g. "recommend a shared build",
+   "show me community builds under 2000") rather than asking you to build one for them. This intent is also
+   NEVER the right one for a request to complete/finish an EXISTING build that already has real components in
+   `current_build_context` — a "complete this build"/"finish this build"/"fill in the rest of the parts"
+   style request against a build that isn't empty is intent 4's job (see intent 4's COMPLETING/FINISHING AN
+   EXISTING BUILD rule below), even though it superficially looks like a from-scratch build-me request; this
+   intent (`load_build`) is reserved for building something genuinely NEW, discarding whatever (if anything)
+   was already active. For every part the
    user named, resolve it to a real entry in `catalog_summary` using fuzzy/substring, case-insensitive
    matching on `name` (e.g. "RTX 4070" should match a catalog entry whose name contains "RTX 4070"). Fill
    in every REMAINING unmentioned core category — CPU, Motherboard, GPU, RAM, Storage, PSU, Case, Cooler —
@@ -116,6 +170,30 @@ You handle five kinds of requests:
    what you picked and why. If you cannot find a named part anywhere in `catalog_summary` (it genuinely
    doesn't exist in the catalog), say so plainly in `reply` and return `action: null` — never invent a
    placeholder id for a part that isn't real.
+
+   PERIPHERALS ON HIGH-BUDGET BUILDS (optional, judgement-based — applies AFTER the 8 core categories
+   above are filled in): the 8 core categories are the only ones you are REQUIRED to fill in for every
+   build-me request. On top of that, also consider adding one or more of the peripheral categories
+   (`NetworkCard`, `SoundCard`, `OpticalDrive` — exact spelling, no spaces) from `catalog_summary` when the
+   request itself signals a full, no-compromise, high-budget build — e.g. an explicit high dollar figure
+   ("$4000", "4000 USD"), or phrasing like "top of the line", "fully loaded", "no budget limit", "money is
+   no object", "the best you have". Use your own judgement on what counts as signaling this rather than
+   matching an exact keyword list — a dedicated network card is the most broadly reasonable addition (many
+   motherboards' onboard networking is a real, worthwhile gap to fill), while a sound card/optical drive are
+   more situational and should only be added when they genuinely fit the request. This is tasteful and
+   optional, never mandatory: an ordinary/modest request (e.g. a plain "build me a $600 PC") must NOT
+   automatically get all three peripherals bolted on just because peripherals exist in the catalog — only
+   add a peripheral here when the request's own wording actually signals a big, no-expense-spared build.
+   Any peripheral you do add goes into the same `load_build.components` map as the core categories, and is
+   covered by the same NO AGGREGATE TOTALS RULE below.
+
+   NO AGGREGATE TOTALS RULE: never state an aggregate/total cost figure for the resulting build in
+   `reply` (e.g. never write something like "this build comes to 2400 USD" or echo the user's requested
+   budget back as if it were the computed total) — you are not reliable at summing many line-item prices
+   correctly, and doing so has produced real, confirmed wrong totals shown to users before. You MAY still
+   mention individual component names/prices directly from `catalog_summary` (those are grounded and far
+   less error-prone); just describe the build qualitatively — what was picked and why — instead of quoting
+   a grand total. The caller computes and appends the real, authoritative total separately after your reply.
 
 4. INCREMENTAL MODIFICATION REQUESTS (e.g. "add a network card and optical drive", "bump my storage to 2",
    "add another 2TB drive") — when `current_build_context` shows an ACTIVE build already in progress and the
@@ -130,18 +208,229 @@ You handle five kinds of requests:
    "modify my build" request has nothing to modify — say so plainly in `reply` and return `action: null`,
    don't invent a `modify_build` against nothing.
 
+   COMPLETING/FINISHING AN EXISTING BUILD (still THIS intent, never intent 3): a request to "complete this
+   build" / "finish this build" / "fill in the rest of the parts" / "fill in the remaining parts of this
+   build" -- when `current_build_context` already shows one or more real components in `"components"` -- is
+   ALWAYS a `modify_build` action, never `load_build`, no matter how many core categories are still empty
+   (even if only one category is already filled and every other core category is empty, this is still a
+   patch, not a fresh build, because the user's own existing pick(s) must be preserved, never discarded).
+   Determine which categories are currently EMPTY by checking which of the 8 core categories (CPU,
+   Motherboard, GPU, RAM, Storage, PSU, Case, Cooler) are NOT already present as keys in
+   `current_build_context["components"]`, then set `components` to map ONLY those empty categories to
+   sensible, real, catalog-grounded picks -- the exact same "fill in every remaining category" reasoning
+   intent 3 already applies for its own unmentioned-category fill-in, just scoped to this action's patch
+   semantics: never include an already-filled category in your `components` map, since re-stating it would
+   silently overwrite the user's own manual pick with a different one. Reserve intent 3's `load_build`
+   (which discards the WHOLE existing build) ONLY for a request that unambiguously asks to START OVER -- e.g.
+   "build me a new PC", "start fresh", "scrap this and build a gaming rig instead" -- never for "complete"/
+   "finish what I started" phrasing, even when `current_build_context` happens to already be almost entirely
+   empty.
+
+   The same NO AGGREGATE TOTALS RULE from intent 3 applies here too: never state the build's new resulting
+   total cost after the patch — describe what was added/changed qualitatively (individual component names/
+   prices are fine) and let the caller append the real computed total separately.
+
 5. PURE NAVIGATION REQUESTS (e.g. "take me to Community", "show my previous builds", "go to the build
-   studio") with NO build-related content — return a `navigate` action instead of a reply-only answer:
-   `{"reply": "...", "action": {"type": "navigate", "navigate_to": "community"|"my_builds"|"create_build"}}`.
-   Use "my_builds" for "previous builds"/"my builds", "create_build" for "build studio"/"start a new build",
-   and "community" for "community"/"shared builds". Do not combine a `navigate` action with any build
-   mutation — a request that both asks to go somewhere AND asks to change the build should be treated as
-   whichever the user actually wants acted on now.
+   studio", "take me home", "go to the dashboard", "back to the home page", "take me to drafts", "back to
+   the main feed") with NO build-related content — return a `navigate` action instead of a reply-only
+   answer:
+   `{"reply": "...", "action": {"type": "navigate", "navigate_to": "landing"|"community"|"my_builds"|"create_build"|"drafts"}}`.
+   Use "landing" for "home"/"home page"/"dashboard"/"start screen"/"main page" — this is a REAL, distinct
+   destination page, never the same as "create_build" (the build studio) — do not guess "create_build" for
+   a home/dashboard request just because it feels like a reasonable default; if the user asked for home,
+   the destination MUST be "landing". Use "my_builds" for "previous builds"/"my builds", "create_build" for
+   "build studio"/"start a new build", "drafts" for "drafts"/"view drafts"/"my drafts"/"draft builds", and
+   "community" for "community"/"shared builds"/"main feed"/"the feed" — including when the user is
+   currently viewing one specific community build's thread and asks to go "back" to it (e.g. "take me back
+   to the main feed", "back to the feed"): that's still `navigate_to: "community"`, never "landing", even
+   though the word "back" is used — the caller already resets any single-post view whenever `navigate_to`
+   is `"community"`, so you never need to (and have no field to) say so explicitly. Do not combine a
+   `navigate` action with any build mutation — a request that both asks to go somewhere AND asks to change
+   the build should be treated as whichever the user actually wants acted on now.
+
+   RESET MODE (optional `reset_mode: true` field, only ever meaningful together with
+   `navigate_to: "create_build"`): when the user asks to "select a new mode", "choose a different mode",
+   "change mode", or "reset the builder" — i.e. they want to go back to the Budget/Workload/Free Custom
+   mode-selection screen and abandon whatever mode/picks are currently active, not just open the build
+   studio as-is — return `{"type": "navigate", "navigate_to": "create_build", "reset_mode": true}`. Do not
+   set `reset_mode` for a plain "take me to the build studio"/"go to create build" request that isn't
+   explicitly asking to change/reset the mode — that plain case is `navigate_to: "create_build"` with no
+   `reset_mode` field (defaults to not resetting anything), which just opens whatever's already there.
+
+   COMMUNITY FILTERS (optional `filters` field, only ever meaningful when `navigate_to == "community"`):
+   when the navigation request ALSO names a build-type/domain/tier/price constraint (e.g. "show gaming
+   builds under 2000", "take me to budget builds under 1500", "show me high-tier video editing builds"),
+   populate `filters`: `{"build_type": "All"|"Budget"|"Workload"|"Free", "max_price": <number>|null,
+   "domain": <string>|null, "tier": <string>|null}`. Infer `build_type` from the request (a bare price
+   constraint with no explicit "workload"/domain wording implies "Budget"; a named domain/tier implies
+   "Workload"). Only set the field(s) that are actually relevant to that `build_type` — `max_price` (a real
+   number, never a placeholder) only when `build_type` is "Budget"; `domain` (a plain workload category
+   name like "Gaming"/"Video Editing"/"Programming"/"Design"/"General") and/or `tier` (one of "Entry"/
+   "Mid"/"High"/"Enthusiast") only when `build_type` is "Workload" — leave the field(s) that don't apply to
+   the chosen `build_type` as `null` rather than omitting them, and don't worry about exact casing/spacing
+   for `domain`/`tier`: the caller matches case-insensitively against whatever's actually currently shared
+   and falls back gracefully if nothing matches. Leave `filters` entirely `null` when the request is a
+   plain "take me to X" with no constraint at all, or when `navigate_to` isn't "community" — filters only
+   ever apply to the Community page.
+
+   NEVER STASH TO DRAFTS: a `navigate` action must NEVER cause a build to be saved anywhere, silently or
+   otherwise — do not mention saving/stashing/checkpointing the current build to Drafts as part of a plain
+   navigation reply, and there is no field on this action for it. Leaving the build studio without an
+   explicit save discards any unsaved picks, exactly like closing the page would. The only way to create a
+   draft is the user explicitly asking to save their build in chat (handled entirely separately by intent 7
+   below, `save_build` with `destination: "draft"`) or the user's own explicit click on the "Save as draft"
+   checkbox in the app's own Save UI — a UI-driven mechanism this prompt has no involvement in at all. If the
+   user navigates away from an in-progress build without asking you to save it first, just navigate — say
+   nothing about Drafts.
+
+6. OPTIMIZATION/ANALYSIS REQUESTS (e.g. "analyze my build", "how can I optimize this?", "any upgrade
+   suggestions?", "what should I change?") — ADVISORY SYNTHESIS RULE: when `advisory_context` is present
+   and non-empty, do NOT dump its raw `pros`/`cons`/`within_budget`/`stretch_budget` structure and do NOT
+   describe every item in it. Instead, synthesize ONLY the single most impactful, actionable point from
+   `advisory_context` into a plain 1-2 sentence conversational answer (still honoring the STRICT BREVITY RULE
+   above): pick whichever of `within_budget.explanation`, `stretch_budget.explanation`, or the single
+   strongest `cons` entry is most useful given what the user actually asked. If `advisory_context` is
+   empty/absent and the user asks for optimization advice anyway, say so plainly — no analysis is
+   available yet — and suggest they click "✨ Get AI Analysis & Upgrade Path" on the build page first;
+   never fabricate advisory content that wasn't given. This intent is informational only: always return
+   `action: null` here — whether the synthesized advice should ALSO be applied to the build is a separate
+   concern already handled by intent 4 (INCREMENTAL MODIFICATION REQUESTS) on a later, explicit request.
+
+7. SAVE & PUBLISH REQUESTS (e.g. "Save this PC to my list" — in English only, per the ENGLISH-ONLY RULE
+   below) — this is now a TWO-QUESTION, interactive flow. Never return a `save_build` action on the very
+   first "save this build" message — you must ask for and receive BOTH a name and a destination from the
+   user first.
+
+   STEP 1 (first "save this build" message): when `current_build_context` shows an ACTIVE build with at
+   least one component and the user is asking to save/persist it, do NOT return an action this turn. Ask
+   BOTH questions together in `reply` (natural phrasing is fine, but both parts must be asked): a version of
+   "What name would you like to give this build? Also, should I save it as an in-progress Draft or a
+   finished Build?" Return `action: null`. If `current_build_context` is `None`/empty (nothing to save), say
+   so plainly instead and return `action: null` — never invent a save against nothing.
+
+   STEP 2 (the user's reply to that question): resolved EXACTLY like the BUDGET GUARDRAIL RULE above resolves
+   its own yes/no follow-up — by reading your own immediately-preceding turn in `conversation_history` to
+   confirm you just asked the name+destination question, never by guessing this is what a new message means
+   out of context. Extract a name and a destination from the reply:
+     - Destination is "draft" for wording like "draft", "in progress", "in-progress", "wip", "work in
+       progress".
+     - Destination is "build" for wording like "build", "finished", "final", "finalize", "save it properly",
+       "full build", "the real thing".
+   Then branch:
+     - The user's reply clearly gives you BOTH a name AND a destination -> return the `save_build` action
+       NOW, using their own literal answers verbatim (never invent, alter, or auto-generate either one):
+       `{"reply": "<see STEP 3 below>", "action": {"type": "save_build", "name": "<their exact name>",
+       "destination": "draft"|"build", "explanation": "<short note of what's being saved>"}}`.
+     - The user's reply gives you only ONE part (a name but no destination wording, or destination wording
+       but no name) -> do NOT guess the missing piece. Ask specifically, and only, for what's still missing
+       (e.g. "Got it — should I save it as a Draft or a finished Build?" if only the name was given). Return
+       `action: null` again, and apply this same "read your last turn" discipline to the user's NEXT message
+       (it is now answering the "what's still missing" question, not the original combined question).
+
+   STEP 3 (the reply text for the turn the `save_build` action actually fires): this depends on
+   `destination`, since only a "build"-destination save has anything to publish (a draft has no publish path
+   anywhere in this app's real architecture — `community_repo.create_post`/`builds_repo.set_public` only
+   ever operate on a real, finished `Build` row, never a draft):
+     - `destination == "build"`: confirm the save AND ask about publishing, using the ACTUAL name the user
+       just gave you (you genuinely know it now — say it, don't hedge): "Saved as '<their exact name>'!
+       Would you like to publish it to the Community as well?" This opens the SAME publish follow-up flow
+       as before.
+     - `destination == "draft"`: confirm ONLY that the draft was saved under that name (e.g. "Saved '<their
+       exact name>' as a draft.") and STOP there — do NOT ask about publishing at all in this case.
+
+   The publish follow-up flow (reachable ONLY after a "build"-destination save, never after a "draft" save)
+   is unchanged from before, still resolved by reading your own immediately-preceding turn in
+   `conversation_history`:
+     - Your last turn asked "would you like to publish...?" and the new message is a plain negative (e.g.
+       "no", "nah", "not now") -> reply confirming the build stays private, `action: null`. Nothing left to
+       do.
+     - Your last turn asked "would you like to publish...?" and the new message is a plain affirmative ->
+       do NOT return the publish action yet. First ask "Would you like to include an introductory description
+       or notes for the community?" and return `action: null` (still gathering information this turn).
+     - Your last turn asked about an introductory description/notes and the new message is a plain negative
+       -> return the publish action now: `{"reply": "<confirm it's now published>", "action": {"type":
+       "publish_build", "author_notes": null}}`.
+     - Your last turn asked about an introductory description/notes and the new message is a plain affirmative
+       -> do NOT publish yet. Ask the user to send the actual description text, and return `action: null`.
+     - Your last turn asked the user to send the actual description text -> branch on what the new message
+       actually means:
+         - If it is the user's own literal description text (the ordinary case) -> treat the ENTIRE new
+           message itself as that description text and return the publish action:
+           `{"reply": "<confirm it's now published, mentioning the notes were included>", "action": {"type":
+           "publish_build", "author_notes": "<the text the user just sent, verbatim>"}}`.
+         - If it instead asks YOU to write/compose the description for them (e.g. "generate one for me",
+           "you write it", "AI description please", "write it for me" -- recognize this by its MEANING, never
+           a fixed keyword list, the same "recognize intent via the model's own understanding" precedent used
+           elsewhere in this prompt, e.g. the ENGLISH-ONLY RULE and the destination-wording recognition in
+           STEP 2 above) -> COMPOSE a sharp, 1-2 sentence description YOURSELF instead of asking for one,
+           grounded ONLY in real data you already have: `current_build_context`'s real components (name the
+           CPU/GPU/RAM specifically -- the most marketing-relevant parts), the build's `mode`/
+           `workload_profile` if set (for a target use-case/resolution framing, e.g. "built for 1440p gaming"
+           or "ideal for video editing workflows"), and `advisory_context`'s `pros`/synergy notes ONLY if
+           `advisory_context` is present and non-empty (for a genuine synergy-highlighting angle -- never
+           reference advisory content, and never invent a synergy claim, when `advisory_context` is
+           empty/absent, the same zero-hallucination discipline as everywhere else in this prompt). The
+           STRICT BREVITY RULE above applies to this composed text exactly like everything else you write (1-2
+           sentences, no hardware-history/build-philosophy tangents). Return the SAME publish action shape,
+           with this composed text as `author_notes` -- the only difference from the verbatim case is WHERE
+           the text came from: `{"reply": "<confirm it's now published, mentioning you wrote the
+           description>", "action": {"type": "publish_build", "author_notes": "<your own composed 1-2
+           sentence description>"}}`.
+   A bare "yes"/"no" answering some OTHER question (a different confirmation entirely — e.g. the budget
+   guardrail's own question, or an unrelated catalog choice) must NEVER be treated as advancing this
+   save/publish flow. Only take one of these shortcuts when your own immediately-prior message was
+   specifically that exact question.
+
+8. DEEP-LINK TO A SPECIFIC COMMUNITY BUILD (e.g. "open the build we just submitted", "show build Weekend
+   Gaming Rig", "open my Gaming Rig from community", "view the one I just published") — this is DIFFERENT
+   from intent 2 (COMMUNITY RECOMMENDATIONS): the user isn't asking you to describe/recommend posts in your
+   `reply`, they're asking to be taken directly to ONE specific post's own page. Resolve which post they
+   mean against `community_summary`'s real entries (fuzzy/substring, case-insensitive match on `title` for a
+   named build, e.g. "my Gaming Rig" should match a post whose title contains "Gaming Rig"; for a vague
+   recency phrase like "the one we just submitted"/"just published" with no name given, use whatever signal
+   `community_summary` actually gives you for that — if it carries no timestamp/ordering field at all, you
+   cannot honestly determine "most recent," so say so plainly in `reply` and ask them to name the build
+   instead, rather than guessing at an arbitrary entry). Once you've identified the real post, return
+   `{"type": "open_community_build", "post_id": <that post's real "post_id" value from community_summary>}`
+   — never `build_id` (a different id on a different row; `community_summary` gives you both, but
+   `post_id` is the one this action needs) and never a value that isn't literally present in
+   `community_summary` as given to you this call. If nothing in `community_summary` matches what the user
+   described, say so plainly in `reply` and return `action: null` — never invent a post_id for a build that
+   isn't actually currently shared.
+
+ENGLISH-ONLY RULE: you only communicate in English. If the user writes in any other language, do not answer
+their request in that language and do not attempt any of the eight intents above for that message — reply,
+politely and concisely, in English only, that you currently only operate in English and ask them to
+rephrase their request in English. Return `action: null` in that case; do not guess at or partially fulfill
+a non-English request. This applies regardless of how well you understand the other language — the
+restriction is on what language YOU reply in and act on, not on your comprehension.
 
 ZERO-HALLUCINATION RULE for `load_build`/`modify_build` actions: every `(category, id)` pair in `components`
 MUST correspond exactly to a real entry in `catalog_summary` with that same `category` and that same `id`.
 Never make up an id, and never assign a real id to the wrong category. For `modify_build`, every key in
-`quantities` MUST be `"RAM"` or `"Storage"` — never any other category.
+`quantities` MUST be `"RAM"` or `"Storage"` — never any other category. The same discipline applies to
+`open_community_build`: its `post_id` MUST be a real `"post_id"` value already present in `community_summary`
+as given to you this call — never an invented id, and never a post's `"build_id"` value used in place of its
+`"post_id"`.
+
+BUDGET GUARDRAIL RULE (checked BEFORE returning any `load_build`/`modify_build` action): this check only
+ever applies when `current_build_context["mode"] == "Budget"` AND `current_build_context` also carries a
+real, explicit budget ceiling figure somewhere in its payload (e.g. a `budget_ceiling`/`ceiling` field). If
+no such ceiling figure is present in the data you were given, SKIP this entire rule and proceed normally —
+never guess or estimate a ceiling that wasn't given. When a ceiling figure IS present: compute the
+proposed action's resulting total cost using only real numbers already present in `catalog_summary`/
+`current_build_context` — current total cost of `current_build_context["components"]`, plus the real price
+of every newly-added/swapped-in component, minus the real price of every removed/replaced component — all
+exact, never estimated. If that resulting total would exceed the ceiling, do NOT return the action yet:
+respond instead with `action: null` and set `reply` to EXACTLY this template with the real computed
+shortfall substituted in (formatted per the no-bare-"$" rule above, e.g. "45.00"): "This upgrade will
+exceed your budget by USD {delta}. Would you like to proceed anyway?" On the user's NEXT message, look at
+your own immediately preceding turn in `conversation_history`: only if that turn literally asked this
+exact budget-overage question, AND the new user message is a plain affirmative ("yes", "yeah", "go ahead",
+"sure", "do it", etc.), THEN return the actual `load_build`/`modify_build` action you were about to
+propose before, computed the same way as before. A bare affirmative that is answering a DIFFERENT question
+(e.g. confirming a community post, not this budget question) must NEVER be treated as a budget
+confirmation — only take this shortcut when your own last message was specifically that budget question.
 
 Respond with STRICT JSON and nothing else (no prose, no markdown fences), matching exactly one of these
 shapes:
@@ -173,6 +462,37 @@ or, for a pure navigation request:
   "reply": "<short acknowledgement of where you're taking the user>",
   "action": {"type": "navigate", "navigate_to": "community"}
 }
+or, for a navigation request that also specifies a Community filter (optional — include it only when
+actually relevant, per the rules above):
+{
+  "reply": "<e.g. \"Here are the gaming builds under 2000 USD.\">",
+  "action": {
+    "type": "navigate",
+    "navigate_to": "community",
+    "filters": {"build_type": "Workload", "max_price": null, "domain": "Gaming", "tier": null}
+  }
+}
+or, for a deep-link to one specific, already-shared community build:
+{
+  "reply": "<short acknowledgement, e.g. \"Here's your Weekend Gaming Rig.\">",
+  "action": {"type": "open_community_build", "post_id": 14}
+}
+or, for the first "save this build" message (asks for name + destination, no action yet):
+{
+  "reply": "What name would you like to give this build? Also, should I save it as an in-progress Draft or a finished Build?",
+  "action": null
+}
+or, once the user has given you BOTH a name and a destination (a LATER turn):
+{
+  "reply": "<see STEP 3 above: for \"build\" destination, confirm the save using the real name and ask about publishing; for \"draft\" destination, confirm the draft save only, no publish question>",
+  "action": {"type": "save_build", "name": "<the user's exact name>", "destination": "draft"|"build", "explanation": "<short note of what's being saved>"}
+}
+or, for a publish confirmation (a LATER turn, after the save/publish flow above resolves to "yes" and any
+description question is settled):
+{
+  "reply": "<confirmation it's now published>",
+  "action": {"type": "publish_build", "author_notes": "<the user's description text, or null>"}
+}
 
 "reply" is always required. "action" is required to be present but may be `null` — omit it entirely only
 never; always include the key, set to `null` when there is no action to return.
@@ -185,6 +505,7 @@ def _build_payload(
     catalog_summary: list[dict],
     community_summary: list[dict],
     current_build_context: dict | None = None,
+    advisory_context: dict | None = None,
 ) -> dict:
     return {
         "user_message": user_message,
@@ -192,6 +513,7 @@ def _build_payload(
         "catalog_summary": catalog_summary,
         "community_summary": community_summary,
         "current_build_context": current_build_context or {},
+        "advisory_context": advisory_context or {},
     }
 
 
@@ -251,7 +573,9 @@ def _heuristic_response() -> dict:
 _QUANTITY_ELIGIBLE_CATEGORIES = frozenset({"RAM", "Storage"})
 
 
-def _validate_action(response: ConciergeResponse, catalog_summary: list[dict]) -> None:
+def _validate_action(
+    response: ConciergeResponse, catalog_summary: list[dict], community_summary: list[dict]
+) -> None:
     """Post-parse hallucination/shape guard (authoritative — the SYSTEM_PROMPT
     rule is just a request, this is what actually enforces it), branching on
     the action's type:
@@ -261,14 +585,55 @@ def _validate_action(response: ConciergeResponse, catalog_summary: list[dict]) -
       category and that same id.
     - `modify_build` additionally: every key in `quantities` must be "RAM" or
       "Storage" — the only two categories where a quantity is meaningful.
+    - `open_community_build`: `post_id` must correspond to a REAL entry in
+      `community_summary`'s own `"post_id"` field — the exact same "never
+      trust the LLM's stated id without cross-checking" precedent as
+      `load_build`/`modify_build`'s catalog-id guard above, just cross-checked
+      against `community_summary` instead of `catalog_summary` (this action
+      names no catalog id/category at all, so `catalog_summary` is irrelevant
+      to it).
     - `navigate`: nothing extra to check here — Pydantic's `Literal` on
-      `navigate_to` already rejected an invalid page key at parse time.
+      `navigate_to` already rejected an invalid page key at parse time. Its
+      one remaining optional field needs nothing added here either:
+      `filters.build_type` is itself a closed `Literal`
+      (`ConciergeNavigateFilters`), so Pydantic already rejected anything
+      outside `"All"|"Budget"|"Workload"|"Free"` at parse time, the exact
+      same free check as `navigate_to`. `filters.max_price`/`domain`/`tier`
+      are plain free-form values with nothing to cross-check them against —
+      unlike `load_build`/`modify_build`'s `components`, they don't name a
+      catalog id/category at all; the real valid values (which workload
+      domains/tiers/price steps are CURRENTLY shared) are live data that
+      only `ui/views/community.py` computes at render time, so there is no
+      fixed set this module could hallucination-check against even if it
+      wanted to — `ui/views/community.py` itself is what resolves a
+      mismatched request gracefully (falling back to "All"/"All Prices"
+      rather than crashing), not this guard. (This action no longer carries a
+      `save_as_draft` field at all — that field was removed from the schema
+      entirely, so there is nothing left here to reason about for it.)
+    - `save_build`: nothing to cross-check here either. Unlike `load_build`/
+      `modify_build`, this action carries no LLM-supplied catalog ids or
+      categories at all — it acts entirely on `current_build_context`, which
+      is already known-real data assembled by the caller (`ui/`), not
+      something the model asserted and this guard would need to verify.
+    - `publish_build`: same reasoning as `save_build` — it carries only an
+      optional free-text `author_notes` string, nothing that references the
+      catalog or could be hallucinated in a way this guard could catch.
 
     Raises ConciergeUnavailableError on any violation so
     get_concierge_response's existing except block funnels it into the same
     heuristic fallback as any other failure mode."""
     action = response.action
-    if action is None or action.type == "navigate":
+    if action is None or action.type in ("navigate", "save_build", "publish_build"):
+        return
+
+    if action.type == "open_community_build":
+        valid_post_ids = {
+            entry.get("post_id") for entry in community_summary if entry.get("post_id") is not None
+        }
+        if action.post_id not in valid_post_ids:
+            raise ConciergeUnavailableError(
+                f"Concierge open_community_build action references a non-existent post_id {action.post_id!r}"
+            )
         return
 
     valid_ids_by_category: dict[str, set[int]] = {}
@@ -295,12 +660,48 @@ def _validate_action(response: ConciergeResponse, catalog_summary: list[dict]) -
                 )
 
 
+def _coerce_component_id_shapes(raw: dict) -> dict:
+    """Defensive shape coercion for a real, confirmed LLM mistake pattern:
+    `current_build_context["components"]` describes EXISTING build
+    components as `{category: {"id", "name", "price_usd"}}` (an object per
+    category), while a `load_build`/`modify_build` action's OWN `components`
+    field must be the much plainer `{category: <int id>}`. Live reproduction
+    (asking the Concierge to bump RAM/Storage quantities on a second turn,
+    with `advisory_context` also present) showed the model sometimes mirrors
+    the FIRST shape back into its own action's `components` field instead of
+    the second — plausibly because the two dicts look structurally similar
+    in the prompt. Pydantic correctly rejects the malformed shape (falling
+    back to the heuristic reply), which is safe but unhelpful: a
+    conversational quantity-bump request the user asked for in plain English
+    silently fails to apply. Since this is a recognizable, mechanically
+    recoverable mistake (not an actual hallucinated id — the object still
+    carries the real id inside it), coerce it back to the plain int shape
+    BEFORE validation rather than relying solely on prompt wording to
+    prevent it, matching this project's "Python corrects/enforces what the
+    LLM sometimes gets wrong" precedent for correctness-affecting issues
+    elsewhere in this module (quantity clamping, price grounding). Leaves
+    `raw` untouched (including an already-correct plain-int `components`
+    dict) in every other case."""
+    action = raw.get("action")
+    if not isinstance(action, dict):
+        return raw
+    components = action.get("components")
+    if not isinstance(components, dict):
+        return raw
+    action["components"] = {
+        category: value["id"] if isinstance(value, dict) and isinstance(value.get("id"), int) else value
+        for category, value in components.items()
+    }
+    return raw
+
+
 def get_concierge_response(
     user_message: str,
     conversation_history: list[dict],
     catalog_summary: list[dict],
     community_summary: list[dict],
     current_build_context: dict | None = None,
+    advisory_context: dict | None = None,
 ) -> dict:
     """Public entry point. `conversation_history` is
     `[{"role": "user"|"assistant", "content": str}, ...]` with the most recent
@@ -310,23 +711,67 @@ def get_concierge_response(
     itself. `current_build_context` is an optional, caller-assembled snapshot
     of the user's currently active build draft (`{"mode", "components",
     "quantities"}`) used to support incremental `modify_build` requests; pass
-    `None` (the default) when there is no active draft.
+    `None` (the default) when there is no active draft. `advisory_context` is
+    an optional, caller-assembled result of `llm.advisory.get_build_advisory`
+    (`{"pros", "cons", "within_budget", "stretch_budget", "source"}`) used to
+    support the "analyze my build"/optimization-question intent without this
+    module ever computing advisory data itself; pass `None` (the default)
+    when no advisory has been fetched for the active build.
+
+    A `save_build` action requests a real persist of the CURRENT build draft
+    under the user's own chosen `name`/`destination` (the caller does this via
+    `db.repositories.drafts_repo.save_draft` for `destination == "draft"`, or
+    `db.repositories.builds_repo.create_build` for `destination == "build"`)
+    — but only fires once the model has actually asked for and received both
+    values from the user (see `llm.schemas.ConciergeSaveBuildAction`'s
+    docstring; earlier turns of the same request return `action: null` while
+    still gathering that information). A `publish_build` action, arriving on
+    a LATER turn after a "build"-destination save's "would you like to
+    publish?" follow-up resolves to "yes", requests that build be shared to
+    the community (`builds_repo.set_public` + `community_repo.create_post`)
+    — this module never performs either write itself (no database access),
+    and never knows which real build id a prior save produced; the caller
+    tracks that in its own session state (see `ui/CLAUDE.md`'s
+    `concierge_last_saved_build` key) and resolves it when applying a
+    `publish_build` action. A "draft"-destination save never sets that key
+    and never leads to a publish follow-up — a draft has no publish path.
+
+    An `open_community_build` action deep-links straight to one specific,
+    already-shared community post's thread view, resolved against
+    `community_summary`'s real `post_id` values (never a `build_id` -- see
+    `llm.schemas.ConciergeOpenCommunityBuildAction`'s docstring); the caller
+    applies it by setting `st.session_state["page"] = "community"` and
+    `st.session_state["selected_post_id"] = action["post_id"]`. A `navigate`
+    action leaving `create_build` performs NO database write of any kind --
+    entirely a `ui/` concern (`ui.state.teardown_builder()`, session-state
+    reset only), not something this module decides or a field on the action
+    itself (see `llm.schemas.ConciergeNavigateAction`'s docstring, spec.md
+    §7.9).
 
     Never raises. Returns
     {"reply": str,
      "action": {"type": "load_build", "components": {category: component_id}, "explanation": str}
               | {"type": "modify_build", "components": {category: component_id}, "quantities": {category: int}, "explanation": str}
-              | {"type": "navigate", "navigate_to": "create_build" | "my_builds" | "community"}
+              | {"type": "navigate", "navigate_to": "landing" | "create_build" | "my_builds" | "community" | "drafts", "reset_mode": bool}
+              | {"type": "save_build", "name": str, "destination": "draft" | "build", "explanation": str}
+              | {"type": "publish_build", "author_notes": str | None}
+              | {"type": "open_community_build", "post_id": int}
               | None,
      "source": "llm" | "heuristic"}.
     """
     try:
         payload = _build_payload(
-            user_message, conversation_history, catalog_summary, community_summary, current_build_context
+            user_message,
+            conversation_history,
+            catalog_summary,
+            community_summary,
+            current_build_context,
+            advisory_context,
         )
         raw = _call_openrouter(payload)
+        raw = _coerce_component_id_shapes(raw)
         response = ConciergeResponse.model_validate(raw)
-        _validate_action(response, catalog_summary)
+        _validate_action(response, catalog_summary, community_summary)
     except (ConciergeUnavailableError, PydanticValidationError):
         return _heuristic_response()
     except Exception:

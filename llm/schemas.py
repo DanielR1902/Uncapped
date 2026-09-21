@@ -138,17 +138,96 @@ class ConciergeLoadBuildAction(BaseModel):
 
     type: Literal["load_build"] = "load_build"
     components: dict[str, int]
-    explanation: str
+    # Optional, no functional consumer anywhere in ui/ — this is a purely
+    # internal/audit note, never the user-facing text (that's `reply`, on
+    # ConciergeResponse). Made optional after a real, confirmed regression:
+    # the STRICT BREVITY RULE (SYSTEM_PROMPT) sometimes led the model to omit
+    # this field entirely, which — back when it was required with no default
+    # — failed Pydantic validation and fell back to the unhelpful heuristic
+    # reply for what was otherwise a perfectly valid, well-formed action.
+    explanation: str = ""
+
+
+class ConciergeNavigateFilters(BaseModel):
+    """Optional filter payload on a `navigate` action targeting `"community"`,
+    mirroring `ui/views/community.py`'s REAL filter toolbar shape — a
+    mutually-exclusive/cascading selection (one mode selectbox, then a
+    mode-specific sub-filter), never a flat bag of 3 independently-meaningful
+    fields. `build_type` picks which sub-filter (if any) is active;
+    `max_price` is only meaningful when `build_type == "Budget"`, and
+    `domain`/`tier` only when `build_type == "Workload"` — the caller
+    (`ui/views/community.py`) simply ignores whichever field(s) don't apply
+    to the chosen `build_type` rather than requiring this model to omit them.
+
+    Deliberately a typed nested model (this project's existing convention for
+    fixed-shape structured LLM output, e.g. `advisory.py`'s
+    `WithinBudgetAdvice`/`StretchBudgetAdvice`) rather than a plain `dict`,
+    so `build_type` gets Pydantic's own `Literal` enforcement for free — the
+    exact same "no extra runtime check needed for this one field" precedent
+    as `ConciergeNavigateAction.navigate_to` below. `domain`/`tier` stay plain
+    `str | None` rather than a `Literal`/enum, though: unlike `build_type`
+    (a fixed, closed set of 4 page-filter modes) or `load_build`/
+    `modify_build`'s catalog ids, there is no fixed catalog of domains/tiers
+    for a `Literal` to close over or for `llm/concierge.py::_validate_action`
+    to hallucination-check against — the real, valid option strings are
+    "whichever workload profiles/tiers happen to be currently shared right
+    now," live data only `ui/views/community.py` computes at render time
+    (its own `price_steps`/`domains`/`tiers` lists). `max_price` is a plain
+    float for the same reason: the real selectable price-step STRINGS
+    (`"$1,000"`, `"$1,500"`, ...) depend on the current most expensive shared
+    Budget build, so this model only carries the requested numeric ceiling —
+    `ui/views/community.py` resolves it to a real, currently-valid step
+    string (or falls back gracefully to "All Prices"/"All" on no match),
+    never trusting an LLM-authored string to already be one of its own
+    selectbox's real options."""
+
+    build_type: Literal["All", "Budget", "Workload", "Free"] = "All"
+    max_price: float | None = None
+    domain: str | None = None
+    tier: str | None = None
 
 
 class ConciergeNavigateAction(BaseModel):
     """A pure page-navigation intent (e.g. "take me to Community") — no build
     mutation involved. `navigate_to` is constrained to this app's real page
     keys by the Literal type itself (Pydantic rejects anything else at parse
-    time, no extra runtime check needed for this one field)."""
+    time, no extra runtime check needed for this one field).
+
+    `filters` (optional, `None` when the request carries no build-type/
+    domain/tier/price constraint) is only ever meaningful when
+    `navigate_to == "community"` — see `ConciergeNavigateFilters`'s own
+    docstring for its cascading shape and why it's a typed nested model.
+    `ui/components/chat_assistant.py` stages a non-`None` `filters` payload
+    into a one-shot session-state key for `ui/views/community.py` to consume
+    on its next render, rather than writing directly to that view's own
+    widget keys (see that module's docstring).
+
+    NOTE on drafts: this action itself carries no draft-save field, and
+    leaving `create_build` via `navigate` performs NO database write of any
+    kind — `ui.state.teardown_builder()` (called from `ui/components/
+    chat_assistant.py`'s `navigate` handler) only resets session state. This
+    is the CURRENT of several designs this exact concern has gone through
+    (spec.md §7.9): an LLM-controlled `save_as_draft: bool` field, then an
+    explicit "Save Draft or Discard?" confirmation dialog, then a silent
+    unconditional auto-save-on-exit — ALL removed by a later, explicit
+    product decision. The "Save as draft" checkbox in `ui/views/
+    create_build.py`'s manual Save UI is now the single, explicit source of
+    truth for creating a draft; leaving the builder without using it simply
+    discards the in-progress build.
+
+    `reset_mode` (optional, default `False`) is only ever meaningful when
+    `navigate_to == "create_build"` — it mirrors the existing "⬅ Change mode"
+    button in `ui/views/create_build.py` (which also routes through
+    `ui.state.teardown_builder()`), exposing that SAME mechanism via chat for
+    a request like "let me select a new mode"/"choose a different mode"/
+    "reset the builder". Deliberately not a new action type: conceptually
+    this is still "navigate to create_build," just with an extra instruction
+    to clear the in-progress pick set first."""
 
     type: Literal["navigate"] = "navigate"
-    navigate_to: Literal["create_build", "my_builds", "community"]
+    navigate_to: Literal["landing", "create_build", "my_builds", "community", "drafts"]
+    filters: ConciergeNavigateFilters | None = None
+    reset_mode: bool = False
 
 
 class ConciergeModifyBuildAction(BaseModel):
@@ -171,7 +250,132 @@ class ConciergeModifyBuildAction(BaseModel):
     type: Literal["modify_build"] = "modify_build"
     components: dict[str, int] = {}
     quantities: dict[str, int] = {}
-    explanation: str
+    # Optional — see ConciergeLoadBuildAction's identical field for why: no
+    # functional consumer in ui/, and a real, confirmed regression where the
+    # STRICT BREVITY RULE led the model to sometimes omit it, failing
+    # validation for an otherwise well-formed quantity/component change.
+    explanation: str = ""
+
+
+class ConciergeSaveBuildAction(BaseModel):
+    """The user's explicit request to persist their CURRENTLY ACTIVE build
+    draft (`current_build_context`) to the database, e.g. "Save this PC to my
+    list". This is the chat equivalent of clicking "Save build" in
+    `ui/views/create_build.py`'s normal flow, and is acceptable as a direct
+    database write triggered from chat specifically because it's the user's
+    own explicit request acting on their own account's own data.
+
+    INTERACTIVE-FIRST DESIGN (reversed from an earlier "zero-click" draft of
+    this action): the model must NOT return this action on the very first
+    "save this build" message. It must first ASK the user for both `name`
+    and `destination` and wait for their answer across one or more turns
+    (see SYSTEM_PROMPT's SAVE & PUBLISH REQUESTS intent for the exact
+    two-question flow) — only once the user has actually supplied both
+    pieces of information does this action get returned, carrying the
+    user's own literal answers. No more auto-naming (the old
+    `"Concierge Build – {date} {time}"` default) and no more silently
+    always targeting the real `builds` table.
+
+    `name` and `destination` are both REQUIRED fields with no default. This
+    is a deliberate, load-bearing schema choice, not just a prompt
+    instruction: if the model tries to return this action before it has
+    genuinely gathered a name/destination from the user (e.g. it omits the
+    field, or the prompt-only instruction above is ignored), Pydantic
+    validation fails outright and `get_concierge_response` falls back to the
+    heuristic response — the exact same "Python enforces what a prompt
+    instruction alone can't guarantee" precedent as this module's other
+    zero-hallucination guards. An `Optional[str] = None` field would let a
+    non-compliant model return the action anyway with a missing/empty name
+    and only rely on prompt wording to prevent that; a required field makes
+    "the model must have asked and received an answer first" a structural
+    guarantee enforced at parse time, not a hope.
+
+    `destination` is constrained to the two real, currently-existing
+    persistence targets in this app's actual schema: `"draft"` (the real
+    `draft_builds` table, via `db.repositories.drafts_repo.save_draft`) or
+    `"build"` (the real `builds` table, via
+    `db.repositories.builds_repo.create_build`) — there is no `saved_builds`
+    table anywhere in this app. Carries no new catalog ids either — it acts
+    entirely on `current_build_context`'s already-known-real
+    components/quantities, so there is nothing new for `_validate_action` to
+    cross-check for this action type beyond what `modify_build` already
+    established (see `_validate_action`'s docstring)."""
+
+    type: Literal["save_build"] = "save_build"
+    name: str
+    destination: Literal["draft", "build"]
+    # Optional — see ConciergeLoadBuildAction's identical field for why.
+    # `name`/`destination` stay REQUIRED (the actual load-bearing fields for
+    # this action's whole interactive-first design) — only this vestigial,
+    # unconsumed note is relaxed.
+    explanation: str = ""
+
+
+class ConciergePublishBuildAction(BaseModel):
+    """The user's confirmation, on a LATER turn (after the Concierge asked
+    "would you like to publish it to the Community as well?" in response to a
+    prior `save_build`), that the just-saved build should be shared to the
+    community. Resolved via the same "read your own immediately-preceding
+    turn in `conversation_history`" discipline as the budget guardrail — see
+    SYSTEM_PROMPT's SAVE & PUBLISH REQUESTS intent.
+
+    Deliberately carries NO build id: the model cannot know which real
+    database row a prior `save_build` action produced (that id only exists
+    once `ui/` actually calls `builds_repo.create_build`, entirely outside
+    this module's visibility). The caller (`ui/`) resolves which build to
+    publish via its own `st.session_state["concierge_last_saved_build"]` key,
+    set when that earlier `save_build` action was applied — never re-derived
+    or guessed here.
+
+    `author_notes` is optional free text for the "would you like to add a
+    description?" follow-up branch — `None` when the user declined to add
+    one, or a real value on the specific later turn where the user typed the
+    actual description text."""
+
+    type: Literal["publish_build"] = "publish_build"
+    author_notes: str | None = None
+
+
+class ConciergeOpenCommunityBuildAction(BaseModel):
+    """A request to deep-link straight to ONE specific, already-shared
+    community build's thread view (e.g. "open the build we just submitted",
+    "show build Weekend Gaming Rig", "view my Gaming Rig from community") —
+    as opposed to intent 2's COMMUNITY RECOMMENDATIONS, which merely
+    describes/recommends posts in `reply` without navigating anywhere.
+
+    WHY `post_id`, NOT `build_id`: the real view-routing mechanism this
+    action drives is `ui/views/community.py::render()`'s existing
+    `st.session_state.get("selected_post_id")` check at the very top of that
+    function — when set, it resolves that id via `community_repo.get_post`
+    and renders `_thread_view(post)` directly instead of the feed list. That
+    lookup is keyed on a `CommunityPost.id` (a "post id"), never a
+    `Build.id` — a `CommunityPost` and the `Build` it wraps are two distinct
+    rows with two distinct id sequences (see `db/models.py::CommunityPost`,
+    which stores its own `id` plus a separate `build_id` foreign key).
+    Carrying `build_id` here instead would force the caller (`ui/`) to
+    re-look-up the matching post via `community_repo` before it could set
+    `selected_post_id` — genuinely redundant work, since `community_summary`
+    (already handed to this model on every call, see
+    `ui/components/chat_assistant.py::_community_summary`) already includes
+    BOTH `post_id` and `build_id` for every currently-shared post. `post_id`
+    is therefore the correct, zero-extra-lookup field: the model resolves
+    "the build we just submitted" / "show build {name}" directly against
+    `community_summary`'s real `post_id` values (by title match, or via
+    whatever recency signal `community_summary` actually carries — see
+    `SYSTEM_PROMPT`'s own intent for what it can and can't infer), and the
+    caller uses that id completely unchanged.
+
+    ZERO-HALLUCINATION: `post_id` must be a real value already present in
+    the `community_summary` this model was given for this call — enforced
+    both by the system prompt's instruction and, authoritatively, by
+    `llm/concierge.py::_validate_action`'s post-parse guard (never trust the
+    prompt alone, the same precedent as every other action type's id
+    cross-check in this module). If nothing in `community_summary` matches
+    what the user described, the model must say so plainly in `reply` and
+    return `action: null` instead of inventing a `post_id`."""
+
+    type: Literal["open_community_build"] = "open_community_build"
+    post_id: int
 
 
 class ConciergeResponse(BaseModel):
@@ -179,14 +383,36 @@ class ConciergeResponse(BaseModel):
     `reply` is always present (conversational answer to the user's message).
     `action` is populated for a "build me a PC" style request that resolved to
     real catalog ids (`load_build`), an incremental patch to the active build
-    draft (`modify_build`), or a pure page-navigation intent (`navigate`); it
-    is `None` for catalog-question and community-recommendation intents, and
-    also `None` (with `reply` saying so) when a named part could not be found
-    in `catalog_summary` at all, or when a modify request has no active build
-    to modify."""
+    draft (`modify_build`), a pure page-navigation intent (`navigate` —
+    optionally carrying a `filters` payload for a "community" destination,
+    see `ConciergeNavigateAction`), an explicit "save my build" request
+    (`save_build`, only returned once the model has actually gathered BOTH a
+    `name` and a `destination` from the user across one or more turns — see
+    `ConciergeSaveBuildAction`'s docstring), a later-turn confirmation to
+    publish a just-saved "build"-destination save (`publish_build`), or a
+    request to deep-link straight to one specific, already-shared community
+    build's thread view (`open_community_build`, resolved against
+    `community_summary`'s real `post_id` values — see
+    `ConciergeOpenCommunityBuildAction`'s docstring); it is `None` for
+    catalog-question, community-recommendation, and optimization/analysis
+    intents, and also `None` (with `reply` saying so) when a named part could
+    not be found in `catalog_summary` at all, when a modify/save request has
+    no active build to act on, when no post in `community_summary` matches a
+    requested deep-link target, or when a mid-flow reply is still gathering
+    information (e.g. asking for the still-missing name or destination,
+    asking whether to publish, or asking for a description) before there's
+    anything to act on yet."""
 
     reply: str
-    action: ConciergeLoadBuildAction | ConciergeModifyBuildAction | ConciergeNavigateAction | None = None
+    action: (
+        ConciergeLoadBuildAction
+        | ConciergeModifyBuildAction
+        | ConciergeNavigateAction
+        | ConciergeSaveBuildAction
+        | ConciergePublishBuildAction
+        | ConciergeOpenCommunityBuildAction
+        | None
+    ) = None
     source: Literal["llm", "heuristic"] = "llm"
 
 

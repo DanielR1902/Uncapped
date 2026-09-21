@@ -48,6 +48,22 @@ CURRENT_BUILD_CONTEXT = {
     "quantities": {},
 }
 
+ADVISORY_CONTEXT = {
+    "pros": ["Strong CPU/GPU balance for the stated workload."],
+    "cons": ["RAM capacity is a bit light for heavy multitasking."],
+    "within_budget": {
+        "explanation": "Downgrade the Case to fund a better Cooler.",
+        "swaps": [],
+        "can_optimize_further": False,
+    },
+    "stretch_budget": {
+        "explanation": "Add a second RAM kit for 64GB total (+89.00 USD) to remove the multitasking limit.",
+        "actions": [],
+        "added_cost_usd": 89.0,
+    },
+    "source": "llm",
+}
+
 COMMUNITY_SUMMARY = [
     {
         "post_id": 1,
@@ -394,6 +410,175 @@ def test_modify_build_action_with_new_categories_passes_through(monkeypatch):
     assert result["action"] == payload["action"]
 
 
+def test_modify_build_action_with_object_shaped_components_is_coerced_to_plain_ids(monkeypatch):
+    """Reproduces a real, confirmed bug: a live (non-mocked) LLM call, on a
+    second turn asking to bump RAM/Storage quantities (with advisory_context
+    also present), returned a `modify_build.components` value shaped like
+    `current_build_context["components"]`'s OWN `{"id", "name", "price_usd"}`
+    object shape instead of the plain `{category: int}` shape the schema
+    requires — Pydantic correctly rejected this, falling back to the
+    unhelpful heuristic reply for what was actually a simple, valid request.
+    `_coerce_component_id_shapes` fixes this by extracting the id from a
+    recognizable `{"id": <int>, ...}` value before validation, so the action
+    still applies instead of silently degrading."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Increased Storage to 2 units and upgraded RAM to 64GB.",
+        "action": {
+            "type": "modify_build",
+            "components": {
+                "Storage": {"id": 7, "name": "Samsung 980 Pro 1TB NVMe", "price_usd": 99.0},
+                "RAM": {"id": 6, "name": "Corsair Vengeance 32GB (2x16GB)", "price_usd": 89.0},
+            },
+            "quantities": {"Storage": 2, "RAM": 2},
+            "explanation": "Doubled storage and RAM.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Can you upgrade the storage a bit? maybe another slot? same with ram",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+        advisory_context=ADVISORY_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["type"] == "modify_build"
+    # Coerced down to plain ids — never the raw object the mocked LLM returned.
+    assert result["action"]["components"] == {"Storage": 7, "RAM": 6}
+    assert result["action"]["quantities"] == {"Storage": 2, "RAM": 2}
+
+
+def test_coerce_component_id_shapes_leaves_already_correct_ids_untouched():
+    """The coercion must be a no-op for the normal/correct case — a plain
+    int id must never be altered."""
+    raw = {"reply": "ok", "action": {"type": "modify_build", "components": {"RAM": 6}, "quantities": {}}}
+    coerced = concierge._coerce_component_id_shapes(raw)
+    assert coerced["action"]["components"] == {"RAM": 6}
+
+
+def test_coerce_component_id_shapes_handles_missing_or_non_dict_action():
+    """Must not raise for action: null or a non-dict components value (an
+    already-invalid shape Pydantic will reject on its own either way)."""
+    assert concierge._coerce_component_id_shapes({"reply": "hi", "action": None}) == {
+        "reply": "hi",
+        "action": None,
+    }
+    raw = {"reply": "hi", "action": {"type": "navigate", "navigate_to": "community"}}
+    assert concierge._coerce_component_id_shapes(raw) == raw
+
+
+def test_modify_build_action_with_missing_explanation_still_parses(monkeypatch):
+    """Reproduces a real, confirmed regression: the STRICT BREVITY RULE
+    sometimes led the model to omit the `explanation` field entirely on a
+    modify_build action (plausibly over-applying "be terse" to internal JSON
+    fields, not just the user-facing `reply`) — since `explanation` used to
+    be REQUIRED with no default, this failed Pydantic validation outright
+    and fell back to the heuristic for an otherwise perfectly valid quantity
+    change. `explanation` is now optional (defaults to "") on every
+    Concierge action type, since it has no functional consumer anywhere in
+    ui/ — only `reply` is ever shown to the user."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Increased Storage and RAM to 2 units each.",
+        "action": {
+            "type": "modify_build",
+            "components": {},
+            "quantities": {"Storage": 2, "RAM": 2},
+            # Deliberately no "explanation" key at all.
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "upgrade storage to 2 and ram to 2",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+        advisory_context=ADVISORY_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["type"] == "modify_build"
+    assert result["action"]["quantities"] == {"Storage": 2, "RAM": 2}
+    assert result["action"]["explanation"] == ""
+
+
+def test_complete_build_request_returns_modify_build_filling_only_empty_categories(monkeypatch):
+    """Reproduces a real, confirmed bug: a live (non-mocked) LLM call, given a
+    `current_build_context` with ONLY a manually-picked CPU and GPU (nothing
+    else), on a "Complete this build for me" request returned a `load_build`
+    action with a COMPLETELY DIFFERENT CPU and GPU than the ones already
+    picked -- `load_build` always starts a fresh build from scratch, so it
+    silently discarded the user's own manual picks instead of preserving them
+    and filling only the empty slots. The fix is prompt-only (SYSTEM_PROMPT's
+    intent 4 COMPLETING/FINISHING AN EXISTING BUILD rule): a "complete"/
+    "finish this build" request against a build that already has real
+    components must resolve to `modify_build`, patching in ONLY the
+    currently-empty categories, never `load_build`. Since this is fundamentally
+    a prompt-following behavior (not something Python can enforce structurally
+    -- `_validate_action` has no way to know intent from wording), this is a
+    plumbing-level test: it confirms the CORRECT shape of response (a
+    `modify_build` action whose `components` does NOT touch the already-filled
+    CPU/GPU and DOES fill in the remaining empty categories) passes through
+    cleanly, matching this project's existing "prompt-only rules get plumbing
+    tests, not behavior-proof tests" convention (e.g. the budget-guardrail/
+    advisory-synthesis tests above)."""
+    _set_env(monkeypatch)
+    partial_build_context = {
+        "mode": "Free",
+        "components": {
+            "CPU": {"id": 1, "name": "Ryzen 7 5800X3D", "price_usd": 329.0},
+            "GPU": {"id": 4, "name": "RTX 4070 Founders Edition", "price_usd": 599.0},
+        },
+        "quantities": {},
+    }
+    payload = {
+        "reply": "Filled in the remaining parts around your CPU and GPU.",
+        "action": {
+            "type": "modify_build",
+            "components": {
+                "Motherboard": 3,
+                "RAM": 6,
+                "Storage": 7,
+                "PSU": 8,
+                "Case": 9,
+                "Cooler": 10,
+            },
+            "quantities": {},
+            "explanation": "Filled in every remaining core category, leaving the existing CPU/GPU untouched.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Complete this build for me",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=partial_build_context,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["type"] == "modify_build"
+    # The already-filled categories must NOT appear in the patch...
+    assert "CPU" not in result["action"]["components"]
+    assert "GPU" not in result["action"]["components"]
+    # ...and every previously-empty core category must be filled in.
+    assert set(result["action"]["components"]) == {
+        "Motherboard",
+        "RAM",
+        "Storage",
+        "PSU",
+        "Case",
+        "Cooler",
+    }
+
+
 def test_modify_build_action_with_bad_quantity_category_falls_back_to_heuristic(monkeypatch):
     """quantities may only ever reference RAM/Storage — a CPU quantity makes
     no sense and must be rejected, falling back to heuristic."""
@@ -444,7 +629,7 @@ def test_modify_build_with_no_active_build_context_says_nothing_to_modify(monkey
 # ---------------------------------------------------------------------------
 # Intent 5: navigate requests
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("page_key", ["create_build", "my_builds", "community"])
+@pytest.mark.parametrize("page_key", ["landing", "create_build", "my_builds", "community", "drafts"])
 def test_navigate_action_parses_for_each_valid_page_key(monkeypatch, page_key):
     _set_env(monkeypatch)
     payload = {
@@ -458,7 +643,12 @@ def test_navigate_action_parses_for_each_valid_page_key(monkeypatch, page_key):
     )
 
     assert result["source"] == "llm"
-    assert result["action"] == {"type": "navigate", "navigate_to": page_key}
+    assert result["action"] == {
+        "type": "navigate",
+        "navigate_to": page_key,
+        "filters": None,
+        "reset_mode": False,
+    }
 
 
 def test_navigate_action_with_invalid_page_key_falls_back_to_heuristic(monkeypatch):
@@ -476,6 +666,781 @@ def test_navigate_action_with_invalid_page_key_falls_back_to_heuristic(monkeypat
         "Take me to my previous builds", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY
     )
     assert result["source"] == "heuristic"
+    assert result["action"] is None
+
+
+# ---------------------------------------------------------------------------
+# Intent 5 extension: navigate with `filters`
+# ---------------------------------------------------------------------------
+def test_navigate_action_with_budget_filters_parses_and_passes_through(monkeypatch):
+    """A navigate action carrying a Budget-shaped filters payload (max_price
+    set, domain/tier null) must parse and reach the caller unmodified —
+    ui/views/community.py, not this module, resolves max_price into a real
+    selectbox option string."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Here are the budget builds under 2000 USD.",
+        "action": {
+            "type": "navigate",
+            "navigate_to": "community",
+            "filters": {"build_type": "Budget", "max_price": 2000.0, "domain": None, "tier": None},
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Take me to budget builds under 2000", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["type"] == "navigate"
+    assert result["action"]["filters"] == {
+        "build_type": "Budget",
+        "max_price": 2000.0,
+        "domain": None,
+        "tier": None,
+    }
+
+
+def test_navigate_action_with_workload_filters_parses_and_passes_through(monkeypatch):
+    """A navigate action carrying a Workload-shaped filters payload
+    (domain/tier set, max_price null)."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Here are the gaming builds.",
+        "action": {
+            "type": "navigate",
+            "navigate_to": "community",
+            "filters": {"build_type": "Workload", "max_price": None, "domain": "Gaming", "tier": None},
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Show me gaming builds", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["filters"]["build_type"] == "Workload"
+    assert result["action"]["filters"]["domain"] == "Gaming"
+
+
+def test_navigate_action_with_invalid_filters_build_type_falls_back_to_heuristic(monkeypatch):
+    """filters.build_type is a closed Literal — a value outside
+    All/Budget/Workload/Free must fail pydantic validation, same precedent
+    as an invalid navigate_to."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Here you go.",
+        "action": {
+            "type": "navigate",
+            "navigate_to": "community",
+            "filters": {"build_type": "Enthusiast", "max_price": None, "domain": None, "tier": None},
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Take me to community", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY
+    )
+    assert result["source"] == "heuristic"
+    assert result["action"] is None
+
+
+def test_navigate_action_ignores_legacy_save_as_draft_field_from_llm(monkeypatch):
+    """Regression guard for the explicit, deliberate removal of the
+    `save_as_draft` field/auto-stash-to-Drafts mechanism: even if a
+    non-compliant (e.g. stale-prompt-cached, or hallucinating) LLM response
+    still includes a `"save_as_draft": true` key on a navigate action,
+    `ConciergeNavigateAction` no longer declares that field at all, so
+    Pydantic silently drops the unrecognized key on parse — the resulting
+    action must NOT carry it, and there must be nothing in this module's
+    plumbing that could act on it."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Taking you to Community.",
+        "action": {
+            "type": "navigate",
+            "navigate_to": "community",
+            "save_as_draft": True,
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Take me to Community",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {
+        "type": "navigate",
+        "navigate_to": "community",
+        "filters": None,
+        "reset_mode": False,
+    }
+    assert "save_as_draft" not in result["action"]
+
+
+def test_navigate_action_without_filters_defaults(monkeypatch):
+    """A plain navigate action (no filters mentioned by the mocked response)
+    must still parse, defaulting filters to None, matching the pre-existing
+    navigate tests' minimal payload shape. There is no `save_as_draft` field
+    to default anymore — it was removed from the schema entirely."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Taking you to My Builds.",
+        "action": {"type": "navigate", "navigate_to": "my_builds"},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Show my previous builds", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["filters"] is None
+    assert "save_as_draft" not in result["action"]
+
+
+# ---------------------------------------------------------------------------
+# advisory_context: new optional parameter (intent 6 — optimization/analysis)
+# ---------------------------------------------------------------------------
+def test_advisory_context_synthesized_reply_passes_through(monkeypatch):
+    """A mocked concise, synthesized reply grounded in advisory_context — the
+    plumbing must pass it through unmodified with source == "llm". The actual
+    synthesis judgment is the model's job (untestable here); this only checks
+    that a well-formed response using advisory_context isn't rejected or
+    altered."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Your RAM is a bit light for multitasking — adding a second kit for 64GB would help most.",
+        "action": None,
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "How can I optimize this build?",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+        advisory_context=ADVISORY_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] is None
+    assert result["reply"] == payload["reply"]
+
+
+def test_advisory_context_reaches_the_request_payload_when_provided(monkeypatch):
+    """Inspect the mocked httpx.post call's JSON body to confirm
+    advisory_context is actually threaded into the request payload sent to
+    OpenRouter, not just accepted and dropped."""
+    _set_env(monkeypatch)
+    captured_payload = {}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        captured_payload.update(json)
+        return _fake_openrouter_response({"reply": "ok", "action": None})
+
+    monkeypatch.setattr(concierge.httpx, "post", fake_post)
+
+    result = concierge.get_concierge_response(
+        "Analyze my build",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+        advisory_context=ADVISORY_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    sent_payload = json.loads(captured_payload["messages"][1]["content"])
+    assert sent_payload["advisory_context"] == ADVISORY_CONTEXT
+
+
+def test_advisory_context_defaults_to_empty_dict_when_none(monkeypatch):
+    """When the caller doesn't pass advisory_context at all (None default),
+    the payload sent to OpenRouter must contain an empty dict, not None,
+    matching current_build_context's existing None -> {} behavior."""
+    _set_env(monkeypatch)
+    captured_payload = {}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        captured_payload.update(json)
+        return _fake_openrouter_response({"reply": "ok", "action": None})
+
+    monkeypatch.setattr(concierge.httpx, "post", fake_post)
+
+    result = concierge.get_concierge_response("Analyze my build", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY)
+
+    assert result["source"] == "llm"
+    sent_payload = json.loads(captured_payload["messages"][1]["content"])
+    assert sent_payload["advisory_context"] == {}
+    assert sent_payload["current_build_context"] == {}
+
+
+def test_build_payload_includes_advisory_context_directly():
+    """Directly exercises _build_payload (not just the full request path) to
+    confirm the new "advisory_context" key is present with the given value,
+    and defaults to {} when omitted."""
+    payload_with_advisory = concierge._build_payload(
+        "hello", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY, None, ADVISORY_CONTEXT
+    )
+    assert payload_with_advisory["advisory_context"] == ADVISORY_CONTEXT
+
+    payload_without_advisory = concierge._build_payload("hello", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY)
+    assert payload_without_advisory["advisory_context"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Budget guardrail wording: pure action:null plumbing (no new server-side
+# validation — the reasoning behind this reply is the model's job, not
+# unit-testable; this only confirms the wording doesn't confuse the existing
+# action:null pass-through path).
+# ---------------------------------------------------------------------------
+def test_budget_guard_reply_template_passes_through_as_ordinary_null_action(monkeypatch):
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "This upgrade will exceed your budget by USD 45.00. Would you like to proceed anyway?",
+        "action": None,
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Swap my GPU for the RTX 4070",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] is None
+    assert result["reply"] == payload["reply"]
+
+
+# ---------------------------------------------------------------------------
+# Intent 7: save & publish requests
+# ---------------------------------------------------------------------------
+def test_concierge_response_parses_save_build_action():
+    payload = {
+        "reply": "Saved as 'My Rig'! Would you like to publish it to the Community as well?",
+        "action": {
+            "type": "save_build",
+            "name": "My Rig",
+            "destination": "build",
+            "explanation": "Saving your current build.",
+        },
+    }
+    response = ConciergeResponse.model_validate(payload)
+    assert response.action is not None
+    assert response.action.type == "save_build"
+    assert response.action.name == "My Rig"
+    assert response.action.destination == "build"
+    assert response.action.explanation == "Saving your current build."
+
+
+def test_concierge_save_build_action_requires_name_field():
+    """`name` is a REQUIRED field on ConciergeSaveBuildAction — a genuine
+    Pydantic-level guarantee (not just a prompt instruction) that the model
+    must have actually gathered a name from the user before this action can
+    ever be constructed. Omitting it must fail validation."""
+    payload = {
+        "reply": "Saved!",
+        "action": {"type": "save_build", "destination": "build", "explanation": "Saving."},
+    }
+    with pytest.raises(PydanticValidationError):
+        ConciergeResponse.model_validate(payload)
+
+
+def test_concierge_save_build_action_requires_destination_field():
+    """Same guarantee as above, for `destination` — omitting it must fail
+    validation rather than silently defaulting to either table."""
+    payload = {
+        "reply": "Saved!",
+        "action": {"type": "save_build", "name": "My Rig", "explanation": "Saving."},
+    }
+    with pytest.raises(PydanticValidationError):
+        ConciergeResponse.model_validate(payload)
+
+
+def test_concierge_save_build_action_parses_fine_with_both_fields_present():
+    """Sanity check: a well-formed action with both required fields present
+    parses cleanly for either real destination value."""
+    for destination in ("draft", "build"):
+        payload = {
+            "reply": "Saved!",
+            "action": {
+                "type": "save_build",
+                "name": "My Rig",
+                "destination": destination,
+                "explanation": "Saving.",
+            },
+        }
+        response = ConciergeResponse.model_validate(payload)
+        assert response.action.destination == destination
+
+
+def test_concierge_response_parses_publish_build_action_with_null_author_notes():
+    payload = {
+        "reply": "Published without a description.",
+        "action": {"type": "publish_build", "author_notes": None},
+    }
+    response = ConciergeResponse.model_validate(payload)
+    assert response.action is not None
+    assert response.action.type == "publish_build"
+    assert response.action.author_notes is None
+
+
+def test_concierge_response_parses_publish_build_action_with_author_notes():
+    payload = {
+        "reply": "Published with your notes.",
+        "action": {"type": "publish_build", "author_notes": "Great 1440p gaming build on a budget."},
+    }
+    response = ConciergeResponse.model_validate(payload)
+    assert response.action.author_notes == "Great 1440p gaming build on a budget."
+
+
+def test_save_build_first_message_asks_for_name_and_destination_with_no_action(monkeypatch):
+    """The FIRST "save this build" message with an active build_context must
+    NOT return an action yet — the model asks for both a name and a
+    destination and waits. This only confirms the plumbing passes such a
+    reply through unmodified (the model's own reasoning produces the actual
+    question text)."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "What name would you like to give this build? Also, should I save it as a Draft or a finished Build?",
+        "action": None,
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Save this PC to my list",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] is None
+    assert "name" in result["reply"].lower()
+    assert "draft" in result["reply"].lower() or "build" in result["reply"].lower()
+
+
+def test_save_build_followup_with_both_name_and_destination_returns_action(monkeypatch):
+    """A follow-up message answering the model's own immediately-prior
+    name+destination question with BOTH pieces of information returns the
+    real save_build action carrying those exact values."""
+    _set_env(monkeypatch)
+    history = [
+        {"role": "user", "content": "Save this PC to my list"},
+        {
+            "role": "assistant",
+            "content": "What name would you like to give this build? Also, should I save it as a Draft or a finished Build?",
+        },
+    ]
+    payload = {
+        "reply": "Saved as 'Weekend Gaming Rig'! Would you like to publish it to the Community as well?",
+        "action": {
+            "type": "save_build",
+            "name": "Weekend Gaming Rig",
+            "destination": "build",
+            "explanation": "Saving the active build as a finished build.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Call it Weekend Gaming Rig, and save it as a finished build",
+        history,
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {
+        "type": "save_build",
+        "name": "Weekend Gaming Rig",
+        "destination": "build",
+        "explanation": "Saving the active build as a finished build.",
+    }
+    assert "weekend gaming rig" in result["reply"].lower()
+    assert "publish" in result["reply"].lower()
+
+
+def test_save_build_followup_with_draft_destination_does_not_ask_about_publishing(monkeypatch):
+    """A "draft"-destination save has nothing to publish — the reply for
+    that turn must confirm the draft save only, never ask about publishing."""
+    _set_env(monkeypatch)
+    history = [
+        {"role": "user", "content": "Save this PC to my list"},
+        {
+            "role": "assistant",
+            "content": "What name would you like to give this build? Also, should I save it as a Draft or a finished Build?",
+        },
+    ]
+    payload = {
+        "reply": "Saved 'WIP Rig' as a draft.",
+        "action": {
+            "type": "save_build",
+            "name": "WIP Rig",
+            "destination": "draft",
+            "explanation": "Saving the active build as a draft.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Call it WIP Rig, save it as a draft for now",
+        history,
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["destination"] == "draft"
+    assert "publish" not in result["reply"].lower()
+
+
+def test_save_build_followup_with_only_name_asks_for_missing_destination(monkeypatch):
+    """A follow-up giving only a name (no destination wording) must NOT guess
+    the missing piece — action stays null, and the model asks specifically
+    for what's still missing."""
+    _set_env(monkeypatch)
+    history = [
+        {"role": "user", "content": "Save this PC to my list"},
+        {
+            "role": "assistant",
+            "content": "What name would you like to give this build? Also, should I save it as a Draft or a finished Build?",
+        },
+    ]
+    payload = {
+        "reply": "Got it — should I save it as a Draft or a finished Build?",
+        "action": None,
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Call it Weekend Gaming Rig",
+        history,
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] is None
+    assert "draft" in result["reply"].lower() or "build" in result["reply"].lower()
+
+
+def test_save_build_intent_with_no_active_build_says_nothing_to_save(monkeypatch):
+    _set_env(monkeypatch)
+    payload = {"reply": "You don't have an active build to save yet.", "action": None}
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Save this PC to my list",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=None,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] is None
+
+
+def test_publish_confirmation_no_answer_stays_action_null(monkeypatch):
+    """A "no" answering the model's own immediately-prior publish question
+    must resolve to a plain reply confirming the build stays private, with
+    no action — this is prompt-reasoning behavior, so this test only checks
+    the plumbing accepts that shape cleanly."""
+    _set_env(monkeypatch)
+    history = [
+        {"role": "assistant", "content": "Saved your build! Would you like to publish it to the Community as well?"},
+    ]
+    payload = {"reply": "No problem — your build stays private.", "action": None}
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "No", history, CATALOG_SUMMARY, COMMUNITY_SUMMARY, current_build_context=CURRENT_BUILD_CONTEXT
+    )
+    assert result["source"] == "llm"
+    assert result["action"] is None
+
+
+def test_publish_confirmation_yes_then_description_no_returns_publish_action(monkeypatch):
+    """A "no" answering the model's own "want to add a description?" question
+    returns the publish_build action with author_notes=None."""
+    _set_env(monkeypatch)
+    history = [
+        {"role": "user", "content": "Save this PC to my list"},
+        {"role": "assistant", "content": "Saved! Would you like to publish it to the Community as well?"},
+        {"role": "user", "content": "Yes"},
+        {
+            "role": "assistant",
+            "content": "Would you like to include an introductory description or notes for the community?",
+        },
+    ]
+    payload = {
+        "reply": "Published to the Community without a description.",
+        "action": {"type": "publish_build", "author_notes": None},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "No", history, CATALOG_SUMMARY, COMMUNITY_SUMMARY, current_build_context=CURRENT_BUILD_CONTEXT
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {"type": "publish_build", "author_notes": None}
+
+
+def test_publish_confirmation_with_description_text_returns_publish_action_with_notes(monkeypatch):
+    """The description text itself (sent after the model asked for it) comes
+    back verbatim as author_notes on the publish_build action."""
+    _set_env(monkeypatch)
+    history = [
+        {"role": "assistant", "content": "Saved! Would you like to publish it to the Community as well?"},
+        {"role": "user", "content": "Yes"},
+        {
+            "role": "assistant",
+            "content": "Would you like to include an introductory description or notes for the community?",
+        },
+        {"role": "user", "content": "Yes"},
+        {"role": "assistant", "content": "Go ahead and send the description text."},
+    ]
+    payload = {
+        "reply": "Published with your description!",
+        "action": {"type": "publish_build", "author_notes": "Great value 1440p gaming rig."},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Great value 1440p gaming rig.",
+        history,
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {
+        "type": "publish_build",
+        "author_notes": "Great value 1440p gaming rig.",
+    }
+
+
+def test_publish_confirmation_with_ai_generated_description_request_returns_composed_notes(monkeypatch):
+    """New branch (intent 7): on the turn where the model asked the user to
+    send the actual description text, the user can instead ask the model to
+    COMPOSE it itself (e.g. "generate one for me"). This is a plumbing-level
+    test -- it doesn't judge the LLM's composition quality, only that a
+    well-formed publish_build action carrying a plausible, model-composed
+    author_notes string passes through cleanly, exactly like the pre-existing
+    verbatim-text path below."""
+    _set_env(monkeypatch)
+    history = [
+        {"role": "assistant", "content": "Saved! Would you like to publish it to the Community as well?"},
+        {"role": "user", "content": "Yes"},
+        {
+            "role": "assistant",
+            "content": "Would you like to include an introductory description or notes for the community?",
+        },
+        {"role": "user", "content": "Yes"},
+        {"role": "assistant", "content": "Go ahead and send the description text."},
+    ]
+    payload = {
+        "reply": "Published! I wrote a description for you based on your build.",
+        "action": {
+            "type": "publish_build",
+            "author_notes": "Built around a Ryzen 7 5800X3D and RTX 4070 for smooth 1440p gaming.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Generate one for me",
+        history,
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+        advisory_context=ADVISORY_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {
+        "type": "publish_build",
+        "author_notes": "Built around a Ryzen 7 5800X3D and RTX 4070 for smooth 1440p gaming.",
+    }
+
+
+def test_publish_confirmation_with_description_text_still_returns_verbatim_notes(monkeypatch):
+    """Regression guard for the pre-existing verbatim-user-text path (see
+    test_publish_confirmation_with_description_text_returns_publish_action_with_notes
+    above, which already covers this): confirms adding the new AI-generated-
+    description branch above did not disturb the ordinary case where the user
+    supplies their own literal description text."""
+    _set_env(monkeypatch)
+    history = [
+        {"role": "assistant", "content": "Saved! Would you like to publish it to the Community as well?"},
+        {"role": "user", "content": "Yes"},
+        {
+            "role": "assistant",
+            "content": "Would you like to include an introductory description or notes for the community?",
+        },
+        {"role": "user", "content": "Yes"},
+        {"role": "assistant", "content": "Go ahead and send the description text."},
+    ]
+    payload = {
+        "reply": "Published with your description!",
+        "action": {"type": "publish_build", "author_notes": "My own hand-written description."},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "My own hand-written description.",
+        history,
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {
+        "type": "publish_build",
+        "author_notes": "My own hand-written description.",
+    }
+
+
+def test_save_build_action_requires_no_extra_validation_and_passes_validate_action(monkeypatch):
+    """_validate_action treats save_build/publish_build as a pass-through
+    (no catalog ids/categories to cross-check) — confirm a well-formed
+    save_build action (with the now-required name/destination fields) is
+    never rejected as a hallucination."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Saved as 'My Rig'! Publish it too?",
+        "action": {
+            "type": "save_build",
+            "name": "My Rig",
+            "destination": "build",
+            "explanation": "Saving now.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Save this build", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY, current_build_context=CURRENT_BUILD_CONTEXT
+    )
+    assert result["source"] == "llm"
+    assert result["action"]["type"] == "save_build"
+    assert result["action"]["name"] == "My Rig"
+    assert result["action"]["destination"] == "build"
+
+
+# ---------------------------------------------------------------------------
+# Intent 8: deep-link to a specific community build (open_community_build)
+# ---------------------------------------------------------------------------
+def test_concierge_response_parses_open_community_build_action():
+    payload = {
+        "reply": "Here's your Budget 1440p Gaming Rig.",
+        "action": {"type": "open_community_build", "post_id": 1},
+    }
+    response = ConciergeResponse.model_validate(payload)
+    assert response.action is not None
+    assert response.action.type == "open_community_build"
+    assert response.action.post_id == 1
+
+
+def test_open_community_build_action_with_real_post_id_passes_through(monkeypatch):
+    """A post_id that genuinely exists in the community_summary given for
+    this call must pass through unmodified — no re-lookup, no coercion."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Here's your Video Editing Powerhouse.",
+        "action": {"type": "open_community_build", "post_id": 2},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Open my Video Editing Powerhouse from community", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {"type": "open_community_build", "post_id": 2}
+
+
+def test_open_community_build_action_with_unknown_post_id_falls_back_to_heuristic(monkeypatch):
+    """A post_id NOT present in community_summary's real "post_id" values —
+    e.g. the model confused a build_id for a post_id, or simply invented one
+    — must be rejected by _validate_action's cross-check and fall back to
+    the heuristic, the same "never trust the LLM's stated id" precedent as
+    load_build/modify_build's catalog-id guard."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Here's your build.",
+        # 999 is not a real post_id in COMMUNITY_SUMMARY (nor is it even one
+        # of the real build_id values, 1/2 — deliberately a value absent from
+        # both fields so this can't accidentally pass via the wrong field).
+        "action": {"type": "open_community_build", "post_id": 999},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Open build 999", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY
+    )
+    assert result["source"] == "heuristic"
+    assert result["action"] is None
+
+
+def test_open_community_build_action_using_build_id_in_place_of_post_id_falls_back_to_heuristic(monkeypatch):
+    """Guards specifically against the "build_id used where post_id belongs"
+    mistake this schema's docstring warns about: in COMMUNITY_SUMMARY, every
+    post's post_id happens to equal its build_id (1/1, 2/2), so this test
+    alone wouldn't catch a mixup — it instead directly exercises
+    _validate_action with a community_summary where the two diverge, proving
+    the guard checks "post_id" specifically, not just "any id belonging to
+    some post"."""
+    from llm.schemas import ConciergeResponse as _Resp
+
+    diverging_summary = [
+        {"post_id": 10, "build_id": 55, "title": "Some Build"},
+    ]
+    response = _Resp.model_validate(
+        {
+            "reply": "Here's your build.",
+            # 55 is the build_id, not the post_id, for the only post given.
+            "action": {"type": "open_community_build", "post_id": 55},
+        }
+    )
+    with pytest.raises(concierge.ConciergeUnavailableError):
+        concierge._validate_action(response, CATALOG_SUMMARY, diverging_summary)
+
+
+def test_open_community_build_action_no_match_says_so_and_returns_null_action(monkeypatch):
+    """When nothing in community_summary matches what the user described,
+    the model is expected to say so plainly and return action: null — this
+    only confirms the plumbing passes that shape through cleanly."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "I couldn't find a community build matching that description.",
+        "action": None,
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "Open my Nonexistent Rig from community", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY
+    )
+    assert result["source"] == "llm"
     assert result["action"] is None
 
 

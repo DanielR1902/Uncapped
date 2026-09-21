@@ -137,6 +137,16 @@ CPUS = [
          specs={"core_count": 24, "thread_count": 24, "base_clock_ghz": 3.7, "boost_clock_ghz": 5.7},
          workloads=[W("VideoEditing", "Enthusiast", 0.95), W("Design", "Enthusiast", 0.95),
                     W("Gaming", "High", 0.85), W("Programming", "Enthusiast", 1.0)]),
+    PART("CPU", "AMD Ryzen 5 5500", "AMD", 79, socket="AM4", tdp=65, bench=48,
+         specs={"core_count": 6, "thread_count": 12, "base_clock_ghz": 3.6, "boost_clock_ghz": 4.2},
+         workloads=[W("General", "Entry", 1.0), W("Gaming", "Entry", 0.9)]),
+    PART("CPU", "Intel Core i3-12100F", "Intel", 89, socket="LGA1700", tdp=58, bench=38,
+         specs={"core_count": 4, "thread_count": 8, "base_clock_ghz": 3.3, "boost_clock_ghz": 4.3},
+         workloads=[W("General", "Entry", 1.0), W("Gaming", "Entry", 0.6)]),
+    PART("CPU", "Intel Core i9-14900KS", "Intel", 689, socket="LGA1700", tdp=150, bench=99,
+         specs={"core_count": 24, "thread_count": 32, "base_clock_ghz": 3.2, "boost_clock_ghz": 6.2},
+         workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Design", "Enthusiast", 1.0),
+                    W("Gaming", "Enthusiast", 1.0), W("Programming", "Enthusiast", 1.0)]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -299,6 +309,15 @@ GPUS = [
     PART("GPU", "Intel Arc B580", "Intel", 249, tdp=190, bench=52, interface="PCIe4.0x8",
          specs={"length_mm": 187, "vram_gb": 12, "boost_clock_mhz": 2670},
          workloads=[W("Gaming", "Entry", 0.9), W("General", "Mid", 0.4)]),
+    PART("GPU", "NVIDIA RTX 3050", "NVIDIA", 219, tdp=130, bench=36, interface="PCIe4.0x8",
+         specs={"length_mm": 194, "vram_gb": 8, "boost_clock_mhz": 1777},
+         workloads=[W("Gaming", "Entry", 0.85), W("General", "Entry", 0.5)]),
+    PART("GPU", "AMD Radeon RX 6600", "AMD", 199, tdp=132, bench=40, interface="PCIe4.0x8",
+         specs={"length_mm": 220, "vram_gb": 8, "boost_clock_mhz": 2491},
+         workloads=[W("Gaming", "Entry", 0.9), W("General", "Entry", 0.5)]),
+    PART("GPU", "Intel Arc A580", "Intel", 179, tdp=185, bench=34, interface="PCIe4.0x8",
+         specs={"length_mm": 267, "vram_gb": 8, "boost_clock_mhz": 1700},
+         workloads=[W("Gaming", "Entry", 0.75), W("General", "Entry", 0.4)]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -353,6 +372,10 @@ RAM = [
          specs={"module_count": 2, "speed_mhz": 6000, "cas_latency": 36},
          workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Design", "Enthusiast", 1.0),
                     W("Programming", "Enthusiast", 1.0), W("Gaming", "Enthusiast", 1.0)]),
+    PART("RAM", "Corsair Vengeance 128GB (2x64GB) DDR5-5600", "Corsair", 349, ram_type="DDR5", capacity_gb=128,
+         specs={"module_count": 2, "speed_mhz": 5600, "cas_latency": 40},
+         workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Design", "Enthusiast", 1.0),
+                    W("Programming", "Enthusiast", 0.9)]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -386,6 +409,11 @@ STORAGE = [
     PART("Storage", "WD Black SN850X 2TB", "Western Digital", 159, interface="NVMe", capacity_gb=2000,
          specs={"read_speed_mbps": 7300, "write_speed_mbps": 6600, "form_factor": "M.2-2280"},
          workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Gaming", "High", 0.85)]),
+    PART("Storage", "Crucial T700 2TB", "Crucial", 219, interface="NVMe", capacity_gb=2000,
+         specs={"read_speed_mbps": 12400, "write_speed_mbps": 11800, "form_factor": "M.2-2280",
+                "pcie_generation": "5.0"},
+         workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Design", "Enthusiast", 0.9),
+                    W("Programming", "Enthusiast", 0.8)]),
     PART("Storage", "Crucial MX500 1TB", "Crucial", 64, interface="SATA", capacity_gb=1000,
          specs={"read_speed_mbps": 560, "write_speed_mbps": 510, "form_factor": "2.5in"},
          workloads=[W("General", "Mid", 1.0), W("Programming", "Mid", 0.6)]),
@@ -458,6 +486,15 @@ PSU = [
     PART("PSU", "Corsair HX1200i", "Corsair", 249, watt_cap=1200, form_factor="ATX",
          specs={"efficiency_rating": "80+ Platinum", "modular": True},
          workloads=[W("Gaming", "Enthusiast", 1.0), W("VideoEditing", "Enthusiast", 0.8)]),
+    PART("PSU", "Seasonic Prime TX-1300", "Seasonic", 339, watt_cap=1300, form_factor="ATX",
+         specs={"efficiency_rating": "80+ Titanium", "modular": True},
+         workloads=[W("Gaming", "Enthusiast", 1.0), W("VideoEditing", "Enthusiast", 0.9)]),
+    PART("PSU", "be quiet! Dark Power Pro 13 1500W", "be quiet!", 429, watt_cap=1500, form_factor="ATX",
+         specs={"efficiency_rating": "80+ Titanium", "modular": True},
+         workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Design", "Enthusiast", 0.9)]),
+    PART("PSU", "Corsair AX1600i", "Corsair", 479, watt_cap=1600, form_factor="ATX",
+         specs={"efficiency_rating": "80+ Titanium", "modular": True},
+         workloads=[W("Gaming", "Enthusiast", 1.0), W("VideoEditing", "Enthusiast", 1.0)]),
 ]
 
 # ---------------------------------------------------------------------------
@@ -567,6 +604,10 @@ COOLER = [
     PART("Cooler", "Lian Li Galahad II 360", "Lian Li", 140, socket="AM4,AM5,LGA1700,LGA1200,LGA1851",
          specs={"cooler_type": "AIO", "radiator_size_mm": 360},
          workloads=[W("Gaming", "Enthusiast", 1.0), W("Design", "High", 0.6)]),
+    PART("Cooler", "NZXT Kraken 420", "NZXT", 219, socket="AM4,AM5,LGA1700,LGA1200,LGA1851",
+         specs={"cooler_type": "AIO", "radiator_size_mm": 420},
+         workloads=[W("Gaming", "Enthusiast", 1.0), W("VideoEditing", "Enthusiast", 0.85),
+                    W("Design", "Enthusiast", 0.8)]),
 ]
 
 # ---------------------------------------------------------------------------

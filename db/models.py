@@ -73,6 +73,9 @@ class User(Base):
     community_comments: Mapped[list["CommunityComment"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    draft_builds: Mapped[list["DraftBuild"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class Component(Base):
@@ -248,6 +251,30 @@ class CommunityComment(Base):
     user: Mapped["User"] = relationship(back_populates="community_comments")
 
     __table_args__ = (Index("idx_comments_post_created", "post_id", "created_at"),)
+
+
+class DraftBuild(Base):
+    __tablename__ = "draft_builds"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)  # "Budget" | "Workload" | "Free"
+    components_json: Mapped[str] = mapped_column(Text, nullable=False)  # JSON: {category: component_id}
+    quantities_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")  # JSON: {category: int}
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
+
+    user: Mapped["User"] = relationship(back_populates="draft_builds")
+
+    __table_args__ = (Index("idx_draft_builds_user_updated", "user_id", "updated_at"),)
 
 
 class LLMCache(Base):
