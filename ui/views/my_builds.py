@@ -18,20 +18,22 @@ _SORT_LABELS = {
 
 
 def _clone_into_studio(build) -> None:
-    draft = state.new_build_draft(build.creation_mode)
-    draft["name"] = f"{build.name} (copy)"
+    draft = state.load_components_into_new_draft(
+        mode=build.creation_mode,
+        components={bc.category: bc.component_id for bc in build.components},
+        # A real, confirmed gap fixed alongside this refactor (same as
+        # community.py::_fork_into_studio): the previous direct-dict-literal
+        # version never carried quantities over, so a RAM/Storage build with
+        # 2x+ units silently reverted to 1x on clone.
+        quantities={bc.category: bc.quantity for bc in build.components},
+        name=f"{build.name} (copy)",
+    )
     draft["workload_profile"] = build.workload_profile
     draft["budget_ceiling"] = build.budget_ceiling
-    draft["components"] = {bc.category: bc.component_id for bc in build.components}
 
     st.session_state["build_draft"] = draft
     st.session_state["create_mode"] = build.creation_mode
     st.session_state["build_draft_analysis"] = None
-    # Same as ui/views/community.py::_fork_into_studio: writing
-    # draft["components"] as a plain dict literal bypasses ui.state.
-    # set_component (the usual place this flag gets set). Set explicitly so
-    # a cloned/edited build is correctly tracked as having unsaved picks.
-    st.session_state["has_unsaved_build_changes"] = True
     st.session_state["page"] = "create_build"
     st.rerun()
 

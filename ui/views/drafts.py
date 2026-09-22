@@ -15,28 +15,20 @@ import streamlit as st
 
 from auth.session import current_user
 from db.models import DraftBuild
-from db.repositories import components_repo, drafts_repo
+from db.repositories import drafts_repo
 from ui import state
 
 
 def _load_into_builder(draft: DraftBuild) -> None:
-    components = json.loads(draft.components_json)
-    quantities = json.loads(draft.quantities_json)
-
-    new_draft = state.new_build_draft(draft.mode)
-    new_draft["name"] = draft.name
+    new_draft = state.load_components_into_new_draft(
+        mode=draft.mode,
+        components=json.loads(draft.components_json),
+        quantities=json.loads(draft.quantities_json),
+        name=draft.name,
+    )
     st.session_state["build_draft"] = new_draft
     st.session_state["create_mode"] = draft.mode
     st.session_state["build_draft_analysis"] = None
-
-    for category, component_id in components.items():
-        component = components_repo.get_by_id(component_id)
-        if component is not None:
-            state.set_component(new_draft, category, component)
-    for category, quantity in quantities.items():
-        if category in new_draft.get("components", {}):
-            state.set_quantity(new_draft, category, quantity)
-
     st.session_state["page"] = "create_build"
     st.rerun()
 

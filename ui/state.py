@@ -123,6 +123,36 @@ def new_build_draft(creation_mode: str | None = None) -> dict:
     }
 
 
+def load_components_into_new_draft(
+    mode: str, components: dict[str, int], quantities: dict[str, int] | None = None, name: str = ""
+) -> dict:
+    """The shared shape every "load an existing build/draft into the studio"
+    entry point needs: starts a fresh `new_build_draft(mode)`, then replays
+    `components`/`quantities` through `set_component`/`set_quantity` —
+    resolving each component id via `components_repo.get_by_id`, silently
+    skipping one that's since left the catalog (same defensive precedent as
+    `resolve_build_state`) — rather than writing `draft["components"]` as a
+    raw dict literal. Using the real setters (not a direct write) is what
+    correctly marks the result as having unsaved changes for free
+    (`has_unsaved_build_changes = True`, set internally by `set_component`),
+    since every source this loads from (a draft, a previously-saved build, a
+    community post) is itself a real, persisted row — the copy landing in
+    the studio is a fresh, uncommitted edit of it, not yet saved on its own.
+    Does not itself touch `st.session_state` beyond that — the caller still
+    assigns the result to `st.session_state["build_draft"]` and sets
+    `create_mode`/`page` itself, since what "loading" means (view, edit,
+    fork, clone) differs per caller."""
+    draft = new_build_draft(mode)
+    draft["name"] = name
+    for category, component_id in components.items():
+        component = components_repo.get_by_id(component_id)
+        if component is not None:
+            set_component(draft, category, component)
+    for category, quantity in (quantities or {}).items():
+        set_quantity(draft, category, quantity)
+    return draft
+
+
 def resolve_build_state(build_draft: dict | None) -> BuildState:
     """Fetch full Component rows for whatever's pinned in build_draft. Missing
     or since-removed component ids are silently skipped rather than raising —

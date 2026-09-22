@@ -1733,6 +1733,7 @@ def test_concierge_quantity_bump_is_reflected_by_the_stepper_widget_immediately(
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Increased RAM to 2 units.",
@@ -1988,6 +1989,7 @@ def test_concierge_message_round_trips_without_crash(seeded_db, monkeypatch):
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         assert catalog_summary  # real catalog was actually pre-fetched
         return {"reply": "Here are some CPUs.", "action": None, "source": "heuristic"}
@@ -2073,6 +2075,7 @@ def test_concierge_english_reply_rendering_unchanged(seeded_db, monkeypatch):
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {"reply": "Here are some CPUs.", "action": None, "source": "heuristic"}
 
@@ -2117,6 +2120,7 @@ def test_concierge_hebrew_reply_gets_rtl_styling(seeded_db, monkeypatch):
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {"reply": hebrew_reply, "action": None, "source": "heuristic"}
 
@@ -2157,6 +2161,7 @@ def test_concierge_hebrew_reply_with_html_like_content_is_escaped_not_live(seede
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {"reply": malicious_reply, "action": None, "source": "heuristic"}
 
@@ -2192,6 +2197,7 @@ def test_concierge_load_build_action_applies_immediately_no_confirmation(seeded_
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Built it.",
@@ -2277,6 +2283,7 @@ def test_concierge_apply_action_failure_degrades_gracefully_without_crashing(see
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Built it.",
@@ -2356,6 +2363,7 @@ def test_concierge_build_request_succeeds_from_community_starting_page(seeded_db
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         # No build has ever been touched this session -> both context
         # helpers must resolve to None/empty, not raise.
@@ -2427,6 +2435,7 @@ def test_concierge_modify_build_patches_without_disturbing_other_categories(seed
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         assert current_build_context is not None
         assert current_build_context["components"]["CPU"]["id"] == cpu.id
@@ -2498,6 +2507,7 @@ def test_concierge_modify_build_quantity_request_is_clamped_to_real_limit(seeded
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Bumped your RAM quantity.",
@@ -2531,6 +2541,7 @@ def test_concierge_navigate_action_sets_page_immediately_no_click(seeded_db, mon
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Taking you to Community.",
@@ -2566,6 +2577,7 @@ def test_concierge_navigate_action_to_landing_home_page(seeded_db, monkeypatch):
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Taking you home.",
@@ -2599,6 +2611,7 @@ def test_concierge_navigate_action_to_drafts_page(seeded_db, monkeypatch):
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Taking you to your drafts.",
@@ -2653,6 +2666,7 @@ def test_concierge_navigate_to_community_resets_stale_selected_post_id(seeded_db
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Taking you back to the main feed.",
@@ -2697,6 +2711,7 @@ def test_concierge_reset_mode_without_unsaved_changes_resets_immediately(seeded_
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Sure, let's pick a new mode.",
@@ -2746,6 +2761,7 @@ def test_concierge_reset_mode_with_unsaved_changes_resets_with_no_draft_created(
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Sure, let's pick a new mode.",
@@ -2859,6 +2875,7 @@ def test_concierge_open_community_build_action_lands_on_thread_view(seeded_db, m
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         # community_summary must carry this real post's post_id (and a
         # distinct build_id) — confirms the caller-assembled context this
@@ -2881,6 +2898,310 @@ def test_concierge_open_community_build_action_lands_on_thread_view(seeded_db, m
 
     page_text = "\n".join(m.value for m in at.markdown) + " ".join(t.value for t in at.title)
     assert "Open Me Rig" in page_text
+
+
+def test_concierge_load_saved_build_draft_source_populates_studio(seeded_db, monkeypatch):
+    """A mocked `load_saved_build` action with source == "draft" must load
+    the real draft's components/mode into build_draft and land on
+    create_build for editing — distinct from load_build (a brand new build)
+    and open_community_build (a read-only view)."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "loaddraft1", "loaddraft1@example.com", "Load Draft One")
+    user_id = at.session_state["auth_user"]["id"]
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+    draft = drafts_repo.save_draft(
+        user_id=user_id, name="pc-master-race", mode="Free",
+        components={"CPU": cpu.id, "GPU": gpu.id}, quantities={},
+    )
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        drafts_summary=None,
+        **kwargs,
+    ):
+        matching = [d for d in (drafts_summary or []) if d["draft_id"] == draft.id]
+        assert matching
+        return {
+            "reply": "Loaded 'pc-master-race' into the Build Studio for editing.",
+            "action": {"type": "load_saved_build", "source": "draft", "id": draft.id},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("sidebar_nav_drafts").click().run()
+    at.get_by_key("concierge_chat_input").set_value("open pc-master-race for editing").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["create_mode"] == "Free"
+    assert at.session_state["build_draft"]["components"] == {"CPU": cpu.id, "GPU": gpu.id}
+    assert at.session_state["build_draft"]["name"] == "pc-master-race"
+    assert at.session_state["has_unsaved_build_changes"] is True
+
+
+def test_concierge_load_saved_build_previous_build_source_populates_studio(seeded_db, monkeypatch):
+    """Same as the draft case above, for source == "build" (a real,
+    finished, previously-saved build)."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "loadbuild1", "loadbuild1@example.com", "Load Build One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Ultra Rig")
+    at.get_by_key("save_build").click().run()
+
+    from db.repositories import builds_repo
+
+    user_id = at.session_state["auth_user"]["id"]
+    saved_build = builds_repo.get_builds_for_user(user_id)[0]
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        previous_builds_summary=None,
+        **kwargs,
+    ):
+        matching = [b for b in (previous_builds_summary or []) if b["build_id"] == saved_build.id]
+        assert matching
+        return {
+            "reply": "Loaded 'Ultra Rig' into the Build Studio for editing.",
+            "action": {"type": "load_saved_build", "source": "build", "id": saved_build.id},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("sidebar_nav_my_builds").click().run()
+    at.get_by_key("concierge_chat_input").set_value("load my build named Ultra Rig").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["create_mode"] == "Budget"
+    assert set(at.session_state["build_draft"]["components"]) == set(
+        c.category for c in saved_build.components
+    )
+
+
+def test_concierge_load_saved_build_community_source_uses_viewed_post_id(seeded_db, monkeypatch):
+    """When "this build"/"this post" is asked with no name given while a
+    specific community thread is already open (selected_post_id set), the
+    Concierge resolves it via viewed_post_id — proven here by a mocked
+    response that only returns a valid action when it actually received the
+    real post id in its own payload."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "loadcommunity1", "loadcommunity1@example.com", "Load Community One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Community Source Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click().run()
+
+    real_post = community_repo.get_feed()[0]
+    at.session_state["page"] = "community"
+    at.session_state["selected_post_id"] = real_post.id
+    at.run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        viewed_post_id=None,
+        **kwargs,
+    ):
+        assert viewed_post_id == real_post.id
+        return {
+            "reply": "Loaded 'Community Source Rig' into the Build Studio for editing.",
+            "action": {"type": "load_saved_build", "source": "community", "id": viewed_post_id},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("edit this build").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["fork_source_build_id"] == real_post.build_id
+
+
+def test_concierge_load_saved_build_discards_current_unsaved_build_first(seeded_db, monkeypatch):
+    """Loading a saved build while ALREADY in create_build with a DIFFERENT
+    unsaved build in progress must not silently mix the two — the current
+    unsaved build is discarded first (ui.state.teardown_builder(), no
+    database write, spec.md §7.9), then the requested one loads cleanly."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "loadswap1", "loadswap1@example.com", "Load Swap One")
+    user_id = at.session_state["auth_user"]["id"]
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    draft = drafts_repo.save_draft(
+        user_id=user_id, name="Target Draft", mode="Free", components={"CPU": cpu.id}, quantities={},
+    )
+
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+    other_gpu = components_repo.get_by_category("GPU")[0]
+    at.get_by_key(f"select_GPU_{other_gpu.id}").click().run()
+    assert at.session_state["has_unsaved_build_changes"] is True
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        **kwargs,
+    ):
+        return {
+            "reply": "Loaded 'Target Draft' into the Build Studio for editing.",
+            "action": {"type": "load_saved_build", "source": "draft", "id": draft.id},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("open Target Draft for editing").run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["build_draft"]["components"] == {"CPU": cpu.id}
+    assert at.session_state["create_mode"] == "Free"
+    # No phantom draft created from the DISCARDED GPU-only build.
+    assert len(drafts_repo.get_user_drafts(user_id)) == 1
+
+
+def test_concierge_save_build_fast_track_with_publish_immediately_persists_both_in_one_turn(
+    seeded_db, monkeypatch
+):
+    """"save build as X and publish to community" in ONE message must
+    create the real Build row AND publish it to Community in the SAME
+    turn — no separate publish_build round-trip needed."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import builds_repo, community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "fasttrack1", "fasttrack1@example.com", "Fast Track One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        **kwargs,
+    ):
+        assert current_build_context is not None
+        return {
+            "reply": "Saved 'Workstation' and published it to the Community!",
+            "action": {
+                "type": "save_build",
+                "name": "Workstation",
+                "destination": "build",
+                "publish_immediately": True,
+                "author_notes": None,
+                "explanation": "Fast-track save + publish.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    user_id = at.session_state["auth_user"]["id"]
+    at.get_by_key("concierge_chat_input").set_value("save build as workstation and publish to community").run()
+
+    assert not at.exception
+    builds = builds_repo.get_builds_for_user(user_id)
+    assert len(builds) == 1
+    assert builds[0].name == "Workstation"
+    assert builds[0].is_public is True
+
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    assert feed[0].build_id == builds[0].id
+    assert at.session_state["concierge_last_saved_build"] == {"build_id": builds[0].id, "name": "Workstation"}
+
+
+def test_concierge_save_build_without_publish_immediately_stays_private(seeded_db, monkeypatch):
+    """Regression guard: an ORDINARY save_build (publish_immediately not set,
+    the common case) must NOT publish — confirms the fast-track field is
+    truly opt-in, never a default-on behavior."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import builds_repo, community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "fasttrack2", "fasttrack2@example.com", "Fast Track Two")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        **kwargs,
+    ):
+        return {
+            "reply": "Saved as 'Ultra Rig'! Would you like to publish it to the Community as well?",
+            "action": {
+                "type": "save_build",
+                "name": "Ultra Rig",
+                "destination": "build",
+                "explanation": "Ordinary save, no publish mentioned.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    user_id = at.session_state["auth_user"]["id"]
+    at.get_by_key("concierge_chat_input").set_value("save build named Ultra Rig").run()
+
+    assert not at.exception
+    builds = builds_repo.get_builds_for_user(user_id)
+    assert len(builds) == 1
+    assert builds[0].is_public is False
+    assert community_repo.get_feed() == []
 
 
 def test_concierge_save_build_action_persists_real_build_and_records_last_saved(seeded_db, monkeypatch):
@@ -2912,6 +3233,7 @@ def test_concierge_save_build_action_persists_real_build_and_records_last_saved(
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         assert current_build_context is not None
         return {
@@ -2975,6 +3297,7 @@ def test_concierge_save_build_action_with_draft_destination_persists_draft_not_b
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         assert current_build_context is not None
         return {
@@ -3026,6 +3349,7 @@ def test_concierge_save_build_action_noop_without_active_build(seeded_db, monkey
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "You don't have an active build to save yet.",
@@ -3081,6 +3405,7 @@ def test_concierge_publish_build_action_uses_last_saved_build(seeded_db, monkeyp
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Published to the Community!",
@@ -3124,6 +3449,7 @@ def test_concierge_publish_build_action_is_noop_without_a_saved_build(seeded_db,
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Published!",
@@ -3170,6 +3496,7 @@ def test_concierge_load_build_appends_authoritative_total_overriding_wrong_llm_c
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": f"I built you a {wrong_claimed_total:,.2f} USD PC with a great CPU and GPU pairing.",
@@ -3224,6 +3551,7 @@ def test_concierge_navigate_and_save_build_actions_never_append_a_total_line(see
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Taking you to Community.",
@@ -3258,6 +3586,7 @@ def test_concierge_navigate_and_save_build_actions_never_append_a_total_line(see
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Saved your build! Want to publish it to Community too?",
@@ -3719,6 +4048,7 @@ def test_concierge_navigate_with_budget_filters_prepopulates_community_widgets(s
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Here are the budget builds under 1200 USD.",
@@ -3772,6 +4102,7 @@ def test_concierge_navigate_with_workload_filters_prepopulates_community_widgets
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Here are the general-purpose builds.",
@@ -3829,6 +4160,7 @@ def test_concierge_navigate_with_unmatched_filters_falls_back_gracefully(seeded_
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Here you go.",
@@ -3887,6 +4219,7 @@ def test_concierge_navigate_never_creates_draft_even_with_active_unsaved_build(
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         assert current_build_context is not None
         return {
@@ -3934,6 +4267,7 @@ def test_concierge_navigate_creates_no_draft_without_active_build_either(seeded_
         community_summary,
         current_build_context=None,
         advisory_context=None,
+        **kwargs,
     ):
         return {
             "reply": "Taking you to Community.",

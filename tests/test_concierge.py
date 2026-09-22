@@ -87,6 +87,16 @@ COMMUNITY_SUMMARY = [
     },
 ]
 
+DRAFTS_SUMMARY = [
+    {"draft_id": 101, "name": "pc-master-race", "mode": "Free"},
+    {"draft_id": 102, "name": "Weekend WIP", "mode": "Budget"},
+]
+
+PREVIOUS_BUILDS_SUMMARY = [
+    {"build_id": 201, "name": "Ultra Rig", "creation_mode": "Free"},
+    {"build_id": 202, "name": "Office PC", "creation_mode": "Budget"},
+]
+
 
 def _fake_openrouter_response(payload: dict, status_code: int = 200) -> httpx.Response:
     body = {"choices": [{"message": {"content": json.dumps(payload)}}]}
@@ -1069,6 +1079,8 @@ def test_save_build_followup_with_both_name_and_destination_returns_action(monke
         "type": "save_build",
         "name": "Weekend Gaming Rig",
         "destination": "build",
+        "publish_immediately": False,
+        "author_notes": None,
         "explanation": "Saving the active build as a finished build.",
     }
     assert "weekend gaming rig" in result["reply"].lower()
@@ -1156,6 +1168,142 @@ def test_save_build_intent_with_no_active_build_says_nothing_to_save(monkeypatch
 
     assert result["source"] == "llm"
     assert result["action"] is None
+
+
+# ---------------------------------------------------------------------------
+# Fast-track save/publish: the user's FIRST message already unambiguously
+# supplies name + destination (+ optional publish intent) up front, so the
+# model skips straight to firing save_build instead of asking questions it
+# already has the answer to.
+# ---------------------------------------------------------------------------
+def test_save_build_action_parses_with_publish_immediately_and_author_notes():
+    payload = {
+        "reply": "Saved 'Workstation' and published it to the Community!",
+        "action": {
+            "type": "save_build",
+            "name": "Workstation",
+            "destination": "build",
+            "publish_immediately": True,
+            "author_notes": "Built for heavy multitasking.",
+            "explanation": "Saving and publishing in one turn.",
+        },
+    }
+    response = ConciergeResponse.model_validate(payload)
+    assert response.action.publish_immediately is True
+    assert response.action.author_notes == "Built for heavy multitasking."
+
+
+def test_save_build_action_defaults_publish_immediately_false_and_author_notes_none():
+    """Both new fields are optional with safe defaults — an ordinary
+    save_build action (the common case) that never mentions either must
+    still parse cleanly without the model having to set them explicitly."""
+    payload = {
+        "reply": "Saved!",
+        "action": {"type": "save_build", "name": "My Rig", "destination": "draft"},
+    }
+    response = ConciergeResponse.model_validate(payload)
+    assert response.action.publish_immediately is False
+    assert response.action.author_notes is None
+
+
+def test_save_build_fast_track_first_message_with_draft_name_fires_immediately(monkeypatch):
+    """"save this as draft named Silent Beast" already answers BOTH
+    questions in one message -- the model must fire save_build on this VERY
+    FIRST turn, never ask "what name" / "draft or build" first."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Saved 'Silent Beast' as a draft.",
+        "action": {
+            "type": "save_build",
+            "name": "Silent Beast",
+            "destination": "draft",
+            "explanation": "Fast-track: name and destination given up front.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "save this as draft named Silent Beast",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["type"] == "save_build"
+    assert result["action"]["name"] == "Silent Beast"
+    assert result["action"]["destination"] == "draft"
+    assert "publish" not in result["reply"].lower()
+
+
+def test_save_build_fast_track_first_message_with_build_name_asks_only_about_publish(monkeypatch):
+    """"save this as a final build named Ultra Rig" already answers both
+    questions (a finished build, named Ultra Rig, via the unambiguous
+    "final build" qualifier) -- fires immediately, and since publishing
+    wasn't mentioned, the reply asks ONLY the one remaining question
+    (whether to publish), not the original name+destination pair again.
+    (A bare "save build named X" is deliberately NOT treated as unambiguous
+    fast-track wording -- see the destination-extraction rule in
+    SYSTEM_PROMPT intent 7 and spec.md §6.7 -- so this test uses a
+    qualified phrase that the prompt's own rule does commit to.)"""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Saved as 'Ultra Rig'! Would you like to publish it to the Community as well?",
+        "action": {
+            "type": "save_build",
+            "name": "Ultra Rig",
+            "destination": "build",
+            "explanation": "Fast-track: name and destination given up front.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "save this as a final build named Ultra Rig",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["destination"] == "build"
+    assert result["action"].get("publish_immediately") in (False, None)
+    assert "publish" in result["reply"].lower()
+
+
+def test_save_build_fast_track_first_message_with_publish_intent_fires_both_in_one_turn(monkeypatch):
+    """"save build as X and publish to community" gives ALL the information
+    needed for both actions in one message -- the model returns save_build
+    with publish_immediately: true, and the caller applies both writes in
+    the SAME turn with no second round-trip."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Saved 'Workstation' and published it to the Community!",
+        "action": {
+            "type": "save_build",
+            "name": "Workstation",
+            "destination": "build",
+            "publish_immediately": True,
+            "author_notes": None,
+            "explanation": "Fast-track: name, destination, and publish intent all given up front.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "save build as workstation and publish to community",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["destination"] == "build"
+    assert result["action"]["publish_immediately"] is True
+    assert "published" in result["reply"].lower()
 
 
 def test_publish_confirmation_no_answer_stays_action_null(monkeypatch):
@@ -1441,6 +1589,210 @@ def test_open_community_build_action_no_match_says_so_and_returns_null_action(mo
         "Open my Nonexistent Rig from community", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY
     )
     assert result["source"] == "llm"
+    assert result["action"] is None
+
+
+# ---------------------------------------------------------------------------
+# Intent 9: load an existing draft/build/community post into the studio
+# (load_saved_build) — distinct from load_build (a brand new build) and from
+# open_community_build (a read-only thread view).
+# ---------------------------------------------------------------------------
+def test_concierge_response_parses_load_saved_build_action():
+    for source in ("draft", "build", "community"):
+        payload = {
+            "reply": "Loaded it into the Build Studio for editing.",
+            "action": {"type": "load_saved_build", "source": source, "id": 1},
+        }
+        response = ConciergeResponse.model_validate(payload)
+        assert response.action is not None
+        assert response.action.type == "load_saved_build"
+        assert response.action.source == source
+        assert response.action.id == 1
+
+
+def test_load_saved_build_action_requires_source_field():
+    payload = {"reply": "Loading it.", "action": {"type": "load_saved_build", "id": 1}}
+    with pytest.raises(PydanticValidationError):
+        ConciergeResponse.model_validate(payload)
+
+
+def test_load_saved_build_action_rejects_invalid_source_value():
+    """`source` is a closed Literal — a value outside draft/build/community
+    must fail validation, the same precedent as every other closed Literal
+    in this module (navigate_to, filters.build_type, save_build.destination)."""
+    payload = {
+        "reply": "Loading it.",
+        "action": {"type": "load_saved_build", "source": "my_builds", "id": 1},
+    }
+    with pytest.raises(PydanticValidationError):
+        ConciergeResponse.model_validate(payload)
+
+
+def test_load_saved_build_draft_with_real_draft_id_passes_through(monkeypatch):
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Loaded 'pc-master-race' into the Build Studio for editing.",
+        "action": {"type": "load_saved_build", "source": "draft", "id": 101},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "open pc-master-race for editing",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        drafts_summary=DRAFTS_SUMMARY,
+        previous_builds_summary=PREVIOUS_BUILDS_SUMMARY,
+        current_page="drafts",
+    )
+    assert result["source"] == "llm"
+    assert result["action"] == {"type": "load_saved_build", "source": "draft", "id": 101}
+
+
+def test_load_saved_build_draft_with_unknown_draft_id_falls_back_to_heuristic(monkeypatch):
+    """Zero-hallucination guard: a draft_id not present in drafts_summary
+    must be rejected, never trusted — same precedent as every other id
+    cross-check in this module."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Loaded it.",
+        "action": {"type": "load_saved_build", "source": "draft", "id": 9999},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "open my draft called Nonexistent",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        drafts_summary=DRAFTS_SUMMARY,
+        previous_builds_summary=PREVIOUS_BUILDS_SUMMARY,
+    )
+    assert result["source"] == "heuristic"
+    assert result["action"] is None
+
+
+def test_load_saved_build_build_with_real_build_id_passes_through(monkeypatch):
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Loaded 'Ultra Rig' into the Build Studio for editing.",
+        "action": {"type": "load_saved_build", "source": "build", "id": 201},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "save build named Ultra Rig",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        drafts_summary=DRAFTS_SUMMARY,
+        previous_builds_summary=PREVIOUS_BUILDS_SUMMARY,
+        current_page="my_builds",
+    )
+    assert result["source"] == "llm"
+    assert result["action"] == {"type": "load_saved_build", "source": "build", "id": 201}
+
+
+def test_load_saved_build_build_with_unknown_build_id_falls_back_to_heuristic(monkeypatch):
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Loaded it.",
+        "action": {"type": "load_saved_build", "source": "build", "id": 9999},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "load my build called Nonexistent",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        drafts_summary=DRAFTS_SUMMARY,
+        previous_builds_summary=PREVIOUS_BUILDS_SUMMARY,
+    )
+    assert result["source"] == "heuristic"
+    assert result["action"] is None
+
+
+def test_load_saved_build_community_with_real_post_id_passes_through(monkeypatch):
+    """`source == "community"` is cross-checked against community_summary's
+    own `post_id` field — the exact same field open_community_build uses,
+    confirmed here to also gate this action correctly."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Loaded 'Budget 1440p Gaming Rig' into the Build Studio for editing.",
+        "action": {"type": "load_saved_build", "source": "community", "id": 1},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "edit this build",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        drafts_summary=DRAFTS_SUMMARY,
+        previous_builds_summary=PREVIOUS_BUILDS_SUMMARY,
+        current_page="community",
+        viewed_post_id=1,
+    )
+    assert result["source"] == "llm"
+    assert result["action"] == {"type": "load_saved_build", "source": "community", "id": 1}
+
+
+def test_load_saved_build_community_with_unknown_post_id_falls_back_to_heuristic(monkeypatch):
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Loaded it.",
+        "action": {"type": "load_saved_build", "source": "community", "id": 9999},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "edit the nonexistent community build",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        drafts_summary=DRAFTS_SUMMARY,
+        previous_builds_summary=PREVIOUS_BUILDS_SUMMARY,
+    )
+    assert result["source"] == "heuristic"
+    assert result["action"] is None
+
+
+def test_load_saved_build_no_match_says_so_and_returns_null_action(monkeypatch):
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "I couldn't identify the build to load. Please specify the exact name of the build.",
+        "action": None,
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "load my draft",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        drafts_summary=DRAFTS_SUMMARY,
+        previous_builds_summary=PREVIOUS_BUILDS_SUMMARY,
+    )
+    assert result["source"] == "llm"
+    assert result["action"] is None
+    assert "couldn't identify" in result["reply"].lower()
+
+
+def test_load_saved_build_with_empty_summaries_still_validates_safely(monkeypatch):
+    """drafts_summary/previous_builds_summary default to None -> [] inside
+    _build_payload -- confirm a load_saved_build action arriving with no
+    summaries at all (the caller passed neither) is correctly rejected as
+    unverifiable, never crashes with a missing-argument error."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Loaded it.",
+        "action": {"type": "load_saved_build", "source": "draft", "id": 101},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response("open pc-master-race for editing", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY)
+    assert result["source"] == "heuristic"
     assert result["action"] is None
 
 

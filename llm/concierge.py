@@ -7,11 +7,14 @@ for a name AND a destination first), then optionally publish it" flow
 existing budget-guardrail confirmation, by the model reading its own prior
 turn plus the user's new reply out of `conversation_history`, never via
 bespoke Python confirmation state. `save_build` is deliberately NOT
-zero-click (unlike `load_build`/`modify_build`/`navigate`/
-`open_community_build`): the model must ask for and receive both `name` and
-`destination` from the user across one or more turns before ever returning
-the action — see `llm.schemas.ConciergeSaveBuildAction`'s docstring and this
-module's SYSTEM_PROMPT intent 7 for the full flow. A `navigate` action
+zero-click by default (unlike `load_build`/`modify_build`/`navigate`/
+`open_community_build`/`load_saved_build`): the model must ask for and
+receive both `name` and `destination` from the user across one or more
+turns before ever returning the action — UNLESS the user's own message
+already unambiguously supplied both up front (the FAST-TRACK path), in
+which case it fires immediately on that same turn instead — see
+`llm.schemas.ConciergeSaveBuildAction`'s docstring and this module's
+SYSTEM_PROMPT intent 7 for the full flow. A `navigate` action
 leaving `create_build` performs NO database write of any kind — handled
 entirely on the `ui/` side (`ui.state.teardown_builder()`, called from
 `ui/components/chat_assistant.py`, resets session state only), never by
@@ -297,44 +300,82 @@ You handle eight kinds of requests:
    concern already handled by intent 4 (INCREMENTAL MODIFICATION REQUESTS) on a later, explicit request.
 
 7. SAVE & PUBLISH REQUESTS (e.g. "Save this PC to my list" — in English only, per the ENGLISH-ONLY RULE
-   below) — this is now a TWO-QUESTION, interactive flow. Never return a `save_build` action on the very
-   first "save this build" message — you must ask for and receive BOTH a name and a destination from the
-   user first.
+   below) — normally a TWO-QUESTION, interactive flow (name, then destination), but with a FAST-TRACK
+   shortcut whenever the user's own message already answers a question before you ask it — never make them
+   repeat information they already gave you.
 
-   STEP 1 (first "save this build" message): when `current_build_context` shows an ACTIVE build with at
-   least one component and the user is asking to save/persist it, do NOT return an action this turn. Ask
-   BOTH questions together in `reply` (natural phrasing is fine, but both parts must be asked): a version of
-   "What name would you like to give this build? Also, should I save it as an in-progress Draft or a
-   finished Build?" Return `action: null`. If `current_build_context` is `None`/empty (nothing to save), say
-   so plainly instead and return `action: null` — never invent a save against nothing.
+   EXTRACTING NAME/DESTINATION/PUBLISH-INTENT FROM A MESSAGE (the same extraction STEP 1 and STEP 2 below
+   both use against whichever message they're looking at):
+     - name: the user's own literal build name, if given verbatim anywhere in the message (e.g. "named
+       Beast Rig", "call it Ultra Rig", "as Silent Beast") — never invent or alter one.
+     - destination: `"draft"` for wording like "draft", "in progress", "in-progress", "wip", "work in
+       progress"; `"build"` for wording that clearly names the FINISHED-BUILD category, not the bare word
+       "build" on its own — "finished", "final", "finalize", "save it properly", "full build", "the real
+       thing", "a build"/"as a build" (with the article), "this as a build". The BARE word "build"/"builds"
+       with no such qualifier — "save build named X", "save my build", "save this build" — is NOT enough on
+       its own to count as destination wording: it is exactly as likely to just be the user referring to "the
+       PC I'm building" as it is to be choosing the Build category over Draft, so treat it as giving NO
+       destination at all (even though the name may still be extractable from the same message). Quick
+       contrast: "save this as a final build named Workstation" -> destination `"build"` (an unambiguous
+       qualifier); "save build named Ultra Rig" -> NO destination extracted (only a name — "build" here is
+       too ambiguous to guess from), ask "...Draft or a finished Build?" next; "save this as draft named Beast
+       Rig" -> destination `"draft"` (unambiguous). absent if the message contains neither.
+     - publish_immediately: `true` ONLY when destination is `"build"` AND the SAME message ALSO explicitly
+       asks to publish/share to Community in the same breath (e.g. "and publish it to the community", "and
+       share it", "make it public too") — never inferred, never guessed, and never `true` for a `"draft"`
+       destination (a draft has no publish path anywhere in this app's real architecture —
+       `community_repo.create_post`/`builds_repo.set_public` only ever operate on a real, finished `Build`
+       row; if the user asks to publish a draft anyway, still save it as a draft and gently note in `reply`
+       that drafts can't be published to Community).
+     - author_notes: the user's own verbatim description text ONLY if it's explicitly included in that SAME
+       message alongside the publish request (e.g. "...and publish it with the note 'built for 1440p
+       gaming'") — otherwise `null`. Do NOT compose one yourself here; composing your own is only for the
+       LATER, separate description follow-up question in the publish flow below.
 
-   STEP 2 (the user's reply to that question): resolved EXACTLY like the BUDGET GUARDRAIL RULE above resolves
-   its own yes/no follow-up — by reading your own immediately-preceding turn in `conversation_history` to
-   confirm you just asked the name+destination question, never by guessing this is what a new message means
-   out of context. Extract a name and a destination from the reply:
-     - Destination is "draft" for wording like "draft", "in progress", "in-progress", "wip", "work in
-       progress".
-     - Destination is "build" for wording like "build", "finished", "final", "finalize", "save it properly",
-       "full build", "the real thing".
+   STEP 1 (the FIRST "save this build" message): when `current_build_context` shows an ACTIVE build with at
+   least one component and the user is asking to save/persist it, run the extraction above against THIS
+   message and branch:
+     - FAST-TRACK (both a name AND a destination already given, e.g. "save this as draft named Beast Rig",
+       "save this as a final build named Workstation", "save as a final build named Workstation and publish
+       to community") -> do NOT ask anything — skip straight to returning the `save_build` action THIS turn,
+       using STEP 3's reply/action rules below (including `publish_immediately`/`author_notes` if extracted).
+     - PARTIAL (only a name, or only destination wording, but not both) -> ask ONLY for the single piece
+       that's still missing (e.g. "Got it — should '<name>' be saved as a Draft or a finished Build?" if
+       only the name was given; "What would you like to name this build?" if only destination wording was
+       given). Return `action: null`; the user's NEXT message answers this single missing-piece question —
+       apply the same "read your last turn" discipline as STEP 2 below to resolve it (their reply, combined
+       with what THIS turn already extracted, together give you both pieces).
+     - NEITHER (a bare "save this build"/"save this PC to my list" with no name or destination wording at
+       all) -> ask BOTH questions together, exactly as before, in `reply`: "What name would you like to give
+       this build? Also, should I save it as an in-progress Draft or a finished Build?" Return `action: null`.
+   If `current_build_context` is `None`/empty (nothing to save), say so plainly instead and return
+   `action: null` — never invent a save against nothing.
+
+   STEP 2 (a later message resolving a question STEP 1 or a prior STEP 2 turn asked): resolved EXACTLY like
+   the BUDGET GUARDRAIL RULE above resolves its own yes/no follow-up — by reading your own
+   immediately-preceding turn in `conversation_history` to confirm what you actually asked (the combined
+   question, or a specific still-missing piece), never by guessing this is what a new message means out of
+   context. Run the extraction rule above against the new message; combine it with whatever a PRIOR turn in
+   this same exchange already established (e.g. a name already given when only destination was missing).
    Then branch:
-     - The user's reply clearly gives you BOTH a name AND a destination -> return the `save_build` action
-       NOW, using their own literal answers verbatim (never invent, alter, or auto-generate either one):
-       `{"reply": "<see STEP 3 below>", "action": {"type": "save_build", "name": "<their exact name>",
-       "destination": "draft"|"build", "explanation": "<short note of what's being saved>"}}`.
-     - The user's reply gives you only ONE part (a name but no destination wording, or destination wording
-       but no name) -> do NOT guess the missing piece. Ask specifically, and only, for what's still missing
-       (e.g. "Got it — should I save it as a Draft or a finished Build?" if only the name was given). Return
-       `action: null` again, and apply this same "read your last turn" discipline to the user's NEXT message
-       (it is now answering the "what's still missing" question, not the original combined question).
+     - You now have BOTH a name AND a destination (between this turn and any prior one in the same
+       exchange) -> return the `save_build` action NOW, using STEP 3's reply/action rules below.
+     - Still only ONE part -> do NOT guess the missing piece. Ask specifically, and only, for what's still
+       missing. Return `action: null` again, and apply this same discipline to the user's NEXT message.
 
-   STEP 3 (the reply text for the turn the `save_build` action actually fires): this depends on
-   `destination`, since only a "build"-destination save has anything to publish (a draft has no publish path
-   anywhere in this app's real architecture — `community_repo.create_post`/`builds_repo.set_public` only
-   ever operate on a real, finished `Build` row, never a draft):
-     - `destination == "build"`: confirm the save AND ask about publishing, using the ACTUAL name the user
-       just gave you (you genuinely know it now — say it, don't hedge): "Saved as '<their exact name>'!
-       Would you like to publish it to the Community as well?" This opens the SAME publish follow-up flow
-       as before.
+   STEP 3 (the reply text/action for the turn `save_build` actually fires): use the user's own literal
+   name/destination verbatim (never invent, alter, or auto-generate either one):
+   `{"action": {"type": "save_build", "name": "<their exact name>", "destination": "draft"|"build",
+   "publish_immediately": <bool>, "author_notes": "<their exact text>"|null, "explanation": "<short note of
+   what's being saved>"}}`, with `reply` depending on `destination` and `publish_immediately` (only a
+   "build"-destination save has anything to publish — see the extraction rule above for why a draft never
+   does):
+     - `destination == "build"` AND `publish_immediately == true`: BOTH actions happen in this SAME turn —
+       confirm both in ONE short sentence, e.g. "Saved '<name>' and published it to the Community!" Do NOT
+       also ask the normal "would you like to publish?" follow-up question below — it already happened.
+     - `destination == "build"` AND `publish_immediately == false` (the ordinary case): confirm the save AND
+       ask about publishing, using the ACTUAL name you now know: "Saved as '<their exact name>'! Would you
+       like to publish it to the Community as well?" This opens the SAME publish follow-up flow as before.
      - `destination == "draft"`: confirm ONLY that the draft was saved under that name (e.g. "Saved '<their
        exact name>' as a draft.") and STOP there — do NOT ask about publishing at all in this case.
 
@@ -398,8 +439,32 @@ You handle eight kinds of requests:
    described, say so plainly in `reply` and return `action: null` — never invent a post_id for a build that
    isn't actually currently shared.
 
+9. LOAD AN EXISTING BUILD/DRAFT INTO THE STUDIO (e.g. "open pc-master-race for editing", "load my draft
+   Beast Rig", "edit this build", "let's work on Ultra Rig") — DIFFERENT from intent 3 (BUILD-ME REQUESTS,
+   which assembles a brand NEW build from named catalog parts) and from intent 8 (DEEP-LINK, which opens a
+   READ-ONLY thread view, never the editable studio): the user wants one specific, ALREADY-persisted
+   draft/saved-build/community-build loaded directly into Build Studio so they can view or edit it.
+   `current_page` tells you which page they're currently on (`"drafts"`, `"my_builds"`, `"community"`, or
+   another value); use it to pick the natural `source` when the request itself is ambiguous about which
+   list to search — on `"drafts"`, prefer `source: "draft"`; on `"my_builds"`, prefer `source: "build"`; on
+   `"community"`, prefer `source: "community"`. Explicit wording in the user's OWN message always overrides
+   this default (e.g. "load my DRAFT called X" is `source: "draft"` regardless of current page). When the
+   user says "this build"/"this post"/"this one" with no name at all while `viewed_post_id` is set (a
+   specific community thread is currently open), resolve directly to `source: "community", id:
+   <viewed_post_id>` — no name matching needed. Otherwise, match the given name (fuzzy/substring,
+   case-insensitive) against the relevant summary's `"name"` field (`drafts_summary` for `"draft"`,
+   `previous_builds_summary` for `"build"`) or `"title"` field (`community_summary` for `"community"`).
+   Once you've identified exactly one real match, return `{"type": "load_saved_build", "source":
+   "draft"|"build"|"community", "id": <that item's real id from the matching summary>}` with a short `reply`
+   confirming it, e.g. "Loaded '<name>' into the Build Studio for editing." If NO name was given and more
+   than one candidate exists in the relevant list (and `viewed_post_id` doesn't resolve it), or if a named
+   build genuinely isn't found in any relevant summary, do NOT guess or refuse outright — respond with
+   `action: null` and `reply` set to exactly: "I couldn't identify the build to load. Please specify the
+   exact name of the build." (If the relevant list is simply empty, say so plainly instead, e.g. "You don't
+   have any saved drafts yet.")
+
 ENGLISH-ONLY RULE: you only communicate in English. If the user writes in any other language, do not answer
-their request in that language and do not attempt any of the eight intents above for that message — reply,
+their request in that language and do not attempt any of the nine intents above for that message — reply,
 politely and concisely, in English only, that you currently only operate in English and ask them to
 rephrase their request in English. Return `action: null` in that case; do not guess at or partially fulfill
 a non-English request. This applies regardless of how well you understand the other language — the
@@ -411,7 +476,10 @@ Never make up an id, and never assign a real id to the wrong category. For `modi
 `quantities` MUST be `"RAM"` or `"Storage"` — never any other category. The same discipline applies to
 `open_community_build`: its `post_id` MUST be a real `"post_id"` value already present in `community_summary`
 as given to you this call — never an invented id, and never a post's `"build_id"` value used in place of its
-`"post_id"`.
+`"post_id"`. It also applies to `load_saved_build`: its `id` MUST be a real value already present in
+whichever summary matches its `source` (`drafts_summary`'s `"draft_id"` for `"draft"`,
+`previous_builds_summary`'s `"build_id"` for `"build"`, or `community_summary`'s `"post_id"` for
+`"community"`) — never an invented id, and never a value copied from the wrong summary or the wrong field.
 
 BUDGET GUARDRAIL RULE (checked BEFORE returning any `load_build`/`modify_build` action): this check only
 ever applies when `current_build_context["mode"] == "Budget"` AND `current_build_context` also carries a
@@ -506,6 +574,10 @@ def _build_payload(
     community_summary: list[dict],
     current_build_context: dict | None = None,
     advisory_context: dict | None = None,
+    drafts_summary: list[dict] | None = None,
+    previous_builds_summary: list[dict] | None = None,
+    current_page: str | None = None,
+    viewed_post_id: int | None = None,
 ) -> dict:
     return {
         "user_message": user_message,
@@ -514,6 +586,10 @@ def _build_payload(
         "community_summary": community_summary,
         "current_build_context": current_build_context or {},
         "advisory_context": advisory_context or {},
+        "drafts_summary": drafts_summary or [],
+        "previous_builds_summary": previous_builds_summary or [],
+        "current_page": current_page,
+        "viewed_post_id": viewed_post_id,
     }
 
 
@@ -574,7 +650,11 @@ _QUANTITY_ELIGIBLE_CATEGORIES = frozenset({"RAM", "Storage"})
 
 
 def _validate_action(
-    response: ConciergeResponse, catalog_summary: list[dict], community_summary: list[dict]
+    response: ConciergeResponse,
+    catalog_summary: list[dict],
+    community_summary: list[dict],
+    drafts_summary: list[dict] | None = None,
+    previous_builds_summary: list[dict] | None = None,
 ) -> None:
     """Post-parse hallucination/shape guard (authoritative — the SYSTEM_PROMPT
     rule is just a request, this is what actually enforces it), branching on
@@ -592,6 +672,12 @@ def _validate_action(
       against `community_summary` instead of `catalog_summary` (this action
       names no catalog id/category at all, so `catalog_summary` is irrelevant
       to it).
+    - `load_saved_build`: `id` must correspond to a REAL entry in whichever
+      summary matches `source` — `drafts_summary`'s `"draft_id"` for
+      `"draft"`, `previous_builds_summary`'s `"build_id"` for `"build"`, or
+      `community_summary`'s `"post_id"` for `"community"` (the exact same
+      field `open_community_build` cross-checks) — the same precedent as
+      every other id guard in this function.
     - `navigate`: nothing extra to check here — Pydantic's `Literal` on
       `navigate_to` already rejected an invalid page key at parse time. Its
       one remaining optional field needs nothing added here either:
@@ -633,6 +719,27 @@ def _validate_action(
         if action.post_id not in valid_post_ids:
             raise ConciergeUnavailableError(
                 f"Concierge open_community_build action references a non-existent post_id {action.post_id!r}"
+            )
+        return
+
+    if action.type == "load_saved_build":
+        if action.source == "draft":
+            valid_ids = {
+                entry.get("draft_id") for entry in (drafts_summary or []) if entry.get("draft_id") is not None
+            }
+        elif action.source == "build":
+            valid_ids = {
+                entry.get("build_id")
+                for entry in (previous_builds_summary or [])
+                if entry.get("build_id") is not None
+            }
+        else:  # "community"
+            valid_ids = {
+                entry.get("post_id") for entry in community_summary if entry.get("post_id") is not None
+            }
+        if action.id not in valid_ids:
+            raise ConciergeUnavailableError(
+                f"Concierge load_saved_build action references a non-existent {action.source} id {action.id!r}"
             )
         return
 
@@ -702,6 +809,10 @@ def get_concierge_response(
     community_summary: list[dict],
     current_build_context: dict | None = None,
     advisory_context: dict | None = None,
+    drafts_summary: list[dict] | None = None,
+    previous_builds_summary: list[dict] | None = None,
+    current_page: str | None = None,
+    viewed_post_id: int | None = None,
 ) -> dict:
     """Public entry point. `conversation_history` is
     `[{"role": "user"|"assistant", "content": str}, ...]` with the most recent
@@ -716,22 +827,40 @@ def get_concierge_response(
     (`{"pros", "cons", "within_budget", "stretch_budget", "source"}`) used to
     support the "analyze my build"/optimization-question intent without this
     module ever computing advisory data itself; pass `None` (the default)
-    when no advisory has been fetched for the active build.
+    when no advisory has been fetched for the active build. `drafts_summary`/
+    `previous_builds_summary` (each optional, default `None` -> sent as `[]`)
+    are the current user's own real `draft_builds`/`builds` rows
+    (`{"draft_id"/"build_id", "name", "mode"/"creation_mode"}`), pre-fetched
+    by the caller the same way `catalog_summary`/`community_summary` are —
+    this module never queries `db.repositories` itself — and exist to
+    support `load_saved_build` (below). `current_page` (optional) is the
+    real `st.session_state["page"]` value, and `viewed_post_id` (optional)
+    is `st.session_state["selected_post_id"]` when a specific community
+    post's thread is currently open — both let the model resolve
+    page-relative phrasing like "load this draft" or "edit this build"
+    without the user having to restate a name.
 
     A `save_build` action requests a real persist of the CURRENT build draft
     under the user's own chosen `name`/`destination` (the caller does this via
     `db.repositories.drafts_repo.save_draft` for `destination == "draft"`, or
     `db.repositories.builds_repo.create_build` for `destination == "build"`)
-    — but only fires once the model has actually asked for and received both
+    — normally only fires once the model has asked for and received both
     values from the user (see `llm.schemas.ConciergeSaveBuildAction`'s
     docstring; earlier turns of the same request return `action: null` while
-    still gathering that information). A `publish_build` action, arriving on
-    a LATER turn after a "build"-destination save's "would you like to
-    publish?" follow-up resolves to "yes", requests that build be shared to
-    the community (`builds_repo.set_public` + `community_repo.create_post`)
-    — this module never performs either write itself (no database access),
-    and never knows which real build id a prior save produced; the caller
-    tracks that in its own session state (see `ui/CLAUDE.md`'s
+    still gathering that information), UNLESS the user's own message already
+    unambiguously supplied both up front (the FAST-TRACK path — see
+    SYSTEM_PROMPT's SAVE & PUBLISH REQUESTS intent), in which case it fires
+    on that very first turn instead. A `"build"`-destination save with
+    `publish_immediately: true` (only ever set when the SAME message also
+    explicitly asked to publish) additionally shares it to the community in
+    the SAME turn, with no separate `publish_build` round-trip needed. A
+    `publish_build` action, arriving on a LATER turn after a
+    "build"-destination save's "would you like to publish?" follow-up
+    resolves to "yes", requests that build be shared to the community
+    (`builds_repo.set_public` + `community_repo.create_post`) — this module
+    never performs either write itself (no database access), and never
+    knows which real build id a prior save produced; the caller tracks that
+    in its own session state (see `ui/CLAUDE.md`'s
     `concierge_last_saved_build` key) and resolves it when applying a
     `publish_build` action. A "draft"-destination save never sets that key
     and never leads to a publish follow-up — a draft has no publish path.
@@ -741,21 +870,28 @@ def get_concierge_response(
     `community_summary`'s real `post_id` values (never a `build_id` -- see
     `llm.schemas.ConciergeOpenCommunityBuildAction`'s docstring); the caller
     applies it by setting `st.session_state["page"] = "community"` and
-    `st.session_state["selected_post_id"] = action["post_id"]`. A `navigate`
-    action leaving `create_build` performs NO database write of any kind --
-    entirely a `ui/` concern (`ui.state.teardown_builder()`, session-state
-    reset only), not something this module decides or a field on the action
-    itself (see `llm.schemas.ConciergeNavigateAction`'s docstring, spec.md
-    §7.9).
+    `st.session_state["selected_post_id"] = action["post_id"]`. A
+    `load_saved_build` action loads an EXISTING draft/saved build/community
+    post's build directly into the Build Studio for editing -- distinct from
+    `load_build` (a brand NEW build from named catalog parts) and from
+    `open_community_build` (a READ-ONLY thread view) -- resolved against
+    `drafts_summary`/`previous_builds_summary`/`community_summary` per its
+    `source` field (see `llm.schemas.ConciergeLoadSavedBuildAction`'s
+    docstring). A `navigate` action leaving `create_build` performs NO
+    database write of any kind -- entirely a `ui/` concern
+    (`ui.state.teardown_builder()`, session-state reset only), not something
+    this module decides or a field on the action itself (see
+    `llm.schemas.ConciergeNavigateAction`'s docstring, spec.md §7.9).
 
     Never raises. Returns
     {"reply": str,
      "action": {"type": "load_build", "components": {category: component_id}, "explanation": str}
               | {"type": "modify_build", "components": {category: component_id}, "quantities": {category: int}, "explanation": str}
               | {"type": "navigate", "navigate_to": "landing" | "create_build" | "my_builds" | "community" | "drafts", "reset_mode": bool}
-              | {"type": "save_build", "name": str, "destination": "draft" | "build", "explanation": str}
+              | {"type": "save_build", "name": str, "destination": "draft" | "build", "publish_immediately": bool, "author_notes": str | None, "explanation": str}
               | {"type": "publish_build", "author_notes": str | None}
               | {"type": "open_community_build", "post_id": int}
+              | {"type": "load_saved_build", "source": "draft" | "build" | "community", "id": int}
               | None,
      "source": "llm" | "heuristic"}.
     """
@@ -767,11 +903,15 @@ def get_concierge_response(
             community_summary,
             current_build_context,
             advisory_context,
+            drafts_summary,
+            previous_builds_summary,
+            current_page,
+            viewed_post_id,
         )
         raw = _call_openrouter(payload)
         raw = _coerce_component_id_shapes(raw)
         response = ConciergeResponse.model_validate(raw)
-        _validate_action(response, catalog_summary, community_summary)
+        _validate_action(response, catalog_summary, community_summary, drafts_summary, previous_builds_summary)
     except (ConciergeUnavailableError, PydanticValidationError):
         return _heuristic_response()
     except Exception:

@@ -304,6 +304,24 @@ class ConciergeSaveBuildAction(BaseModel):
     type: Literal["save_build"] = "save_build"
     name: str
     destination: Literal["draft", "build"]
+    # FAST-TRACK refinement (only meaningful when destination == "build" —
+    # a draft has no publish path anywhere in this app's real architecture,
+    # per this class's own docstring): true only when the user's OWN message
+    # that triggered this action ALSO explicitly asked to publish/share to
+    # Community in the same breath (e.g. "save build as X and publish it to
+    # the community"), never inferred or guessed. Lets `save_build` and the
+    # publish step both apply in ONE turn without a second round-trip,
+    # instead of requiring the normal "Saved! Would you like to publish it
+    # too?" follow-up question — see SYSTEM_PROMPT's SAVE & PUBLISH REQUESTS
+    # intent for exactly which phrasing qualifies. `author_notes` (only
+    # meaningful together with `publish_immediately: true`) carries the
+    # user's own verbatim description text ONLY if they also supplied one in
+    # that same message; left `null` otherwise (never invented) — the model
+    # does NOT compose one for this fast-track path (unlike the normal
+    # publish flow's later, explicit "generate one for me" request), since
+    # nothing here asked it to.
+    publish_immediately: bool = False
+    author_notes: str | None = None
     # Optional — see ConciergeLoadBuildAction's identical field for why.
     # `name`/`destination` stay REQUIRED (the actual load-bearing fields for
     # this action's whole interactive-first design) — only this vestigial,
@@ -378,6 +396,36 @@ class ConciergeOpenCommunityBuildAction(BaseModel):
     post_id: int
 
 
+class ConciergeLoadSavedBuildAction(BaseModel):
+    """Loads an EXISTING, already-persisted draft, previously-saved build, or
+    community post's build directly into the Build Studio for viewing or
+    editing (e.g. "open pc-master-race for editing", "load my draft Beast
+    Rig", "edit this build") — distinct from `ConciergeLoadBuildAction`
+    (which assembles a brand NEW build from named catalog parts, never an
+    existing saved row) and from `ConciergeOpenCommunityBuildAction` (which
+    deep-links to a post's READ-ONLY thread view, never into the editable
+    studio).
+
+    `source` + `id` together name exactly one real, already-persisted row —
+    the model never invents either. ZERO-HALLUCINATION: `id` must already be
+    present in whichever caller-supplied summary matches `source` —
+    `drafts_summary` (`"draft_id"` field) for `"draft"`,
+    `previous_builds_summary` (`"build_id"` field) for `"build"`, or
+    `community_summary` (`"post_id"` field, the SAME field
+    `ConciergeOpenCommunityBuildAction` uses) for `"community"` — enforced
+    both by the system prompt's instruction and, authoritatively, by
+    `llm/concierge.py::_validate_action`'s post-parse guard, the same
+    precedent as every other action type's id cross-check in this module. If
+    nothing in the relevant summary matches what the user described (or the
+    request is ambiguous — no name given while multiple candidates exist),
+    the model must say so plainly in `reply` and return `action: null`
+    instead of inventing an id."""
+
+    type: Literal["load_saved_build"] = "load_saved_build"
+    source: Literal["draft", "build", "community"]
+    id: int
+
+
 class ConciergeResponse(BaseModel):
     """Response shape for the Concierge chat feature (see llm/concierge.py).
     `reply` is always present (conversational answer to the user's message).
@@ -389,19 +437,24 @@ class ConciergeResponse(BaseModel):
     (`save_build`, only returned once the model has actually gathered BOTH a
     `name` and a `destination` from the user across one or more turns — see
     `ConciergeSaveBuildAction`'s docstring), a later-turn confirmation to
-    publish a just-saved "build"-destination save (`publish_build`), or a
+    publish a just-saved "build"-destination save (`publish_build`), a
     request to deep-link straight to one specific, already-shared community
     build's thread view (`open_community_build`, resolved against
     `community_summary`'s real `post_id` values — see
-    `ConciergeOpenCommunityBuildAction`'s docstring); it is `None` for
+    `ConciergeOpenCommunityBuildAction`'s docstring), or a request to load an
+    EXISTING draft/saved build/community post directly into the Build Studio
+    for editing (`load_saved_build`, resolved against `drafts_summary`/
+    `previous_builds_summary`/`community_summary` — see
+    `ConciergeLoadSavedBuildAction`'s docstring); it is `None` for
     catalog-question, community-recommendation, and optimization/analysis
     intents, and also `None` (with `reply` saying so) when a named part could
     not be found in `catalog_summary` at all, when a modify/save request has
     no active build to act on, when no post in `community_summary` matches a
-    requested deep-link target, or when a mid-flow reply is still gathering
-    information (e.g. asking for the still-missing name or destination,
-    asking whether to publish, or asking for a description) before there's
-    anything to act on yet."""
+    requested deep-link target, when no item in the relevant summary matches
+    a requested load-into-studio target (or the request is ambiguous), or
+    when a mid-flow reply is still gathering information (e.g. asking for
+    the still-missing name or destination, asking whether to publish, or
+    asking for a description) before there's anything to act on yet."""
 
     reply: str
     action: (
@@ -411,6 +464,7 @@ class ConciergeResponse(BaseModel):
         | ConciergeSaveBuildAction
         | ConciergePublishBuildAction
         | ConciergeOpenCommunityBuildAction
+        | ConciergeLoadSavedBuildAction
         | None
     ) = None
     source: Literal["llm", "heuristic"] = "llm"

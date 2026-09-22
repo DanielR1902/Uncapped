@@ -32,19 +32,30 @@ builder without using it simply discards the in-progress build, the same
 tradeoff a plain "close the tab" would have.
 
 `save_build`/`publish_build` are different: `save_build` is deliberately NOT
-zero-click — the Concierge must first ask the user for both a `name` and a
-`destination` ("draft" or "build") and wait for their answer across one or
-more turns before this action is ever returned (see
+zero-click by default — the Concierge must first ask the user for both a
+`name` and a `destination` ("draft" or "build") and wait for their answer
+across one or more turns before this action is ever returned (see
 `llm.schemas.ConciergeSaveBuildAction`'s docstring and `llm/concierge.py`'s
-SYSTEM_PROMPT intent 7); this module only ever receives the action once that
-information has already been gathered. Once it does arrive, THIS module
-still applies it immediately with no separate confirmation click of its own
-— the "confirmation" already happened conversationally. `destination ==
+SYSTEM_PROMPT intent 7) — UNLESS the user's own message already
+unambiguously supplied both up front, the FAST-TRACK path, in which case it
+fires on that very first turn instead; this module only ever receives the
+action once the model has determined (via either path) that it has both
+pieces. Once it does arrive, THIS module still applies it immediately with
+no separate confirmation click of its own — the "confirmation" already
+happened conversationally (or was never needed, on the fast-track path,
+since the user stated their full intent unprompted). `destination ==
 "draft"` writes to the real `draft_builds` table via `drafts_repo.save_draft`
 (there is no `saved_builds` table anywhere in this app); `destination ==
 "build"` mirrors `ui/views/create_build.py::_save_actions`'s own real
-`builds_repo.create_build` call exactly. `publish_build` mirrors that same
-function's `community_repo.create_post` call. This is acceptable specifically
+`builds_repo.create_build` call exactly, and additionally applies
+`builds_repo.set_public` + `community_repo.create_post` in the SAME turn
+when the action's `publish_immediately` field is `true` (only ever set when
+the user's OWN message that triggered the save ALSO explicitly asked to
+publish in the same breath — never inferred) — skipping the separate
+"would you like to publish?" round-trip entirely for that case.
+`publish_build` (the separate, later action reachable after an ORDINARY
+"build"-destination save) mirrors that same `community_repo.create_post`
+call. This is acceptable specifically
 because it's the user's own explicit, direct request acting on their own
 account's own data — the same trust boundary as them clicking "Save
 build"/"Share to Community" themselves. The multi-turn "save (name +
@@ -99,6 +110,27 @@ and `ui/views/community.py::render()` already checks `selected_post_id` at
 the very top of its own function, so no further wiring is needed in that
 module for this to land directly on the post's thread view on the next
 render.
+
+A `load_saved_build` action loads an EXISTING, already-persisted draft,
+previously-saved build, or community post's build directly into Build
+Studio for editing — distinct from `load_build` (a brand NEW build from
+named catalog parts) and from `open_community_build` above (a READ-ONLY
+thread view). `_drafts_summary()`/`_previous_builds_summary()` are two more
+pre-fetched, per-call summaries (same shape/precedent as `_catalog_summary`/
+`_community_summary`) giving the model the current user's own real
+`draft_builds`/`builds` rows to resolve `source`/`id` against — cross-checked
+by `llm/concierge.py::_validate_action` the same way `open_community_build`'s
+`post_id` already is. `current_page`/`viewed_post_id` (the real
+`st.session_state["page"]`/`["selected_post_id"]`, the latter only sent when
+on the `"community"` page) are also handed to the model on every call so it
+can resolve page-relative phrasing ("load this draft", "edit this build")
+without the user restating a name. Applying it reuses `ui.state.
+load_components_into_new_draft` — the SAME shared helper `ui/views/
+drafts.py`'s "Load into Builder", `community.py::_fork_into_studio`, and
+`my_builds.py::_clone_into_studio` all use — and, like every other "enter
+the studio" transition, calls `ui.state.teardown_builder()` first when
+already on `create_build` (spec.md §7.9, no database write) so an unsaved
+in-progress build is never silently mixed with what's being loaded.
 
 `_advisory_context` supplies the Concierge with a pre-fetched, synthesizable
 `get_build_advisory` result (`llm/concierge.py` cannot call `llm.advisory`
@@ -177,6 +209,7 @@ is meaningful there) or when the action no-ops (no active draft / empty
 from __future__ import annotations
 
 import html
+import json
 import re
 import sys
 import traceback
@@ -305,6 +338,33 @@ def _community_summary() -> list[dict]:
             "author_notes": post.author_notes,
         }
         for post in posts
+    ]
+
+
+def _drafts_summary() -> list[dict]:
+    """The current user's own `draft_builds` rows — real ids the Concierge's
+    `load_saved_build` action (`source == "draft"`) is cross-checked against
+    by `llm/concierge.py::_validate_action`, the same zero-hallucination
+    precedent as `_community_summary()`'s `post_id`."""
+    user = current_user()
+    if user is None:
+        return []
+    return [
+        {"draft_id": draft.id, "name": draft.name, "mode": draft.mode}
+        for draft in drafts_repo.get_user_drafts(user["id"])
+    ]
+
+
+def _previous_builds_summary() -> list[dict]:
+    """The current user's own real, finished `builds` rows (§3.4) — real ids
+    the Concierge's `load_saved_build` action (`source == "build"`) is
+    cross-checked against, same precedent as `_drafts_summary()` above."""
+    user = current_user()
+    if user is None:
+        return []
+    return [
+        {"build_id": build.id, "name": build.name, "creation_mode": build.creation_mode}
+        for build in builds_repo.get_builds_for_user(user["id"])
     ]
 
 
@@ -524,6 +584,73 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         st.session_state["selected_post_id"] = action.get("post_id")
         return None
 
+    if action_type == "load_saved_build":
+        # Loading an EXISTING draft/saved-build/community-build into the
+        # studio for editing — distinct from load_build (a brand new build
+        # from named catalog parts) and open_community_build (a read-only
+        # thread view). `id` is already guaranteed real by llm/concierge.py's
+        # own zero-hallucination guard, cross-checked against whichever of
+        # drafts_summary/previous_builds_summary/community_summary this
+        # module sent it for the matching `source`. Same builder reset as
+        # any other "enter the studio" transition (spec.md §7.9, no database
+        # write) before loading the new content, so an unsaved in-progress
+        # build is never silently mixed with what's being loaded.
+        if st.session_state.get("page") == "create_build":
+            state.teardown_builder()
+
+        source = action.get("source")
+        item_id = action.get("id")
+        new_draft = None
+
+        if source == "draft":
+            draft = drafts_repo.get_draft(item_id)
+            if draft is not None:
+                new_draft = state.load_components_into_new_draft(
+                    mode=draft.mode,
+                    components=json.loads(draft.components_json),
+                    quantities=json.loads(draft.quantities_json),
+                    name=draft.name,
+                )
+                st.session_state["create_mode"] = draft.mode
+        elif source == "build":
+            build = builds_repo.get_build(item_id)
+            if build is not None:
+                new_draft = state.load_components_into_new_draft(
+                    mode=build.creation_mode,
+                    components={bc.category: bc.component_id for bc in build.components},
+                    quantities={bc.category: bc.quantity for bc in build.components},
+                    name=f"{build.name} (copy)",
+                )
+                new_draft["workload_profile"] = build.workload_profile
+                new_draft["budget_ceiling"] = build.budget_ceiling
+                st.session_state["create_mode"] = build.creation_mode
+        else:  # "community"
+            post = community_repo.get_post(item_id)
+            if post is not None:
+                build = post.build
+                new_draft = state.load_components_into_new_draft(
+                    mode=build.creation_mode or "Free",
+                    components={bc.category: bc.component_id for bc in build.components},
+                    quantities={bc.category: bc.quantity for bc in build.components},
+                    name=f"{build.name} (fork)",
+                )
+                new_draft["workload_profile"] = build.workload_profile
+                new_draft["budget_ceiling"] = build.budget_ceiling
+                st.session_state["fork_source_build_id"] = build.id
+                st.session_state["create_mode"] = build.creation_mode or "Free"
+
+        if new_draft is None:
+            # The zero-hallucination guard already rejects an id that never
+            # existed in the summary sent this call, so this only fires for
+            # the (should be rare) case of a row deleted between that
+            # summary being assembled and this action being applied.
+            return None
+
+        st.session_state["build_draft"] = new_draft
+        st.session_state["build_draft_analysis"] = None
+        st.session_state["page"] = "create_build"
+        return None
+
     if action_type == "save_build":
         build_draft = st.session_state.get("build_draft")
         if not build_draft:
@@ -580,6 +707,16 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         )
         st.session_state["concierge_last_saved_build"] = {"build_id": build.id, "name": name}
         st.session_state["has_unsaved_build_changes"] = False
+        # FAST-TRACK refinement (llm.schemas.ConciergeSaveBuildAction): only
+        # ever true when the user's OWN message that triggered this save
+        # ALSO explicitly asked to publish/share to Community in the same
+        # breath — publishes in this SAME turn, mirroring the SAME
+        # builds_repo.set_public + community_repo.create_post pair the
+        # separate, later `publish_build` action below uses, so the user
+        # never has to wait for a second round-trip they already answered.
+        if action.get("publish_immediately"):
+            builds_repo.set_public(build.id, True)
+            community_repo.create_post(build.id, user["id"], name, action.get("author_notes"))
         return None
 
     if action_type == "publish_build":
@@ -674,6 +811,14 @@ def render_concierge_widget() -> None:
                     _community_summary(),
                     current_build_context=_current_build_context(),
                     advisory_context=_advisory_context(user_input),
+                    drafts_summary=_drafts_summary(),
+                    previous_builds_summary=_previous_builds_summary(),
+                    current_page=st.session_state.get("page"),
+                    viewed_post_id=(
+                        st.session_state.get("selected_post_id")
+                        if st.session_state.get("page") == "community"
+                        else None
+                    ),
                 )
             # Apply BEFORE finalizing the assistant message so the real,
             # Python-computed total (if any) is available to append to the

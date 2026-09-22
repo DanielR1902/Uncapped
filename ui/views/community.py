@@ -26,23 +26,23 @@ def _post_subtitle(build, created_at) -> str:
 
 
 def _fork_into_studio(build) -> None:
-    draft = state.new_build_draft(build.creation_mode or "Free")
-    draft["name"] = f"{build.name} (fork)"
+    draft = state.load_components_into_new_draft(
+        mode=build.creation_mode or "Free",
+        components={bc.category: bc.component_id for bc in build.components},
+        # A real, confirmed gap fixed alongside this refactor: the previous
+        # direct-dict-literal version never carried quantities over at all,
+        # so a RAM/Storage build with 2x+ units silently reverted to 1x on
+        # fork. `load_components_into_new_draft` accepts them directly.
+        quantities={bc.category: bc.quantity for bc in build.components},
+        name=f"{build.name} (fork)",
+    )
     draft["workload_profile"] = build.workload_profile
     draft["budget_ceiling"] = build.budget_ceiling
-    draft["components"] = {bc.category: bc.component_id for bc in build.components}
 
     st.session_state["fork_source_build_id"] = build.id
     st.session_state["build_draft"] = draft
     st.session_state["create_mode"] = build.creation_mode or "Free"
     st.session_state["build_draft_analysis"] = None
-    # Unlike ui/views/drafts.py's "Load into Builder" (which replays
-    # components through state.set_component/set_quantity — each of which
-    # already sets this flag), this function writes draft["components"] as a
-    # direct dict literal, bypassing those setters entirely. Set explicitly
-    # here so a freshly-forked build is correctly tracked as having unsaved
-    # picks, consistent with every other way a build_draft gets populated.
-    st.session_state["has_unsaved_build_changes"] = True
     st.session_state["page"] = "create_build"
     st.rerun()
 
