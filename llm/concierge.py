@@ -162,7 +162,11 @@ You handle eight kinds of requests:
    style request against a build that isn't empty is intent 4's job (see intent 4's COMPLETING/FINISHING AN
    EXISTING BUILD rule below), even though it superficially looks like a from-scratch build-me request; this
    intent (`load_build`) is reserved for building something genuinely NEW, discarding whatever (if anything)
-   was already active. For every part the
+   was already active. It is likewise NEVER the right intent for a request to SAVE/persist/clone an EXISTING
+   build — including a community post the user is currently viewing (e.g. "save the build I'm looking at to
+   my drafts") — even when `current_build_context` is empty and there is nothing obviously active in the
+   Studio: that phrasing is intent 7's job (see its SOURCE RESOLUTION rule), never a cue to generate a brand
+   new build from scratch. For every part the
    user named, resolve it to a real entry in `catalog_summary` using fuzzy/substring, case-insensitive
    matching on `name` (e.g. "RTX 4070" should match a catalog entry whose name contains "RTX 4070"). Fill
    in every REMAINING unmentioned core category — CPU, Motherboard, GPU, RAM, Storage, PSU, Case, Cooler —
@@ -304,6 +308,32 @@ You handle eight kinds of requests:
    shortcut whenever the user's own message already answers a question before you ask it — never make them
    repeat information they already gave you.
 
+   SOURCE RESOLUTION (which build's data actually gets saved — resolved BEFORE the name/destination
+   extraction below, and independently of it): by default the source is your own active Studio build,
+   `current_build_context` — exactly like every save request before this rule existed, and by far the
+   common case. But when `current_page == "community"` and the user is asking to save/persist/clone/add-to-
+   my-drafts a build they are VIEWING there — not their own in-progress Studio build — e.g. "save the build
+   I'm looking at to my drafts", "save this to my builds", "clone this community build and save it", "add
+   this one to my drafts" — resolve a COMMUNITY source instead, using the exact same matching rule intent 9
+   (LOAD AN EXISTING BUILD/DRAFT INTO THE STUDIO) uses for its own `source: "community"` case: if
+   `viewed_post_id` is set (a specific post's thread is open) and the user says "this"/"it"/"the build I'm
+   looking at" with no distinguishing title, resolve directly to that post — no name matching needed;
+   otherwise fuzzy-match a named title against `community_summary`. Once resolved to exactly one real post,
+   carry it forward as `source: "community", source_post_id: <that post's real "post_id">` on the eventual
+   `save_build` action (STEP 3 below) — the destination ("draft" or "build") and its name are still asked
+   for/extracted completely independently, exactly as the rest of this intent already describes; only WHERE
+   the components/quantities come from changes. If NO name was given and more than one candidate exists (and
+   `viewed_post_id` doesn't resolve it), or a named community build genuinely isn't found, do NOT guess and
+   do NOT fall back to treating this as intent 3 (BUILD-ME REQUESTS) — a request to save/clone an EXISTING
+   build (whether the user's own Studio draft or a community post they're looking at) must NEVER be answered
+   with a brand-new-build-generation action; that intent is reserved for requests like "build me a gaming
+   PC", never for "save this one." Instead respond exactly like intent 9's own no-match case: ask the user to
+   open the specific post first or give its exact title, and return `action: null`. This SOURCE RESOLUTION
+   re-runs fresh on EVERY turn of this flow (STEP 1 and STEP 2 alike) from `current_page`/`viewed_post_id`/
+   `community_summary` as given THAT call — there is no separate cross-turn memory to maintain here, since
+   those three values are simply resent, unchanged, on the user's very next message as long as they haven't
+   actually navigated away from that same community post.
+
    EXTRACTING NAME/DESTINATION/PUBLISH-INTENT FROM A MESSAGE (the same extraction STEP 1 and STEP 2 below
    both use against whichever message they're looking at):
      - name: the user's own literal build name, if given verbatim anywhere in the message (e.g. "named
@@ -332,9 +362,10 @@ You handle eight kinds of requests:
        gaming'") — otherwise `null`. Do NOT compose one yourself here; composing your own is only for the
        LATER, separate description follow-up question in the publish flow below.
 
-   STEP 1 (the FIRST "save this build" message): when `current_build_context` shows an ACTIVE build with at
-   least one component and the user is asking to save/persist it, run the extraction above against THIS
-   message and branch:
+   STEP 1 (the FIRST "save this build" message): when EITHER `current_build_context` shows an ACTIVE build
+   with at least one component, OR the SOURCE RESOLUTION rule above resolves this to a specific community
+   post, and the user is asking to save/persist it, run the extraction above against THIS message and
+   branch:
      - FAST-TRACK (both a name AND a destination already given, e.g. "save this as draft named Beast Rig",
        "save this as a final build named Workstation", "save as a final build named Workstation and publish
        to community") -> do NOT ask anything — skip straight to returning the `save_build` action THIS turn,
@@ -348,8 +379,9 @@ You handle eight kinds of requests:
      - NEITHER (a bare "save this build"/"save this PC to my list" with no name or destination wording at
        all) -> ask BOTH questions together, exactly as before, in `reply`: "What name would you like to give
        this build? Also, should I save it as an in-progress Draft or a finished Build?" Return `action: null`.
-   If `current_build_context` is `None`/empty (nothing to save), say so plainly instead and return
-   `action: null` — never invent a save against nothing.
+   If `current_build_context` is `None`/empty AND the SOURCE RESOLUTION rule doesn't resolve a community
+   post either (nothing at all to save), say so plainly instead and return `action: null` — never invent a
+   save against nothing, and never substitute a `load_build` (BUILD-ME) action for it.
 
    STEP 2 (a later message resolving a question STEP 1 or a prior STEP 2 turn asked): resolved EXACTLY like
    the BUDGET GUARDRAIL RULE above resolves its own yes/no follow-up — by reading your own
@@ -366,8 +398,10 @@ You handle eight kinds of requests:
    STEP 3 (the reply text/action for the turn `save_build` actually fires): use the user's own literal
    name/destination verbatim (never invent, alter, or auto-generate either one):
    `{"action": {"type": "save_build", "name": "<their exact name>", "destination": "draft"|"build",
-   "publish_immediately": <bool>, "author_notes": "<their exact text>"|null, "explanation": "<short note of
-   what's being saved>"}}`, with `reply` depending on `destination` and `publish_immediately` (only a
+   "publish_immediately": <bool>, "author_notes": "<their exact text>"|null, "source": "studio"|"community",
+   "source_post_id": <int>|null, "explanation": "<short note of what's being saved>"}}` — `source`/
+   `source_post_id` come from the SOURCE RESOLUTION rule above (omit/leave `source_post_id` `null` for the
+   ordinary `"studio"` case), with `reply` depending on `destination` and `publish_immediately` (only a
    "build"-destination save has anything to publish — see the extraction rule above for why a draft never
    does):
      - `destination == "build"` AND `publish_immediately == true`: BOTH actions happen in this SAME turn —
@@ -480,6 +514,8 @@ as given to you this call — never an invented id, and never a post's `"build_i
 whichever summary matches its `source` (`drafts_summary`'s `"draft_id"` for `"draft"`,
 `previous_builds_summary`'s `"build_id"` for `"build"`, or `community_summary`'s `"post_id"` for
 `"community"`) — never an invented id, and never a value copied from the wrong summary or the wrong field.
+It also applies to a `save_build` action whose `source == "community"`: its `source_post_id` MUST likewise be
+a real `"post_id"` value already present in `community_summary` as given to you this call.
 
 BUDGET GUARDRAIL RULE (checked BEFORE returning any `load_build`/`modify_build` action): this check only
 ever applies when `current_build_context["mode"] == "Budget"` AND `current_build_context` also carries a
@@ -696,11 +732,16 @@ def _validate_action(
       rather than crashing), not this guard. (This action no longer carries a
       `save_as_draft` field at all — that field was removed from the schema
       entirely, so there is nothing left here to reason about for it.)
-    - `save_build`: nothing to cross-check here either. Unlike `load_build`/
-      `modify_build`, this action carries no LLM-supplied catalog ids or
-      categories at all — it acts entirely on `current_build_context`, which
-      is already known-real data assembled by the caller (`ui/`), not
-      something the model asserted and this guard would need to verify.
+    - `save_build`: nothing to cross-check when `source == "studio"` (the
+      default) — unlike `load_build`/`modify_build`, it carries no LLM-
+      supplied catalog ids or categories at all in that case, only acting on
+      `current_build_context`, already known-real data assembled by the
+      caller (`ui/`). When `source == "community"`, though, `source_post_id`
+      IS an LLM-asserted id and MUST correspond to a REAL entry in
+      `community_summary`'s own `"post_id"` field — the exact same guard
+      `open_community_build`/`load_saved_build` apply to their own post/build
+      ids, applied here for the same reason (never trust the model's stated
+      id without cross-checking it against the real, caller-supplied list).
     - `publish_build`: same reasoning as `save_build` — it carries only an
       optional free-text `author_notes` string, nothing that references the
       catalog or could be hallucinated in a way this guard could catch.
@@ -709,7 +750,19 @@ def _validate_action(
     get_concierge_response's existing except block funnels it into the same
     heuristic fallback as any other failure mode."""
     action = response.action
-    if action is None or action.type in ("navigate", "save_build", "publish_build"):
+    if action is None or action.type in ("navigate", "publish_build"):
+        return
+
+    if action.type == "save_build":
+        if action.source == "community":
+            valid_post_ids = {
+                entry.get("post_id") for entry in community_summary if entry.get("post_id") is not None
+            }
+            if action.source_post_id not in valid_post_ids:
+                raise ConciergeUnavailableError(
+                    f"Concierge save_build action references a non-existent source_post_id "
+                    f"{action.source_post_id!r}"
+                )
         return
 
     if action.type == "open_community_build":

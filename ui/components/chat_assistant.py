@@ -55,7 +55,19 @@ publish in the same breath — never inferred) — skipping the separate
 "would you like to publish?" round-trip entirely for that case.
 `publish_build` (the separate, later action reachable after an ORDINARY
 "build"-destination save) mirrors that same `community_repo.create_post`
-call. This is acceptable specifically
+call. `save_build`'s `source` field (`"studio"` by default, or `"community"`)
+picks WHICH build's components/quantities/scores actually get persisted:
+`"studio"` reads `st.session_state["build_draft"]` exactly as described
+above; `"community"` instead reads a specific, ALREADY-shared
+`CommunityPost`'s own `Build` row (`action["source_post_id"]`, zero-
+hallucination-guarded by `llm/concierge.py` against `community_summary`,
+exactly like `open_community_build`/`load_saved_build`) — for a request like
+"save the build I'm looking at to my drafts" made while viewing it on the
+Community page, distinct from `load_saved_build` in that it does NOT touch
+`build_draft`/`page`/`has_unsaved_build_changes` at all: it is a headless
+clone straight into the user's own drafts/builds, not "let me edit this in
+the Studio first," so any of the user's own actually-in-progress Studio work
+is left completely untouched. This is acceptable specifically
 because it's the user's own explicit, direct request acting on their own
 account's own data — the same trust boundary as them clicking "Save
 build"/"Share to Community" themselves. The multi-turn "save (name +
@@ -480,24 +492,35 @@ def _apply_concierge_action(action: dict | None) -> float | None:
     effective ceiling the manual quantity stepper already enforces
     (`ui.state.resolve_effective_quantity_limit`) before ever writing one.
 
-    `save_build` is destination-aware (`action["destination"]`, one of
+    `save_build` first resolves WHICH build's data to use via
+    `action["source"]` (`"studio"`, the default, or `"community"` — see this
+    module's own docstring for the full rationale): `"studio"` reads
+    `st.session_state["build_draft"]`; `"community"` instead reads
+    `action["source_post_id"]`'s `CommunityPost.build` (zero-hallucination-
+    guarded against `community_summary` by `llm/concierge.py`), leaving
+    `build_draft`/`page`/`has_unsaved_build_changes` completely untouched
+    since nothing about the user's own Studio session is being acted on.
+    Either way it then persists using `action["destination"]` (one of
     `"draft"`/`"build"` — always present per the now-required schema field,
     read defensively regardless):
-      - `"draft"`: persists the CURRENT `build_draft` via
-        `drafts_repo.save_draft(...)`, extracting `components`/`quantities`
-        from `build_state`/`build_draft` the same way every other real
+      - `"draft"`: persists the resolved build's components/quantities/mode
+        via `drafts_repo.save_draft(...)`, the same way every other real
         persist path in this module does. Does NOT set
         `st.session_state["concierge_last_saved_build"]` — a draft has
         nothing for a later `publish_build` action to resolve against, since
         `community_repo.create_post`/`builds_repo.set_public` only ever
         operate on a real `Build` row.
-      - `"build"`: persists the CURRENT `build_draft` via the exact same
-        `builds_repo.create_build(...)` call shape as
-        `ui/views/create_build.py::_save_actions` (read that function first
-        if editing this) — computing `compatibility_score` via a fresh
-        `evaluate_build` call and pulling `synergy_score`/
-        `bottleneck_percentage` from `build_draft_analysis` when present,
-        exactly like the manual flow. It always saves privately
+      - `"build"`: persists via the exact same `builds_repo.create_build(...)`
+        call shape as `ui/views/create_build.py::_save_actions` (read that
+        function first if editing this). For `source == "studio"`,
+        `compatibility_score` comes from a fresh `evaluate_build` call and
+        `synergy_score`/`bottleneck_percentage` from `build_draft_analysis`
+        when present, exactly like the manual flow; for `source ==
+        "community"`, all four scores (plus `total_cost`) are copied directly
+        from the community post's own already-evaluated `Build` row instead
+        of being recomputed — that build was already scored once when it was
+        first saved, so reusing its real, persisted numbers is both simpler
+        and more accurate than re-deriving them. It always saves privately
         (`is_public=False`) — publishing is a deliberately separate, later
         `publish_build` action/turn, never bundled into the same write. Sets
         `st.session_state["concierge_last_saved_build"]`, since the publish
@@ -507,12 +530,15 @@ def _apply_concierge_action(action: dict | None) -> float | None:
     `_default_saved_build_name()` is called only as a last-resort defensive
     fallback if `name` somehow arrives empty/missing despite the schema
     requiring it. No-ops (does nothing, does not crash) when there is no
-    active draft or it resolves to zero real components — should be rare,
-    since the SYSTEM_PROMPT tells the model not to return this action
-    against nothing, but a defensive guard costs nothing. `build_draft`/
-    `create_mode`/`page` are deliberately left untouched (see this module's
-    docstring); only `has_unsaved_build_changes` is reset in both branches,
-    matching the manual flow's own post-save state reset.
+    active draft/resolvable community post, or it resolves to zero real
+    components — should be rare, since the SYSTEM_PROMPT tells the model not
+    to return this action against nothing, but a defensive guard costs
+    nothing. `build_draft`/`create_mode`/`page` are deliberately left
+    untouched for BOTH sources (see this module's docstring); only
+    `has_unsaved_build_changes` is reset in both destination branches, and
+    only for `source == "studio"` — a `"community"` source never set it in
+    the first place, so there is nothing of the user's own Studio session to
+    reset, matching the manual flow's own post-save state reset.
 
     `publish_build` resolves WHICH build to publish via
     `st.session_state["concierge_last_saved_build"]` (set by a prior
@@ -652,25 +678,66 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         return None
 
     if action_type == "save_build":
-        build_draft = st.session_state.get("build_draft")
-        if not build_draft:
-            return None
-        build_state = state.resolve_build_state(build_draft)
-        if not build_state:
-            return None
-
         user = current_user()
-        quantities = build_draft.get("quantities", {})
         # Defensive fallback only — the schema requires `name`, so a
         # well-formed action always carries the user's own literal answer.
         name = action.get("name") or _default_saved_build_name()
         destination = action.get("destination")
 
+        if action.get("source") == "community":
+            # SOURCE RESOLUTION (llm.schemas.ConciergeSaveBuildAction, SYSTEM_PROMPT
+            # intent 7): the user asked to save/clone a build they're VIEWING on the
+            # Community page, not their own in-progress Studio build — pull the
+            # components/quantities/scores straight from that ALREADY-persisted
+            # CommunityPost's own Build row instead of `build_draft`. Deliberately
+            # does NOT touch `build_draft`/`page`/`has_unsaved_build_changes` at all:
+            # unlike `load_saved_build`, this is a headless "clone it into my drafts/
+            # builds" request, not "let me edit it in the Studio" — the user's own
+            # in-progress Studio work (if any) must be left completely untouched.
+            post = community_repo.get_post(action.get("source_post_id"))
+            if post is None:
+                # The zero-hallucination guard already rejects a source_post_id that
+                # never existed in the community_summary sent this call, so this only
+                # fires for the (should be rare) case of a post deleted in between.
+                return None
+            source_build = post.build
+            build_state = state.resolve_build_state(
+                {"components": {bc.category: bc.component_id for bc in source_build.components}}
+            )
+            if not build_state:
+                return None
+            quantities = {bc.category: bc.quantity for bc in source_build.components}
+            creation_mode = source_build.creation_mode or "Free"
+            workload_profile = source_build.workload_profile
+            workload_tier = source_build.workload_tier
+            budget_ceiling = source_build.budget_ceiling
+            total_cost = source_build.total_cost
+            compatibility_score = source_build.compatibility_score
+            synergy_score = source_build.synergy_score
+            bottleneck_percentage = source_build.bottleneck_percentage
+        else:
+            build_draft = st.session_state.get("build_draft")
+            if not build_draft:
+                return None
+            build_state = state.resolve_build_state(build_draft)
+            if not build_state:
+                return None
+            quantities = build_draft.get("quantities", {})
+            creation_mode = build_draft.get("creation_mode") or "Free"
+            workload_profile = build_draft.get("workload_profile")
+            workload_tier = build_draft.get("tier") if creation_mode == "Workload" else None
+            budget_ceiling = build_draft.get("budget_ceiling")
+            total_cost = state.build_total_cost(build_state, quantities)
+            compatibility_score = evaluate_build(build_state, quantities).compatibility_score
+            analysis = st.session_state.get("build_draft_analysis") or {}
+            synergy_score = analysis.get("synergy", {}).get("overall_score")
+            bottleneck_percentage = analysis.get("bottleneck", {}).get("bottleneck_percentage")
+
         if destination == "draft":
             drafts_repo.save_draft(
                 user_id=user["id"],
                 name=name,
-                mode=build_draft.get("creation_mode") or "Free",
+                mode=creation_mode,
                 components={category: component.id for category, component in build_state.items()},
                 quantities=quantities,
             )
@@ -678,35 +745,32 @@ def _apply_concierge_action(action: dict | None) -> float | None:
             # a draft has no publish path anywhere in this app's real
             # architecture, so concierge_last_saved_build is deliberately
             # left untouched (never set, never cleared) here.
-            st.session_state["has_unsaved_build_changes"] = False
+            if action.get("source") != "community":
+                st.session_state["has_unsaved_build_changes"] = False
             return None
 
         # destination == "build" (or a malformed/missing value — default to
         # the real, finished-build save path, the historical behavior).
-        report = evaluate_build(build_state, quantities)
-        analysis = st.session_state.get("build_draft_analysis") or {}
-        synergy = analysis.get("synergy", {}).get("overall_score")
-        bottleneck = analysis.get("bottleneck", {}).get("bottleneck_percentage")
-
         build = builds_repo.create_build(
             user_id=user["id"],
             name=name,
-            creation_mode=build_draft.get("creation_mode") or "Free",
+            creation_mode=creation_mode,
             components=[
-                builds_repo.BuildComponentInput(component_id=c.id, quantity=state.get_quantity(build_draft, cat))
+                builds_repo.BuildComponentInput(component_id=c.id, quantity=quantities.get(cat, 1))
                 for cat, c in build_state.items()
             ],
-            total_cost=state.build_total_cost(build_state, quantities),
-            compatibility_score=report.compatibility_score,
-            workload_profile=build_draft.get("workload_profile"),
-            workload_tier=build_draft.get("tier") if build_draft.get("creation_mode") == "Workload" else None,
-            budget_ceiling=build_draft.get("budget_ceiling"),
-            synergy_score=synergy,
-            bottleneck_percentage=bottleneck,
+            total_cost=total_cost,
+            compatibility_score=compatibility_score,
+            workload_profile=workload_profile,
+            workload_tier=workload_tier,
+            budget_ceiling=budget_ceiling,
+            synergy_score=synergy_score,
+            bottleneck_percentage=bottleneck_percentage,
             is_public=False,
         )
         st.session_state["concierge_last_saved_build"] = {"build_id": build.id, "name": name}
-        st.session_state["has_unsaved_build_changes"] = False
+        if action.get("source") != "community":
+            st.session_state["has_unsaved_build_changes"] = False
         # FAST-TRACK refinement (llm.schemas.ConciergeSaveBuildAction): only
         # ever true when the user's OWN message that triggered this save
         # ALSO explicitly asked to publish/share to Community in the same

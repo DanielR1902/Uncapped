@@ -3332,6 +3332,98 @@ def test_concierge_save_build_action_with_draft_destination_persists_draft_not_b
     assert at.session_state["page"] == "create_build"
 
 
+def test_concierge_save_build_community_source_clones_to_drafts_without_touching_studio(
+    seeded_db, monkeypatch
+):
+    """A save_build action with source="community" (the user asking to save
+    a build they're VIEWING on the Community page, e.g. "save the build I'm
+    looking at to my drafts") must persist a real draft cloned from that
+    ALREADY-shared post's own Build row -- and must leave the user's own,
+    completely unrelated, in-progress Studio build (build_draft/page/
+    has_unsaved_build_changes) entirely untouched, since this is a headless
+    clone-into-my-drafts, not a "load into the Studio" action."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import builds_repo, community_repo, components_repo, drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "communitysave1", "communitysave1@example.com", "Community Save One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Shared Source Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click().run()
+
+    real_post = community_repo.get_feed()[0]
+    real_build = real_post.build
+    real_components = {bc.category: bc.component_id for bc in real_build.components}
+
+    # A SEPARATE, unrelated in-progress Studio build the community-sourced
+    # save must not touch at all. (Landing page's "nav_create_build" button
+    # is gone once we've navigated away from landing — use the persistent
+    # sidebar nav button instead, app.py's real key for it.)
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+    other_gpu = components_repo.get_by_category("GPU")[0]
+    at.get_by_key(f"select_GPU_{other_gpu.id}").click().run()
+    assert at.session_state["has_unsaved_build_changes"] is True
+
+    at.session_state["page"] = "community"
+    at.session_state["selected_post_id"] = real_post.id
+    at.run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        current_page=None,
+        viewed_post_id=None,
+        **kwargs,
+    ):
+        assert current_page == "community"
+        assert viewed_post_id == real_post.id
+        return {
+            "reply": "Saved 'Cloned From Community' to your drafts.",
+            "action": {
+                "type": "save_build",
+                "name": "Cloned From Community",
+                "destination": "draft",
+                "source": "community",
+                "source_post_id": viewed_post_id,
+                "explanation": "Cloning the community build the user is viewing.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value("save the build I'm looking at to my drafts").run()
+
+    assert not at.exception
+    user_id = at.session_state["auth_user"]["id"]
+
+    drafts = drafts_repo.get_user_drafts(user_id)
+    cloned = next(d for d in drafts if d.name == "Cloned From Community")
+    assert json.loads(cloned.components_json) == real_components
+    assert cloned.mode == real_build.creation_mode
+
+    # No real Build row was created (destination was "draft"), and nothing
+    # to publish.
+    assert len(builds_repo.get_builds_for_user(user_id)) == 1  # just "Shared Source Rig"
+    assert at.session_state["concierge_last_saved_build"] is None
+
+    # The user's own, unrelated in-progress Studio build is completely
+    # untouched: still on the community page, GPU pick still there, and the
+    # unsaved-changes flag isn't falsely cleared by an unrelated save.
+    assert at.session_state["page"] == "community"
+    assert at.session_state["build_draft"]["components"]["GPU"] == other_gpu.id
+    assert at.session_state["has_unsaved_build_changes"] is True
+
+
 def test_concierge_save_build_action_noop_without_active_build(seeded_db, monkeypatch):
     """A save_build action arriving with no active build_draft (mode not
     even chosen yet) must not crash and must not create a build or draft."""

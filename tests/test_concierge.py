@@ -1081,6 +1081,8 @@ def test_save_build_followup_with_both_name_and_destination_returns_action(monke
         "destination": "build",
         "publish_immediately": False,
         "author_notes": None,
+        "source": "studio",
+        "source_post_id": None,
         "explanation": "Saving the active build as a finished build.",
     }
     assert "weekend gaming rig" in result["reply"].lower()
@@ -1794,6 +1796,98 @@ def test_load_saved_build_with_empty_summaries_still_validates_safely(monkeypatc
     result = concierge.get_concierge_response("open pc-master-race for editing", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY)
     assert result["source"] == "heuristic"
     assert result["action"] is None
+
+
+# ---------------------------------------------------------------------------
+# save_build with source == "community" (save/clone a build viewed on the
+# Community page directly, without going through the Studio)
+# ---------------------------------------------------------------------------
+def test_save_build_community_source_with_real_post_id_passes_through(monkeypatch):
+    """A save_build action sourced from a real, currently-shared community
+    post (post_id 1, present in COMMUNITY_SUMMARY) must pass through
+    unchanged -- current_build_context is deliberately omitted/empty here to
+    confirm the community source doesn't need an active Studio build at
+    all."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Saved 'Budget Clone' to your drafts.",
+        "action": {
+            "type": "save_build",
+            "name": "Budget Clone",
+            "destination": "draft",
+            "source": "community",
+            "source_post_id": 1,
+            "explanation": "Cloning the community build the user is viewing.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "save the build I'm looking at to my drafts, call it Budget Clone",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_page="community",
+        viewed_post_id=1,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["source"] == "community"
+    assert result["action"]["source_post_id"] == 1
+
+
+def test_save_build_community_source_with_unknown_post_id_falls_back_to_heuristic(monkeypatch):
+    """A save_build action claiming source_post_id 9999 (not in
+    COMMUNITY_SUMMARY) must be rejected by the zero-hallucination guard, the
+    same as open_community_build/load_saved_build treat an invalid id."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Saved it.",
+        "action": {
+            "type": "save_build",
+            "name": "Budget Clone",
+            "destination": "draft",
+            "source": "community",
+            "source_post_id": 9999,
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "save the build I'm looking at to my drafts, call it Budget Clone",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_page="community",
+        viewed_post_id=1,
+    )
+
+    assert result["source"] == "heuristic"
+    assert result["action"] is None
+
+
+def test_save_build_studio_source_is_still_the_default(monkeypatch):
+    """A save_build action with no `source` field at all (every pre-existing
+    test/behavior) must still default to "studio" and pass through exactly
+    like before this refinement existed -- regression guard."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Saved 'Weekend Rig' as a draft.",
+        "action": {"type": "save_build", "name": "Weekend Rig", "destination": "draft"},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "save this as draft named Weekend Rig",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["source"] == "studio"
+    assert result["action"]["source_post_id"] is None
 
 
 # ---------------------------------------------------------------------------

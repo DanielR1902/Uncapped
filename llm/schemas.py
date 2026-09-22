@@ -295,11 +295,33 @@ class ConciergeSaveBuildAction(BaseModel):
     `draft_builds` table, via `db.repositories.drafts_repo.save_draft`) or
     `"build"` (the real `builds` table, via
     `db.repositories.builds_repo.create_build`) — there is no `saved_builds`
-    table anywhere in this app. Carries no new catalog ids either — it acts
-    entirely on `current_build_context`'s already-known-real
-    components/quantities, so there is nothing new for `_validate_action` to
-    cross-check for this action type beyond what `modify_build` already
-    established (see `_validate_action`'s docstring)."""
+    table anywhere in this app.
+
+    `source`/`source_post_id` (both optional, defaulting to `"studio"`/`None`)
+    are a SECOND, independent refinement (alongside `publish_immediately`):
+    which build's data actually gets persisted. `source: "studio"` (the
+    default, and the ONLY behavior that existed before this refinement) acts
+    on `current_build_context` exactly as this class's main docstring
+    describes — the user's own active, uncommitted Studio `build_draft`.
+    `source: "community"` instead persists a specific, ALREADY-shared
+    `CommunityPost`'s build — for when the user asks to save/clone/add-to-my-
+    drafts a build they are VIEWING on the Community page, not their own
+    in-progress Studio build (e.g. "save the build I'm looking at to my
+    drafts", "clone this community build as a saved build too") — see
+    SYSTEM_PROMPT's SAVE & PUBLISH REQUESTS intent's SOURCE RESOLUTION rule
+    for exactly when this applies. `source_post_id` (the real `post_id` of
+    that `CommunityPost`, resolved the SAME way `ConciergeLoadSavedBuildAction`
+    resolves its own community `id` — via `viewed_post_id` or a name match
+    against `community_summary`) is REQUIRED whenever `source == "community"`
+    and is cross-checked by `_validate_action` against the real `"post_id"`
+    values in `community_summary`, the same zero-hallucination precedent as
+    `open_community_build`/`load_saved_build`. It is simply ignored when
+    `source == "studio"` (nothing to check there — see `_validate_action`'s
+    docstring). Carries no other new catalog ids — for either source, the
+    actual component/quantity data comes from already-known-real rows this
+    module was given (`current_build_context` for `"studio"`, the community
+    post's own persisted `Build` row for `"community"`), never something the
+    model asserts about individual parts."""
 
     type: Literal["save_build"] = "save_build"
     name: str
@@ -322,6 +344,11 @@ class ConciergeSaveBuildAction(BaseModel):
     # nothing here asked it to.
     publish_immediately: bool = False
     author_notes: str | None = None
+    # Which build's data gets persisted — see this class's own docstring for
+    # the full explanation. `source_post_id` is only meaningful (and only
+    # cross-checked by `_validate_action`) when `source == "community"`.
+    source: Literal["studio", "community"] = "studio"
+    source_post_id: int | None = None
     # Optional — see ConciergeLoadBuildAction's identical field for why.
     # `name`/`destination` stay REQUIRED (the actual load-bearing fields for
     # this action's whole interactive-first design) — only this vestigial,
