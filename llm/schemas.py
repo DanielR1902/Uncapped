@@ -481,7 +481,24 @@ class ConciergeResponse(BaseModel):
     a requested load-into-studio target (or the request is ambiguous), or
     when a mid-flow reply is still gathering information (e.g. asking for
     the still-missing name or destination, asking whether to publish, or
-    asking for a description) before there's anything to act on yet."""
+    asking for a description) before there's anything to act on yet.
+
+    `currency_switch` (optional, default `None`) is a SEPARATE, top-level
+    field — deliberately NOT nested inside `action` — because it must be able
+    to co-occur with ANY action type (or `None`): a build-me request can name
+    a budget in a different currency than the one currently active ("build me
+    a gaming PC for 10000 NIS" while `active_currency == "USD"`) in the exact
+    same turn it returns a `load_build` action, and a bare "switch to NIS"/"I
+    asked it to be in NIS" request has no OTHER action at all. Set it to the
+    real currency code the user explicitly named in THIS message — never
+    guessed, never defaulted to `active_currency`, and left `None` whenever no
+    currency is mentioned at all, even if the user's wording is otherwise
+    currency-adjacent (e.g. a bare "what's the total?" with no currency named
+    leaves this `None` — see llm/concierge.py SYSTEM_PROMPT's CURRENCY SWITCH
+    REQUESTS rule for the exact extraction wording recognized). The caller
+    (`ui/`) applies this by updating `st.session_state["selected_currency"]`
+    and forcing a rerun so the sidebar selector and every price on screen
+    switch immediately — this module itself never touches session state."""
 
     reply: str
     action: (
@@ -494,6 +511,7 @@ class ConciergeResponse(BaseModel):
         | ConciergeLoadSavedBuildAction
         | None
     ) = None
+    currency_switch: Literal["USD", "EUR", "NIS"] | None = None
     source: Literal["llm", "heuristic"] = "llm"
 
 

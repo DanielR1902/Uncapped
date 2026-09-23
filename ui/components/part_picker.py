@@ -14,6 +14,7 @@ from db.models import Component
 from engine import scoring
 from engine.compatibility import BuildState, evaluate_build, resolve_quantity_limit
 from engine.solvers import CATEGORY_ORDER, cheapest_fill_cost
+from ui.format import format_currency
 from ui.state import resolve_effective_quantity_limit
 
 # UI-only conservative display cap used ONLY when engine.compatibility's
@@ -149,6 +150,7 @@ def render_part_picker(
     quantities: dict[str, int] | None = None,
 ) -> None:
     current = build_state.get(category)
+    currency = st.session_state.get("selected_currency", "USD")
     sort_criteria = st.session_state.get("sort_criteria", "Cost")
     ordered = sort_candidates(candidates, build_state, sort_criteria)
     icon = _CATEGORY_ICONS.get(category, "🔧")
@@ -165,11 +167,11 @@ def render_part_picker(
                 st.badge("Selected", icon=":material/check_circle:", color="green")
                 if category in _QUANTITY_CATEGORIES and quantity > 1:
                     st.caption(
-                        f"{current.name} · ${current.price_usd:,.2f} × {quantity} = "
-                        f"${current.price_usd * quantity:,.2f}"
+                        f"{current.name} · {format_currency(current.price_usd, currency)} × {quantity} = "
+                        f"{format_currency(current.price_usd * quantity, currency)}"
                     )
                 else:
-                    st.caption(f"{current.name} · ${current.price_usd:,.2f}")
+                    st.caption(f"{current.name} · {format_currency(current.price_usd, currency)}")
                 specs_line = " · ".join(_key_specs(current))
                 if specs_line:
                     st.caption(specs_line)
@@ -185,7 +187,7 @@ def render_part_picker(
                     # always yields a real financial max) — fall back to this UI's
                     # own conservative cap exactly as before.
                     effective_max, reason, limit_kind = resolve_effective_quantity_limit(
-                        build_state, category, quantities or {}, budget_ceiling
+                        build_state, category, quantities or {}, budget_ceiling, currency
                     )
                     max_qty = effective_max if effective_max is not None else _FALLBACK_QUANTITY_CAP
                     qty_key = f"qty_{category}"
@@ -277,7 +279,7 @@ def render_part_picker(
                             if specs_line:
                                 st.caption(specs_line)
                         with row[1]:
-                            st.write(f"${candidate.price_usd:,.2f}")
+                            st.write(format_currency(candidate.price_usd, currency))
                             st.caption(f"Value {scoring.value_index(candidate, ordered, build_state):.0f}")
                         with row[2]:
                             max_slot_cost = None
@@ -295,7 +297,9 @@ def render_part_picker(
                                     on_select(candidate)
                                     st.rerun()
                                 if over_budget:
-                                    st.caption(f"${candidate.price_usd - max_slot_cost:,.2f} over budget")
+                                    st.caption(
+                                        f"{format_currency(candidate.price_usd - max_slot_cost, currency)} over budget"
+                                    )
 
         with header_cols[2]:
             if current is not None and on_remove is not None:

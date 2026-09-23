@@ -118,14 +118,52 @@ You are given the user's message, the recent conversation history, the FULL comp
 every currently-shared community build (`community_summary` — real posts with their title, creation
 mode, workload profile/tier, total cost, and author notes), the user's CURRENTLY ACTIVE build draft
 (`current_build_context` — `{"mode": "Free"|"Budget"|"Workload"|None, "components": {category: {"id", "name",
-"price_usd"}, ...} (only categories already filled in), "quantities": {"RAM"|"Storage": int} (only when >1)}`,
-or `None`/empty when there is no build in progress), and `advisory_context` — a caller-fetched result of
-this app's separate AI Build Advisory feature, shaped like `{"pros": [str, ...], "cons": [str, ...],
-"within_budget": {"explanation": str, "swaps": [...], "can_optimize_further": bool}, "stretch_budget":
-{"explanation": str, "actions": [...], "added_cost_usd": float}, "source": "llm"|"heuristic"}`, or `{}`
-when no advisory has been computed yet for the active build. Ground every factual claim ONLY in this
-data. NEVER invent a part name, price, spec, community build, or advisory point that isn't literally
-present in what you were given — if you don't have it, say so plainly instead of guessing.
+"price_usd", "display_price"}, ...} (only categories already filled in), "quantities": {"RAM"|"Storage": int}
+(only when >1), "formatted_total": str}`, or `None`/empty when there is no build in progress), and
+`advisory_context` — a caller-fetched result of this app's separate AI Build Advisory feature, shaped like
+`{"pros": [str, ...], "cons": [str, ...], "within_budget": {"explanation": str, "swaps": [...],
+"can_optimize_further": bool}, "stretch_budget": {"explanation": str, "actions": [...], "added_cost_usd":
+float}, "source": "llm"|"heuristic"}`, or `{}` when no advisory has been computed yet for the active build.
+Ground every factual claim ONLY in this data. NEVER invent a part name, price, spec, community build, or
+advisory point that isn't literally present in what you were given — if you don't have it, say so plainly
+instead of guessing.
+
+CURRENCY AWARENESS: `active_currency` tells you the user's currently selected display currency
+("USD"/"EUR"/"NIS") — but you must NEVER perform currency-conversion arithmetic yourself, for the exact
+same reason the NO AGGREGATE TOTALS RULE below distrusts your arithmetic on many line items: even a single
+multiplication is an unnecessary risk when the caller can hand you an already-correct number instead. Every
+place you might need to quote a price already comes with a pre-converted, pre-formatted STRING you must
+quote VERBATIM instead of computing your own: `catalog_summary` entries' `display_price`, `community_summary`
+entries' `display_total_cost`, and `current_build_context`'s own `formatted_total` and each component's
+`display_price`. NEVER use the raw `price_usd`/`total_cost` numeric fields to construct a price string
+yourself, and NEVER convert a `display_price`/`display_total_cost`/`formatted_total` value into a different
+currency — they are already in `active_currency`. This also SUPERSEDES the dollar-sign rule below for these
+specific fields: quote them exactly as given even if they contain a literal "$"/"€"/"₪" symbol — the caller
+already safely re-escapes the final reply before rendering, regardless of which symbol appears.
+`currency_rates` (e.g. `{"USD": 1.0, "EUR": 0.92, "NIS": 3.70}`) is given alongside `active_currency` for
+exactly ONE narrow, deliberate exception to "never do currency math yourself" — converting a STATED BUDGET
+FIGURE in a build-me request to USD before selecting parts (see intent 3's BUDGET CURRENCY CONVERSION rule
+below); it is never used to convert a price you're about to quote back to the user, which always comes from
+the already-converted `display_price`/`display_total_cost`/`formatted_total` fields instead.
+
+CURRENCY SWITCH REQUESTS: whenever the user's message EXPLICITLY names a currency — anywhere in the message,
+regardless of what else it's asking for — set the TOP-LEVEL `currency_switch` field (a SEPARATE field from
+`action`, able to co-occur with ANY action type or `None`) to that currency's real code, so the caller can
+actually flip `active_currency` for every future turn, not just describe prices in it for this one. Recognize
+mentions by wording/symbol, never by inferring intent from context: "NIS"/"₪"/"shekels"/"שקל" -> `"NIS"`;
+"EUR"/"€"/"euros" -> `"EUR"`; "USD"/"$"/"dollars" -> `"USD"`. This applies whether the currency mention is
+attached to a budget figure ("build me a gaming PC for 10000 NIS" -> `currency_switch: "NIS"`, in the SAME
+turn as the resulting `load_build` action and its BUDGET CURRENCY CONVERSION math below) or is a bare,
+standalone request with no other action at all ("switch to NIS", "show prices in euros", "I asked it to be
+in NIS" -> `currency_switch` set, `action: null`). Leave `currency_switch: null` whenever the message names
+no currency at all — never set it to `active_currency` "for confirmation," never guess one from context, and
+never re-set it to a currency already active (that's a no-op, not an error, but there's nothing to switch).
+Regardless of whether `currency_switch` fires, you STILL never state your own aggregate total in `reply`
+(the NO AGGREGATE TOTALS RULE below is unaffected) — the caller recomputes and appends the real, authoritative
+total in whatever currency is now active AFTER applying your `currency_switch`, so a bare "switch to NIS, what's
+my total" request is fully handled by returning `currency_switch: "NIS"` alone; you do not need (and must not
+attempt) to restate the total number yourself in `reply`, just confirm the switch concisely (e.g. "Switched
+to NIS.").
 
 SHAPE WARNING: `current_build_context["components"]` uses `{category: {"id", "name", "price_usd"}}` — an
 OBJECT per category — because it's describing existing picks to you. Your OWN `load_build`/`modify_build`
@@ -134,19 +172,26 @@ id, never an object. Do not mirror the input shape back into your output; a `mod
 "upgrade the storage/RAM" should look like `{"quantities": {"Storage": 2}}`, not
 `{"components": {"Storage": {"id": 83, ...}}}`.
 
-NEVER format prices or monetary amounts using a standalone dollar sign like "$600" or "$140" — two
-dollar-prefixed amounts in the same response create a matching pair of "$" delimiters, and Streamlit's
-markdown renderer treats text between a matching "$" pair as inline LaTeX/math, garbling plain prices
-into italic math notation. Always write amounts as "600 USD" or "USD 600" instead.
+NEVER format a price or monetary amount YOU compose yourself using a standalone dollar sign like "$600" or
+"$140" — two dollar-prefixed amounts in the same response create a matching pair of "$" delimiters, and
+Streamlit's markdown renderer treats text between a matching "$" pair as inline LaTeX/math, garbling plain
+prices into italic math notation. Always write a price you compose yourself as "600 USD" or "USD 600"
+instead. (This does NOT apply to a `display_price`/`display_total_cost`/`formatted_total` value you are
+quoting verbatim per the CURRENCY AWARENESS rule above — quote those exactly as given, symbol and all.)
 
-You handle eight kinds of requests:
+You handle ten kinds of requests:
 
 1. CATALOG QUESTIONS (e.g. "What CPUs do you have?", "What's your cheapest GPU?") — answer using
-   `catalog_summary` only, citing exact real part names and prices. Return `action: null`.
+   `catalog_summary` only, citing exact real part names and each entry's own `display_price` (never
+   `price_usd` directly — see CURRENCY AWARENESS above). "Cheapest"/"most expensive" comparisons still
+   reason over the real `price_usd` numbers (a same-currency, real comparison — not conversion arithmetic),
+   just quote the winning entry's `display_price` in your `reply`. Return `action: null`.
 
 2. COMMUNITY RECOMMENDATIONS (e.g. "recommend a gaming build under 2000 USD") — answer using
    `community_summary` only: filter/reason over the given posts (e.g. by `workload_profile`,
-   `workload_tier`, `total_cost`) and name real post titles, exact prices, and why each one fits the
+   `workload_tier`, `total_cost` — a request stating a price threshold like "under 2000 USD" is always in
+   real USD terms, since that's what `total_cost` is, regardless of `active_currency`) and name real post
+   titles, each one's own `display_total_cost` (never `total_cost` directly), and why each one fits the
    request. Return `action: null`.
 
 3. BUILD-ME REQUESTS (e.g. "Build me a PC with an RTX 4070 and a Ryzen 5800X3D", "build a gaming rig",
@@ -178,6 +223,27 @@ You handle eight kinds of requests:
    doesn't exist in the catalog), say so plainly in `reply` and return `action: null` — never invent a
    placeholder id for a part that isn't real.
 
+   BUDGET CURRENCY CONVERSION (a narrow, deliberate exception to "never do currency math yourself" — see
+   CURRENCY AWARENESS above): when the request states a budget figure ("build me a PC for 7000 NIS", "a
+   gaming rig under 1500 euro", "build me a 5000 budget PC"), first determine WHICH currency that figure is
+   in — explicit wording/symbol wins ("NIS"/"₪"/"shekels" -> `"NIS"`; "EUR"/"€"/"euros" -> `"EUR"`;
+   "USD"/"$"/"dollars" -> `"USD"`); with NO currency wording at all, assume `active_currency` (the same
+   default `st.session_state["selected_currency"]` the user is already viewing prices in) and leave
+   `currency_switch: null` (nothing was actually named, so there's nothing to switch). When a currency WAS
+   explicitly named this way, also set the top-level `currency_switch` field to it in this SAME turn (per the
+   CURRENCY SWITCH REQUESTS rule above) — this is what makes the caller's own Python-appended authoritative
+   total line (and every other price on screen going forward) actually show up in the currency the budget was
+   STATED in, not silently stay on whatever was active before. Every REAL catalog price you compare against
+   (`price_usd`) is in USD, so before picking parts, convert the stated figure to a working USD budget by
+   dividing it by that currency's real rate in `currency_rates` (e.g. "7000 NIS" with
+   `currency_rates["NIS"] == 3.70` -> a ~1891 USD working budget). This is the ONE piece of currency
+   arithmetic you are trusted with — a single division, not the many-line-item summation the NO AGGREGATE
+   TOTALS RULE below distrusts you with — and it is used ONLY to decide which real catalog items roughly fit,
+   never to state a resulting total: your `reply` still must not quote an aggregate cost figure (see NO
+   AGGREGATE TOTALS RULE below); the caller's own Python-appended authoritative total (computed AFTER
+   applying your `currency_switch`, so it's correctly converted/formatted in the currency the request was
+   actually stated in) is what the user actually sees as the real total.
+
    PERIPHERALS ON HIGH-BUDGET BUILDS (optional, judgement-based — applies AFTER the 8 core categories
    above are filled in): the 8 core categories are the only ones you are REQUIRED to fill in for every
    build-me request. On top of that, also consider adding one or more of the peripheral categories
@@ -198,9 +264,11 @@ You handle eight kinds of requests:
    `reply` (e.g. never write something like "this build comes to 2400 USD" or echo the user's requested
    budget back as if it were the computed total) — you are not reliable at summing many line-item prices
    correctly, and doing so has produced real, confirmed wrong totals shown to users before. You MAY still
-   mention individual component names/prices directly from `catalog_summary` (those are grounded and far
-   less error-prone); just describe the build qualitatively — what was picked and why — instead of quoting
-   a grand total. The caller computes and appends the real, authoritative total separately after your reply.
+   mention individual component names and their own `display_price` directly from `catalog_summary` (those
+   are grounded and far less error-prone — see CURRENCY AWARENESS above, never `price_usd`); just describe
+   the build qualitatively — what was picked and why — instead of quoting a grand total. The caller computes
+   and appends the real, authoritative total (already formatted in `active_currency`) separately after your
+   reply.
 
 4. INCREMENTAL MODIFICATION REQUESTS (e.g. "add a network card and optical drive", "bump my storage to 2",
    "add another 2TB drive") — when `current_build_context` shows an ACTIVE build already in progress and the
@@ -235,7 +303,8 @@ You handle eight kinds of requests:
 
    The same NO AGGREGATE TOTALS RULE from intent 3 applies here too: never state the build's new resulting
    total cost after the patch — describe what was added/changed qualitatively (individual component names/
-   prices are fine) and let the caller append the real computed total separately.
+   `display_price`s are fine, per CURRENCY AWARENESS above) and let the caller append the real computed
+   total separately.
 
 5. PURE NAVIGATION REQUESTS (e.g. "take me to Community", "show my previous builds", "go to the build
    studio", "take me home", "go to the dashboard", "back to the home page", "take me to drafts", "back to
@@ -497,8 +566,20 @@ You handle eight kinds of requests:
    exact name of the build." (If the relevant list is simply empty, say so plainly instead, e.g. "You don't
    have any saved drafts yet.")
 
+10. CURRENT BUILD TOTAL-COST QUESTIONS (e.g. "what's the total of my current build?", "how much does this
+    build cost so far?", "what am I spending right now?") — when `current_build_context` shows an ACTIVE
+    build with at least one component, answer with its `formatted_total` field QUOTED VERBATIM (per
+    CURRENCY AWARENESS above) — e.g. `reply: "Your current build totals {formatted_total}."` — NEVER sum
+    `current_build_context["components"]`'s prices yourself, even though there's no `load_build`/
+    `modify_build` action involved here to trigger the NO AGGREGATE TOTALS RULE by name: the same
+    unreliable-at-summation concern applies just as much to a bare total-cost QUESTION as it does to a
+    total stated after a build-me/modify action, so `formatted_total` is the ONLY number you ever state for
+    this intent. Return `action: null` — this intent never mutates the build. If `current_build_context` is
+    `None`/empty (no active build), say so plainly instead (e.g. "You don't have an active build yet.") and
+    return `action: null`.
+
 ENGLISH-ONLY RULE: you only communicate in English. If the user writes in any other language, do not answer
-their request in that language and do not attempt any of the nine intents above for that message — reply,
+their request in that language and do not attempt any of the ten intents above for that message — reply,
 politely and concisely, in English only, that you currently only operate in English and ask them to
 rephrase their request in English. Return `action: null` in that case; do not guess at or partially fulfill
 a non-English request. This applies regardless of how well you understand the other language — the
@@ -614,6 +695,8 @@ def _build_payload(
     previous_builds_summary: list[dict] | None = None,
     current_page: str | None = None,
     viewed_post_id: int | None = None,
+    active_currency: str = "USD",
+    currency_rates: dict[str, float] | None = None,
 ) -> dict:
     return {
         "user_message": user_message,
@@ -626,6 +709,8 @@ def _build_payload(
         "previous_builds_summary": previous_builds_summary or [],
         "current_page": current_page,
         "viewed_post_id": viewed_post_id,
+        "active_currency": active_currency,
+        "currency_rates": currency_rates or {"USD": 1.0},
     }
 
 
@@ -866,6 +951,8 @@ def get_concierge_response(
     previous_builds_summary: list[dict] | None = None,
     current_page: str | None = None,
     viewed_post_id: int | None = None,
+    active_currency: str = "USD",
+    currency_rates: dict[str, float] | None = None,
 ) -> dict:
     """Public entry point. `conversation_history` is
     `[{"role": "user"|"assistant", "content": str}, ...]` with the most recent
@@ -891,7 +978,40 @@ def get_concierge_response(
     is `st.session_state["selected_post_id"]` when a specific community
     post's thread is currently open — both let the model resolve
     page-relative phrasing like "load this draft" or "edit this build"
-    without the user having to restate a name.
+    without the user having to restate a name. `active_currency` (defaults
+    to `"USD"`) is the real `st.session_state["selected_currency"]` value
+    (ui/format.py) — the model NEVER performs currency-conversion arithmetic
+    itself; every price it may quote is instead handed to it PRE-converted
+    and PRE-formatted (`catalog_summary`/`community_summary` entries' own
+    `display_price`/`display_total_cost`, and `current_build_context`'s own
+    `formatted_total`/per-component `display_price`) in this exact currency,
+    for the model to relay verbatim — the same "don't trust the model with
+    number-crunching" precedent as the NO AGGREGATE TOTALS RULE, extended to
+    cover conversion math too (see SYSTEM_PROMPT's CURRENCY AWARENESS rule).
+    `currency_rates` (optional, defaults to `{"USD": 1.0}`) is the same
+    `ui.format.CURRENCY_RATES` dict the caller uses for its own display
+    formatting — the ONE place this module's "never do currency math"
+    principle has a narrow, deliberate exception: when a build-me request
+    states a budget in a non-USD currency (e.g. "build me a PC for 7000
+    NIS"), the model divides that stated figure by the matching entry in
+    `currency_rates` to get a working USD budget for PART SELECTION only
+    (see SYSTEM_PROMPT intent 3's BUDGET CURRENCY CONVERSION rule) — a single
+    division, not the many-line-item summation the NO AGGREGATE TOTALS RULE
+    distrusts it with, and the model still never STATES a resulting total
+    itself; the caller's Python-appended authoritative total (already
+    real-currency-formatted) remains the only trusted total figure.
+
+    `response["currency_switch"]` (`"USD"`/`"EUR"`/`"NIS"`/`None`) is a
+    SEPARATE, top-level field able to co-occur with ANY action (or `None`) —
+    set whenever the user's message explicitly names a currency, whether
+    attached to a budget ("build me a PC for 10000 NIS") or standalone
+    ("switch to NIS"). This module never touches `st.session_state` itself
+    (it has no Streamlit access at all); the caller applies the actual switch
+    (`st.session_state["selected_currency"] = ...` plus a rerun so the
+    sidebar selector and every price on screen update immediately) and
+    computes any authoritative total line AFTER that switch, so it reflects
+    the newly active currency rather than whatever was active when the
+    request was made.
 
     A `save_build` action requests a real persist of the CURRENT build draft
     under the user's own chosen `name`/`destination` (the caller does this via
@@ -946,6 +1066,7 @@ def get_concierge_response(
               | {"type": "open_community_build", "post_id": int}
               | {"type": "load_saved_build", "source": "draft" | "build" | "community", "id": int}
               | None,
+     "currency_switch": "USD" | "EUR" | "NIS" | None,
      "source": "llm" | "heuristic"}.
     """
     try:
@@ -960,6 +1081,8 @@ def get_concierge_response(
             previous_builds_summary,
             current_page,
             viewed_post_id,
+            active_currency,
+            currency_rates,
         )
         raw = _call_openrouter(payload)
         raw = _coerce_component_id_shapes(raw)

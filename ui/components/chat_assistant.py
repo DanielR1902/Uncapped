@@ -236,7 +236,7 @@ from engine.compatibility import evaluate_build
 from llm.advisory import get_build_advisory
 from llm.concierge import get_concierge_response
 from ui import state
-from ui.format import sanitize_markdown
+from ui.format import CURRENCY_RATES, format_currency, sanitize_markdown
 
 # A couple of cheap, generically-useful key specs per component, when present
 # — matching the compact style of llm/advisory.py's own _component_summary,
@@ -316,9 +316,23 @@ def _render_chat_message(content: str) -> None:
         st.markdown(sanitize_markdown(content))
 
 
+def _active_currency() -> str:
+    return st.session_state.get("selected_currency", "USD")
+
+
 def _catalog_summary() -> list[dict]:
     """Full catalog (~143 real components) — compact enough to embed whole in
-    one concierge payload every message."""
+    one concierge payload every message. `price_usd` stays the real, never-
+    converted USD price (this is what `_validate_action`'s zero-hallucination
+    guard and any internal budget-guardrail arithmetic reason over — it must
+    stay in one consistent, real currency). `display_price` is a SEPARATE,
+    already-converted-and-formatted string in the user's active currency
+    (ui/format.py) — the ONLY field the model is instructed to quote when
+    stating a catalog price aloud, so it never performs currency-conversion
+    arithmetic itself (the same "don't trust the model with number-crunching"
+    precedent as the NO AGGREGATE TOTALS RULE, extended to cover conversion
+    math too)."""
+    currency = _active_currency()
     summary: list[dict] = []
     for category in COMPONENT_CATEGORIES:
         for component in components_repo.get_by_category(category):
@@ -327,6 +341,7 @@ def _catalog_summary() -> list[dict]:
                 "category": category,
                 "name": component.name,
                 "price_usd": component.price_usd,
+                "display_price": format_currency(component.price_usd, currency),
             }
             for field in _SUMMARY_SPEC_FIELDS:
                 value = getattr(component, field, None)
@@ -337,6 +352,10 @@ def _catalog_summary() -> list[dict]:
 
 
 def _community_summary() -> list[dict]:
+    """`total_cost` stays real USD (unconverted); `display_total_cost` is the
+    pre-converted, pre-formatted string for the model to quote — same
+    rationale as `_catalog_summary`'s `display_price`."""
+    currency = _active_currency()
     posts = community_repo.get_feed()
     return [
         {
@@ -347,6 +366,7 @@ def _community_summary() -> list[dict]:
             "workload_profile": post.build.workload_profile,
             "workload_tier": post.build.workload_tier,
             "total_cost": post.build.total_cost,
+            "display_total_cost": format_currency(post.build.total_cost, currency),
             "author_notes": post.author_notes,
         }
         for post in posts
@@ -385,21 +405,41 @@ def _current_build_context() -> dict | None:
     LLM so it can support incremental `modify_build` requests. `None` when
     there's no draft in progress at all (mode not chosen yet) or it resolves
     to no real components (e.g. every previously-picked id has since been
-    removed from the catalog)."""
+    removed from the catalog).
+
+    `price_usd`/`budget_ceiling` stay real, unconverted USD (the budget
+    guardrail's own internal arithmetic, and anything `_validate_action`
+    might reason over, must stay in one consistent real currency). Each
+    component's `display_price`, and the top-level `formatted_total`
+    (`ui.state.build_total_cost` run through `ui.format.format_currency` —
+    the SAME authoritative total `render_concierge_widget` itself later
+    appends to the reply), are the pre-converted strings the model is
+    instructed to quote instead — this is what finally lets a bare "what's
+    my current total?" question be answered correctly without the model
+    ever summing/converting anything itself (see SYSTEM_PROMPT's CURRENT
+    BUILD TOTAL-COST QUESTIONS intent)."""
     build_draft = st.session_state.get("build_draft")
     if not build_draft:
         return None
     build_state = state.resolve_build_state(build_draft)
     if not build_state:
         return None
+    currency = _active_currency()
+    quantities = build_draft.get("quantities", {})
     return {
         "mode": build_draft.get("creation_mode"),
         "budget_ceiling": build_draft.get("budget_ceiling"),
         "components": {
-            category: {"id": component.id, "name": component.name, "price_usd": component.price_usd}
+            category: {
+                "id": component.id,
+                "name": component.name,
+                "price_usd": component.price_usd,
+                "display_price": format_currency(component.price_usd, currency),
+            }
             for category, component in build_state.items()
         },
-        "quantities": build_draft.get("quantities", {}),
+        "quantities": quantities,
+        "formatted_total": format_currency(state.build_total_cost(build_state, quantities), currency),
     }
 
 
@@ -883,6 +923,8 @@ def render_concierge_widget() -> None:
                         if st.session_state.get("page") == "community"
                         else None
                     ),
+                    active_currency=_active_currency(),
+                    currency_rates=CURRENCY_RATES,
                 )
             # Apply BEFORE finalizing the assistant message so the real,
             # Python-computed total (if any) is available to append to the
@@ -912,9 +954,47 @@ def render_concierge_widget() -> None:
                     f"{result['reply']}\n\n_(Note: something went wrong applying this action — "
                     "your build may not have updated as expected.)_"
                 )
+            # CURRENCY SWITCH (spec.md §6.7/§7.10): a `currency_switch` response
+            # field is a SEPARATE, top-level field from `action` — set whenever the
+            # user's message explicitly names a currency, whether attached to a
+            # budget ("build me a PC for 10000 NIS") or standalone ("switch to
+            # NIS"). Only ever a real, already-active-currency-code-shaped value
+            # (Pydantic's own Literal type on ConciergeResponse rejects anything
+            # else at parse time) — never re-staged when it already matches what's
+            # active (a no-op, not an error). Staged into a one-shot key
+            # (`app.py::pending_currency_switch`) rather than written directly to
+            # `st.session_state["selected_currency"]` here: THIS widget already
+            # rendered earlier in the current script pass (it lives above the nav
+            # buttons in the sidebar, `app.py`), so writing its own key now would
+            # raise StreamlitWidgetAlreadyInstantiatedError — the exact same class
+            # of gotcha `ui/components/part_picker.py`'s quantity-stepper works
+            # around. The unconditional `st.rerun()` at the end of this block
+            # already picks the staged value up on the very next pass, BEFORE that
+            # widget re-instantiates, so the sidebar selector and every price on
+            # screen switch immediately with no extra plumbing needed.
+            currency_switch = result.get("currency_switch")
+            target_currency = _active_currency()
+            if currency_switch and currency_switch != target_currency:
+                st.session_state["pending_currency_switch"] = currency_switch
+                target_currency = currency_switch
+            # A bare "switch currency" request (no other action, e.g. "switch to
+            # NIS" or "I asked it to be in NIS") still gets the authoritative total
+            # line restated in the NEWLY active currency, for an existing build —
+            # `_apply_concierge_action` only ever computes `real_total` for a
+            # `load_build`/`modify_build` action, so this covers the case where
+            # `action` is `None` but a build is already active. Deliberately
+            # scoped to `action is None` only (never `navigate`/`save_build`/etc.)
+            # so those action types keep their own "never gets a total line"
+            # guarantee even when combined with a currency switch.
+            if real_total is None and result.get("action") is None and currency_switch:
+                build_draft = st.session_state.get("build_draft")
+                if build_draft:
+                    build_state = state.resolve_build_state(build_draft)
+                    if build_state:
+                        real_total = state.build_total_cost(build_state, build_draft.get("quantities", {}))
             reply_content = result["reply"]
             if real_total is not None:
-                reply_content = f"{reply_content}\n\n**Total: USD {real_total:,.2f}**"
+                reply_content = f"{reply_content}\n\n**Total: {format_currency(real_total, target_currency)}**"
             st.session_state["concierge_messages"].append(
                 {"role": "assistant", "content": sanitize_markdown(reply_content)}
             )

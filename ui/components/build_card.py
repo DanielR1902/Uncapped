@@ -6,7 +6,7 @@ from typing import Callable
 import streamlit as st
 
 from db.models import Build
-from ui.format import humanize_profile, sanitize_markdown
+from ui.format import format_currency, humanize_profile, sanitize_markdown
 
 
 def render_build_card(
@@ -20,8 +20,9 @@ def render_build_card(
     with st.container(border=True):
         st.markdown(sanitize_markdown(f"#### {build.name}"))
 
+        currency = st.session_state.get("selected_currency", "USD")
         cols = st.columns(4)
-        cols[0].metric("Cost", f"${build.total_cost:,.2f}", border=True)
+        cols[0].metric("Cost", format_currency(build.total_cost, currency), border=True)
         cols[1].metric("Compatibility", f"{build.compatibility_score:.0f}%", border=True)
         cols[2].metric(
             "Bottleneck",

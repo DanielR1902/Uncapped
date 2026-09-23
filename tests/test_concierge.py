@@ -873,6 +873,162 @@ def test_advisory_context_reaches_the_request_payload_when_provided(monkeypatch)
     assert sent_payload["advisory_context"] == ADVISORY_CONTEXT
 
 
+def test_active_currency_reaches_the_request_payload_when_provided(monkeypatch):
+    """Same inspection as advisory_context above, for active_currency
+    (ui/format.py's multi-currency support, spec.md §7.7) — confirms it's
+    actually threaded into the request payload, not just accepted/dropped."""
+    _set_env(monkeypatch)
+    captured_payload = {}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        captured_payload.update(json)
+        return _fake_openrouter_response({"reply": "ok", "action": None})
+
+    monkeypatch.setattr(concierge.httpx, "post", fake_post)
+
+    result = concierge.get_concierge_response(
+        "What CPUs do you have?",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        active_currency="NIS",
+    )
+
+    assert result["source"] == "llm"
+    sent_payload = json.loads(captured_payload["messages"][1]["content"])
+    assert sent_payload["active_currency"] == "NIS"
+
+
+def test_active_currency_defaults_to_usd_when_omitted(monkeypatch):
+    _set_env(monkeypatch)
+    captured_payload = {}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        captured_payload.update(json)
+        return _fake_openrouter_response({"reply": "ok", "action": None})
+
+    monkeypatch.setattr(concierge.httpx, "post", fake_post)
+
+    concierge.get_concierge_response("What CPUs do you have?", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY)
+
+    sent_payload = json.loads(captured_payload["messages"][1]["content"])
+    assert sent_payload["active_currency"] == "USD"
+
+
+def test_currency_rates_reaches_the_request_payload_when_provided(monkeypatch):
+    """currency_rates (ui.format.CURRENCY_RATES) must actually be threaded
+    into the request payload -- it's what lets the model convert a
+    foreign-currency-stated budget ("build me a PC for 7000 NIS") to USD
+    before selecting parts (SYSTEM_PROMPT intent 3's BUDGET CURRENCY
+    CONVERSION rule)."""
+    _set_env(monkeypatch)
+    captured_payload = {}
+    rates = {"USD": 1.0, "EUR": 0.92, "NIS": 3.70}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        captured_payload.update(json)
+        return _fake_openrouter_response({"reply": "ok", "action": None})
+
+    monkeypatch.setattr(concierge.httpx, "post", fake_post)
+
+    concierge.get_concierge_response(
+        "build me a PC for 7000 NIS",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        active_currency="NIS",
+        currency_rates=rates,
+    )
+
+    sent_payload = json.loads(captured_payload["messages"][1]["content"])
+    assert sent_payload["currency_rates"] == rates
+
+
+def test_currency_rates_defaults_to_usd_only_when_omitted(monkeypatch):
+    _set_env(monkeypatch)
+    captured_payload = {}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        captured_payload.update(json)
+        return _fake_openrouter_response({"reply": "ok", "action": None})
+
+    monkeypatch.setattr(concierge.httpx, "post", fake_post)
+
+    concierge.get_concierge_response("What CPUs do you have?", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY)
+
+    sent_payload = json.loads(captured_payload["messages"][1]["content"])
+    assert sent_payload["currency_rates"] == {"USD": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# currency_switch (spec.md §6.7/§7.10) — a top-level ConciergeResponse field,
+# separate from `action`, set whenever the user explicitly names a currency.
+# ---------------------------------------------------------------------------
+def test_currency_switch_parses_alongside_a_load_build_action(monkeypatch):
+    """"build me a gaming PC for 10000 NIS" -> both a load_build action AND
+    currency_switch: "NIS" in the SAME response -- currency_switch is a
+    sibling field to action, not nested inside it."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Built you a gaming PC within budget.",
+        "action": {
+            "type": "load_build",
+            "components": {"CPU": 1, "GPU": 4},
+            "explanation": "Balanced pick.",
+        },
+        "currency_switch": "NIS",
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "build me a gaming PC for 10000 NIS",
+        [],
+        CATALOG_SUMMARY,
+        COMMUNITY_SUMMARY,
+        active_currency="USD",
+        currency_rates={"USD": 1.0, "EUR": 0.92, "NIS": 3.70},
+    )
+
+    assert result["source"] == "llm"
+    assert result["currency_switch"] == "NIS"
+    assert result["action"]["type"] == "load_build"
+
+
+def test_currency_switch_parses_standalone_with_no_action(monkeypatch):
+    """"switch to NIS" -- currency_switch fires with action: null."""
+    _set_env(monkeypatch)
+    payload = {"reply": "Switched to NIS.", "action": None, "currency_switch": "NIS"}
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "switch to NIS", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY, active_currency="USD"
+    )
+
+    assert result["source"] == "llm"
+    assert result["currency_switch"] == "NIS"
+    assert result["action"] is None
+
+
+def test_currency_switch_defaults_to_none_when_not_mentioned():
+    """A plain reply with no currency_switch key at all must default to
+    None, matching every other optional ConciergeResponse field."""
+    response = ConciergeResponse.model_validate({"reply": "Here are the CPUs.", "action": None})
+    assert response.currency_switch is None
+
+
+def test_currency_switch_rejects_an_invalid_currency_code(monkeypatch):
+    """A hallucinated/invalid currency code must fail Pydantic validation
+    outright (the Literal type is the structural guarantee, not just a
+    prompt instruction) and fall back to the heuristic response."""
+    _set_env(monkeypatch)
+    payload = {"reply": "Switched.", "action": None, "currency_switch": "GBP"}
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response("switch to pounds", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY)
+
+    assert result["source"] == "heuristic"
+
+
 def test_advisory_context_defaults_to_empty_dict_when_none(monkeypatch):
     """When the caller doesn't pass advisory_context at all (None default),
     the payload sent to OpenRouter must contain an empty dict, not None,

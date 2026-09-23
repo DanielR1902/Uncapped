@@ -3702,6 +3702,299 @@ def test_concierge_navigate_and_save_build_actions_never_append_a_total_line(see
 
 
 # ---------------------------------------------------------------------------
+# Multi-currency display support (ui/format.py, app.py's sidebar selector,
+# spec.md §7.7/§6.7). Pure DISPLAY-layer conversion — every stored/compared
+# price stays real USD (db.repositories, engine/) regardless of the active
+# selection; only rendered strings (and, for the Concierge, pre-formatted
+# strings handed to the model to quote verbatim) ever convert.
+# ---------------------------------------------------------------------------
+def test_currency_selector_defaults_to_usd(seeded_db):
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "currency1", "currency1@example.com", "Currency One")
+    assert at.session_state["selected_currency"] == "USD"
+    assert at.get_by_key("selected_currency").value == "USD"
+
+
+def test_switching_currency_updates_build_studio_total_cost_display(seeded_db):
+    """Selecting NIS in the sidebar must re-render the Build Studio's Total
+    Cost metric converted at ui/format.py's real static rate, in Shekels —
+    the underlying stored price/total (state.build_total_cost) stays real
+    USD throughout; only the rendered string changes."""
+    from ui.format import CURRENCY_RATES
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "currency2", "currency2@example.com", "Currency Two")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    from db.repositories import components_repo
+
+    gpu = components_repo.get_by_category("GPU")[0]
+    at.get_by_key(f"select_GPU_{gpu.id}").click().run()
+
+    usd_metric = next(m for m in at.get_by_key("build_summary_header").metric if m.label == "💰 Total Cost")
+    assert usd_metric.value == f"${gpu.price_usd:,.2f}"
+
+    at.get_by_key("selected_currency").select("NIS").run()
+
+    nis_metric = next(m for m in at.get_by_key("build_summary_header").metric if m.label == "💰 Total Cost")
+    expected = f"₪{gpu.price_usd * CURRENCY_RATES['NIS']:,.2f}"
+    assert nis_metric.value == expected
+    # Stored data is untouched — still real USD.
+    assert at.session_state["build_draft"]["components"]["GPU"] == gpu.id
+
+
+def test_switching_currency_updates_community_feed_price_display(seeded_db):
+    """Selecting EUR must re-render a community feed card's price tag
+    converted, in Euros."""
+    from ui.format import CURRENCY_RATES
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "currency3", "currency3@example.com", "Currency Three")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Currency Feed Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click().run()
+
+    from db.repositories import community_repo
+
+    real_post = community_repo.get_feed()[0]
+
+    at.get_by_key("selected_currency").select("EUR").run()
+    at.get_by_key("sidebar_nav_community").click().run()
+
+    expected = f"€{real_post.build.total_cost * CURRENCY_RATES['EUR']:,.2f}"
+    markdown_values = [m.value for m in at.markdown]
+    assert any(expected in m for m in markdown_values)
+
+
+def test_concierge_receives_active_currency_matching_sidebar_selection(seeded_db, monkeypatch):
+    """The active currency the user picked in the sidebar must actually
+    reach llm.concierge.get_concierge_response as active_currency — proven
+    here the same way other context-threading tests in this file are (a
+    mocked response that only returns a valid reply when it received the
+    expected kwarg)."""
+    import ui.components.chat_assistant as chat_assistant_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "currency4", "currency4@example.com", "Currency Four")
+    at.get_by_key("selected_currency").select("NIS").run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        active_currency=None,
+        **kwargs,
+    ):
+        assert active_currency == "NIS"
+        return {"reply": "Prices are in Shekels.", "action": None, "source": "heuristic"}
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("What currency are we using?").run()
+
+    assert not at.exception
+    assert at.session_state["concierge_messages"][-1]["content"] == "Prices are in Shekels."
+
+
+def test_concierge_authoritative_total_line_formats_in_selected_currency(seeded_db, monkeypatch):
+    """The Python-appended authoritative "Total: ..." line (never trusting
+    the model's own arithmetic, spec.md §7.8) must itself be formatted in
+    whatever currency is currently selected, not hardcoded to USD."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from ui.format import CURRENCY_RATES
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "currency5", "currency5@example.com", "Currency Five")
+    at.get_by_key("selected_currency").select("EUR").run()
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        **kwargs,
+    ):
+        return {
+            "reply": "Built you a solid CPU/GPU pairing.",
+            "action": {
+                "type": "load_build",
+                "components": {"CPU": cpu.id, "GPU": gpu.id},
+                "explanation": "Balanced pick.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("Build me a CPU and GPU").run()
+
+    assert not at.exception
+    last_message = at.session_state["concierge_messages"][-1]
+    expected_total = (cpu.price_usd + gpu.price_usd) * CURRENCY_RATES["EUR"]
+    assert f"**Total: €{expected_total:,.2f}**" in last_message["content"]
+
+
+def test_concierge_currency_switch_flips_selector_and_formats_total_in_new_currency(
+    seeded_db, monkeypatch
+):
+    """The real bug this directive reports: starting in USD and asking for a
+    build in NIS must actually flip st.session_state["selected_currency"]
+    (and the sidebar selector itself) to NIS, not just describe the resulting
+    build's total in NIS for one reply while silently staying on USD
+    afterward. Exercises the full round-trip: a mocked response carrying
+    BOTH a load_build action AND currency_switch: "NIS" in the same turn
+    (exactly how "build me a gaming PC for 10000 NIS" resolves)."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from ui.format import CURRENCY_RATES
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "currencyswitch1", "currencyswitch1@example.com", "Currency Switch One")
+
+    assert at.session_state["selected_currency"] == "USD"
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        active_currency=None,
+        **kwargs,
+    ):
+        assert active_currency == "USD"  # still USD at the moment of THIS request
+        return {
+            "reply": "Built you a gaming PC within your 10000 NIS budget.",
+            "action": {
+                "type": "load_build",
+                "components": {"CPU": cpu.id, "GPU": gpu.id},
+                "explanation": "Balanced pick within the converted USD budget.",
+            },
+            "currency_switch": "NIS",
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("build me a gaming PC for 10000 NIS").run()
+
+    assert not at.exception
+    # The sidebar selector itself must now show NIS, not just the one reply.
+    assert at.session_state["selected_currency"] == "NIS"
+    assert at.get_by_key("selected_currency").value == "NIS"
+
+    last_message = at.session_state["concierge_messages"][-1]
+    expected_total = (cpu.price_usd + gpu.price_usd) * CURRENCY_RATES["NIS"]
+    assert f"**Total: ₪{expected_total:,.2f}**" in last_message["content"]
+    assert "USD" not in last_message["content"].split("Total:")[-1]
+
+    # Every OTHER price on screen (Build Studio) must also already reflect NIS.
+    usd_metric = next(m for m in at.get_by_key("build_summary_header").metric if m.label == "💰 Total Cost")
+    assert usd_metric.value == f"₪{expected_total:,.2f}"
+
+
+def test_concierge_currency_switch_standalone_restates_total_with_no_action(seeded_db, monkeypatch):
+    """"switch to NIS" / "I asked it to be in NIS" with an ALREADY-active
+    build and no other action: the switch must still fire, and the
+    authoritative total line must still be appended (restated in the new
+    currency), even though action is None."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from ui.format import CURRENCY_RATES
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "currencyswitch2", "currencyswitch2@example.com", "Currency Switch Two")
+    at.get_by_key("sidebar_nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    gpu = components_repo.get_by_category("GPU")[0]
+    at.get_by_key(f"select_GPU_{gpu.id}").click().run()
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        **kwargs,
+    ):
+        return {"reply": "Switched to NIS.", "action": None, "currency_switch": "NIS", "source": "heuristic"}
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("I asked it to be in NIS").run()
+
+    assert not at.exception
+    assert at.session_state["selected_currency"] == "NIS"
+    assert at.get_by_key("selected_currency").value == "NIS"
+
+    last_message = at.session_state["concierge_messages"][-1]
+    expected_total = gpu.price_usd * CURRENCY_RATES["NIS"]
+    assert f"**Total: ₪{expected_total:,.2f}**" in last_message["content"]
+
+
+def test_concierge_currency_switch_not_set_when_no_currency_mentioned(seeded_db, monkeypatch):
+    """A plain build-me request with no currency named at all must leave
+    selected_currency completely untouched -- currency_switch defaulting to
+    None must never accidentally flip anything."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "currencyswitch3", "currencyswitch3@example.com", "Currency Switch Three")
+
+    cpu = components_repo.get_by_category("CPU")[0]
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        **kwargs,
+    ):
+        return {
+            "reply": "Built you a PC.",
+            "action": {"type": "load_build", "components": {"CPU": cpu.id}, "explanation": "Pick."},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("build me a PC with that CPU").run()
+
+    assert not at.exception
+    assert at.session_state["selected_currency"] == "USD"
+    last_message = at.session_state["concierge_messages"][-1]
+    # sanitize_markdown replaces every literal "$" with "USD " (KaTeX-safety,
+    # ui/format.py) -- this is the pre-existing, unchanged USD rendering, not
+    # a regression; see the EUR/NIS tests above for the symbol-preserving case.
+    assert f"**Total: USD {cpu.price_usd:,.2f}**" in last_message["content"]
+
+
+# ---------------------------------------------------------------------------
 # Drafts (db.repositories.drafts_repo) + leaving Build Studio
 # (ui.state.teardown_builder, ui/views/drafts.py) — spec.md §7.9.
 #
@@ -4164,8 +4457,11 @@ def test_concierge_navigate_with_budget_filters_prepopulates_community_widgets(s
     assert mode_widget.value == "Budget"
 
     price_widget = at.get_by_key("community_price_filter")
-    assert price_widget.value != "All Prices"  # a real max_price was requested and matched
-    assert price_widget.value in price_widget.options  # never a value outside the real options
+    assert price_widget.value is not None  # a real max_price was requested and matched (None == "All Prices")
+    # A real, raw USD step number — not a currency-symbol string to parse back (see
+    # ui/views/community.py's `format_func`-based selectbox; `.options` reflects the
+    # FORMATTED display labels, so containment against `.value`'s raw number doesn't apply here).
+    assert isinstance(price_widget.value, (int, float))
 
 
 def test_concierge_navigate_with_workload_filters_prepopulates_community_widgets(seeded_db, monkeypatch):

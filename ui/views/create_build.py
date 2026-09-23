@@ -27,7 +27,7 @@ from llm.advisory import get_build_advisory
 from llm.client import analyze_build
 from ui import state, theme
 from ui.components.part_picker import render_part_picker
-from ui.format import humanize_profile, sanitize_markdown
+from ui.format import format_currency, humanize_profile, sanitize_markdown
 
 CORE_CATEGORIES = solvers.CATEGORY_ORDER
 PERIPHERAL_CATEGORIES = solvers.PERIPHERAL_CATEGORIES
@@ -97,7 +97,8 @@ def _apply_budget_and_generate(build_draft: dict) -> None:
     if entered < floor_cost:
         st.session_state["budget_ceiling_input"] = floor_cost
         ceiling = floor_cost
-        st.toast(f"Budget set to minimum viable floor: ${floor_cost:,.2f}", icon="⚠️")
+        currency = st.session_state.get("selected_currency", "USD")
+        st.toast(f"Budget set to minimum viable floor: {format_currency(floor_cost, currency)}", icon="⚠️")
     else:
         ceiling = entered
 
@@ -122,7 +123,14 @@ def _budget_controls(build_draft: dict) -> None:
             build_draft["budget_ceiling"] = None
 
         st.number_input(
-            "Budget ceiling ($)",
+            # Deliberately always USD-denominated regardless of the sidebar currency
+            # selector (ui/format.py) — the ceiling is compared directly against
+            # Component.price_usd/Build.total_cost everywhere downstream (engine.solvers,
+            # ui.state.resolve_effective_quantity_limit), so converting this INPUT would
+            # require round-tripping it back to USD on every currency change with no
+            # precision-drift bugs; out of scope for this round's DISPLAY-only currency
+            # support (spec.md §7.7) — the label says so explicitly to avoid ambiguity.
+            "Budget ceiling (USD)",
             value=build_draft.get("budget_ceiling") or 1500.0, step=50.0,
             key="budget_ceiling_input", disabled=unlimited,
         )
@@ -263,9 +271,10 @@ def _summary_header(build_draft: dict, build_state: dict) -> None:
     analysis = st.session_state.get("build_draft_analysis")
     live = scoring.live_bottleneck_and_synergy(build_state) if analysis is None else None
 
+    currency = st.session_state.get("selected_currency", "USD")
     with st.container(border=True, key="build_summary_header"):
         cols = st.columns(4)
-        cols[0].metric("💰 Total Cost", f"${total_cost:,.2f}", border=True)
+        cols[0].metric("💰 Total Cost", format_currency(total_cost, currency), border=True)
         cols[1].metric("🔧 Compatibility", f"{report.compatibility_score:.0f}%", border=True)
 
         if analysis:

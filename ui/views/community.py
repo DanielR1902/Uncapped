@@ -11,7 +11,7 @@ from auth.session import current_user
 from db.repositories import builds_repo, community_repo, users_repo
 from ui import state
 from ui.components.build_card import render_build_card
-from ui.format import humanize_profile, sanitize_markdown
+from ui.format import format_currency, humanize_profile, sanitize_markdown
 
 
 def _post_subtitle(build, created_at) -> str:
@@ -119,7 +119,8 @@ def _thread_view(post) -> None:
         # ($477.00)" for 3 units at $159.00 each.
         label = f"{bc.category} (x{bc.quantity})" if bc.quantity > 1 else bc.category
         total_price = bc.component.price_usd * bc.quantity
-        st.write(f"- **{label}**: {bc.component.name} (${total_price:,.2f})")
+        currency = st.session_state.get("selected_currency", "USD")
+        st.write(f"- **{label}**: {bc.component.name} ({format_currency(total_price, currency)})")
 
     cols = st.columns(2)
     if cols[0].button("🍴 Fork / Customize", key="fork_build", use_container_width=True):
@@ -218,15 +219,22 @@ def _apply_pending_community_filters(posts) -> None:
     Every value this function writes is guaranteed to already be one of the
     real options the corresponding selectbox will render this same pass —
     `build_type` falls back to "All" if it's somehow not one of the 4 real
-    mode-filter options; `max_price`/`domain`/`tier` are resolved against
-    `_budget_price_steps`/`_workload_domains`/`_workload_tiers` via
-    `_match_option`, falling back to "All Prices"/"All" (themselves always-
-    real options) rather than ever writing a string absent from a keyed
-    selectbox's own `options` list — the exact class of `StreamlitAPIException`
-    footgun `ui/CLAUDE.md`'s existing `number_input` pre-clamp precedent
-    warns about for a different widget type. Confirmed live via
-    `streamlit.testing.v1.AppTest` (see `tests/test_ui_smoke.py`) that a
-    mismatched/unmatched request degrades gracefully instead of raising."""
+    mode-filter options; `domain`/`tier` are resolved against
+    `_workload_domains`/`_workload_tiers` via `_match_option`, falling back
+    to "All" (itself an always-real option) rather than ever writing a
+    string absent from a keyed selectbox's own `options` list — the exact
+    class of `StreamlitAPIException` footgun `ui/CLAUDE.md`'s existing
+    `number_input` pre-clamp precedent warns about for a different widget
+    type. `community_price_filter` is the one exception to "always a
+    string": it's a raw `float | None` (`None` == "All Prices"), matching
+    `render()`'s own `st.selectbox(..., format_func=...)` widget below —
+    keeping the STORED/COMPARED value a real USD number and letting
+    `format_func` be the only currency-DISPLAY-aware layer (ui/format.py)
+    avoids the fragile "parse the number back out of a currency-symbol
+    string" approach a naive multi-currency label would otherwise need.
+    Confirmed live via `streamlit.testing.v1.AppTest` (see
+    `tests/test_ui_smoke.py`) that a mismatched/unmatched request degrades
+    gracefully instead of raising."""
     pending = st.session_state.pop("pending_community_filters", None)
     if not pending:
         return
@@ -238,12 +246,11 @@ def _apply_pending_community_filters(posts) -> None:
 
     if build_type == "Budget":
         price_steps = _budget_price_steps(posts)
-        price_choice = "All Prices"
+        price_choice: float | None = None  # None == "All Prices" — see render()'s format_func
         max_price = pending.get("max_price")
         if price_steps and max_price is not None:
             covering = [step for step in price_steps if step >= max_price]
-            chosen = min(covering) if covering else price_steps[-1]
-            price_choice = f"${chosen:,.0f}"
+            price_choice = min(covering) if covering else price_steps[-1]
         st.session_state["community_price_filter"] = price_choice
     elif build_type == "Workload":
         domains = _workload_domains(posts)
@@ -289,16 +296,19 @@ def render() -> None:
     domain_filter = "All"
     tier_filter = "All"
 
+    currency = st.session_state.get("selected_currency", "USD")
     if mode_filter == "Budget":
         price_steps = _budget_price_steps(posts)
         if price_steps:
             price_choice = st.selectbox(
                 "Max Price Limit",
-                ["All Prices"] + [f"${p:,.0f}" for p in price_steps],
+                [None] + price_steps,  # None == "All Prices" — a real USD number otherwise, never a
+                # currency-symbol string to parse back (see _apply_pending_community_filters's docstring)
+                format_func=lambda p: "All Prices" if p is None else format_currency(p, currency),
                 key="community_price_filter",
             )
-            if price_choice != "All Prices":
-                price_ceiling = float(price_choice.replace("$", "").replace(",", ""))
+            if price_choice is not None:
+                price_ceiling = float(price_choice)
     elif mode_filter == "Workload":
         col_domain, col_tier = st.columns(2)
         domains = _workload_domains(posts)
@@ -328,7 +338,9 @@ def render() -> None:
 
     for post in filtered_posts:
         with st.container(border=True):
-            st.markdown(sanitize_markdown(f"### {post.title} | ${post.build.total_cost:,.2f}"))
+            st.markdown(
+                sanitize_markdown(f"### {post.title} | {format_currency(post.build.total_cost, currency)}")
+            )
             st.caption(_post_subtitle(post.build, post.created_at))
             if st.button("View", key=f"view_post_{post.id}"):
                 st.session_state["selected_post_id"] = post.id

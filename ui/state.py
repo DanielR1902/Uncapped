@@ -12,11 +12,17 @@ from streamlit.errors import StreamlitWidgetAlreadyInstantiatedError
 from db.models import Component
 from db.repositories import components_repo
 from engine.compatibility import BuildState, resolve_quantity_limit
+from ui.format import DEFAULT_CURRENCY, format_currency
 
 DEFAULT_SORT_CRITERIA = "Cost"
 
 _DEFAULTS = {
     "page": "landing",
+    "selected_currency": DEFAULT_CURRENCY,  # "USD"/"EUR"/"NIS" — the sidebar currency selector's own key
+    # (app.py). Pure display-layer preference (ui/format.py's CURRENCY_RATES/format_currency) — every
+    # stored/compared price (Component.price_usd, Build.total_cost, budget_ceiling) stays in USD regardless
+    # of this value; only rendered strings (and, for llm/concierge.py, pre-formatted strings handed to the
+    # model to quote verbatim) ever convert.
     "auth_user": None,
     "auth_mode": None,
     "auth_error": {},
@@ -271,6 +277,7 @@ def resolve_effective_quantity_limit(
     category: str,
     quantities: dict[str, int],
     budget_ceiling: float | None,
+    currency: str = DEFAULT_CURRENCY,
 ) -> tuple[int | None, str, str]:
     """Combines the real physical slot limit (engine.compatibility.
     resolve_quantity_limit) with a budget-affordability limit, returning
@@ -285,6 +292,11 @@ def resolve_effective_quantity_limit(
     ui/components/part_picker.py already uses when calling render_part_picker
     (it passes build_draft.get("budget_ceiling"), which is None outside
     Budget mode). effective_max is always >= 1 when it is not None.
+
+    `currency` (defaults to "USD") only affects the DISPLAY formatting of
+    `financial_reason` (via `ui.format.format_currency`) — `budget_ceiling`
+    itself is always compared/computed in real USD regardless, since that's
+    what's stored and what every other price in this function is already in.
 
     The financial calculation: holding every OTHER category's cost fixed at
     its current (quantity-scaled) total, how many units of THIS category's
@@ -308,7 +320,7 @@ def resolve_effective_quantity_limit(
         financial_max = max(1, int(remaining_for_category // component.price_usd))
         financial_reason = (
             f"Budget limit reached: cannot afford additional units without exceeding "
-            f"{budget_ceiling:,.2f} USD."
+            f"{format_currency(budget_ceiling, currency)}."
         )
 
     candidates = [v for v in (physical_max, financial_max) if v is not None]
