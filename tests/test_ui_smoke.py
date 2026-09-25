@@ -1539,13 +1539,14 @@ def test_slot_clear_button_removes_component_without_opening_popover(seeded_db):
 
 
 def test_get_advisory_button_populates_cache_with_suggestions(seeded_db):
-    """AI Build Advisory: the "✨ Get AI Analysis & Upgrade Path" button
-    (separate, click-gated feature from the auto-run synergy/bottleneck
-    read) must exist once a build has at least two components, and clicking
-    it must populate `advisory_cache` with a non-empty within_budget and
-    stretch_budget suggestion list. `_no_live_llm_calls` (autouse) keeps
-    this on the network-free heuristic path, same as the existing
-    auto-analysis fallback test above."""
+    """AI Build Advisory: the HUD's compact "✨ AI Analysis" quick action
+    (the ONE trigger now — a duplicate full-page "Get AI Analysis & Upgrade
+    Path" button was removed this round, spec.md §7.4.1, since it populated
+    the exact same cache) must exist once a build has at least two
+    components, and clicking it must populate `advisory_cache` with a
+    non-empty within_budget and stretch_budget suggestion list.
+    `_no_live_llm_calls` (autouse) keeps this on the network-free heuristic
+    path, same as the existing auto-analysis fallback test above."""
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "priya", "priya@example.com", "Priya Row")
@@ -1553,7 +1554,7 @@ def test_get_advisory_button_populates_cache_with_suggestions(seeded_db):
     at.get_by_key("mode_budget").click().run()
     at.get_by_key("apply_budget_generate").click().run()
 
-    advisory_button = at.get_by_key("get_advisory")
+    advisory_button = at.get_by_key("hud_ai_analysis")
     assert advisory_button is not None
     assert advisory_button.disabled is False  # build is complete, well over 2 components
 
@@ -1587,7 +1588,7 @@ def test_apply_in_budget_optimization_changes_components_and_cost(seeded_db):
     at.get_by_key("mode_budget").click().run()
     at.get_by_key("apply_budget_generate").click().run()
 
-    at.get_by_key("get_advisory").click().run()
+    at.get_by_key("hud_ai_analysis").click().run()
     assert not at.exception
 
     cache = at.session_state["advisory_cache"]
@@ -1668,7 +1669,7 @@ def test_apply_in_budget_optimization_terminates_within_round_cap(seeded_db, mon
 
     monkeypatch.setattr(create_build_module, "get_build_advisory", _always_optimizable)
 
-    at.get_by_key("get_advisory").click().run()
+    at.get_by_key("hud_ai_analysis").click().run()
     assert not at.exception
 
     apply_button = at.get_by_key("btn_apply_in_budget")
@@ -1751,7 +1752,7 @@ def test_apply_stretch_upgrade_locks_per_build(seeded_db, monkeypatch):
 
     monkeypatch.setattr(create_build_module, "get_build_advisory", _set_quantity_stretch_advisory)
 
-    at.get_by_key("get_advisory").click().run()
+    at.get_by_key("hud_ai_analysis").click().run()
     assert not at.exception
 
     stretch_button = at.get_by_key("btn_apply_stretch")
@@ -1814,7 +1815,7 @@ def test_apply_stretch_set_quantity_action_updates_quantity(seeded_db, monkeypat
 
     monkeypatch.setattr(create_build_module, "get_build_advisory", _set_quantity_stretch_advisory)
 
-    at.get_by_key("get_advisory").click().run()
+    at.get_by_key("hud_ai_analysis").click().run()
     assert not at.exception
 
     stretch_button = at.get_by_key("btn_apply_stretch")
@@ -1870,7 +1871,7 @@ def test_apply_stretch_swap_action_updates_component(seeded_db, monkeypatch):
 
     monkeypatch.setattr(create_build_module, "get_build_advisory", _swap_stretch_advisory)
 
-    at.get_by_key("get_advisory").click().run()
+    at.get_by_key("hud_ai_analysis").click().run()
     assert not at.exception
 
     stretch_button = at.get_by_key("btn_apply_stretch")
@@ -1911,7 +1912,7 @@ def test_advisory_apply_buttons_disabled_when_no_swaps(seeded_db, monkeypatch):
 
     monkeypatch.setattr(create_build_module, "get_build_advisory", _no_swaps_advisory)
 
-    at.get_by_key("get_advisory").click().run()
+    at.get_by_key("hud_ai_analysis").click().run()
     assert not at.exception
 
     assert at.get_by_key("btn_apply_in_budget").disabled is True
@@ -1925,13 +1926,15 @@ def test_advisory_apply_buttons_disabled_when_no_swaps(seeded_db, monkeypatch):
 
 
 def test_reset_all_fields_clears_build_and_budget_ceiling(seeded_db):
-    """Studio redesign: the 'Sort candidates by' control was replaced by a
-    single 'Reset All Fields' button that empties every slot and restores
-    the budget ceiling to its clean default in one click. Budget ceiling
-    commits are now apply-on-click (not live-synced as you type), so a
-    fresh draft's budget_ceiling is None until "Apply budget & generate
-    build" is clicked again — it's the *widget's displayed value* that
-    resets to the clean default immediately, not the committed one."""
+    """Studio redesign: the HUD's compact "🔄 Reset Build" quick action (the
+    ONE reset entry point now — a duplicate full-page "Reset All Fields"
+    button calling the exact same `_do_reset_build` was removed this round,
+    spec.md §7.4.1) empties every slot and restores the budget ceiling to its
+    clean default in one click. Budget ceiling commits are now apply-on-click
+    (not live-synced as you type), so a fresh draft's budget_ceiling is None
+    until "Apply budget & generate build" is clicked again — it's the
+    *widget's displayed value* that resets to the clean default immediately,
+    not the committed one."""
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "ulysses", "ulysses@example.com", "Ulysses Row")
@@ -1943,7 +1946,7 @@ def test_reset_all_fields_clears_build_and_budget_ceiling(seeded_db):
     assert at.session_state["build_draft"]["components"]  # non-empty before reset
     assert at.session_state["build_draft"]["budget_ceiling"] == 900.0
 
-    at.get_by_key("reset_all_fields").click().run()
+    at.get_by_key("hud_reset_build").click().run()
 
     assert not at.exception
     assert at.session_state["build_draft"]["components"] == {}
@@ -1995,10 +1998,10 @@ def test_hud_compatibility_pill_reflects_real_score(seeded_db):
 
 
 def test_hud_reset_build_button_matches_reset_all_fields(seeded_db):
-    """The HUD's compact "Reset Build" quick action must clear the build the
-    exact same way the full "Reset All Fields" button does (both call the
-    shared _do_reset_build helper) -- proven here via the HUD's OWN key,
-    hud_reset_build, distinct from reset_all_fields."""
+    """The HUD's compact "Reset Build" quick action must clear the build via
+    the shared `_do_reset_build` helper — the ONE reset entry point now (a
+    duplicate full-page "Reset All Fields" button that called the exact same
+    helper was removed this round, spec.md §7.4.1)."""
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "hud3", "hud3@example.com", "Hud Three")
@@ -2014,11 +2017,12 @@ def test_hud_reset_build_button_matches_reset_all_fields(seeded_db):
 
 
 def test_hud_ai_analysis_populates_same_cache_as_get_advisory_button(seeded_db):
-    """The HUD's compact "AI Analysis" quick action (_trigger_advisory) must
-    populate the SAME st.session_state["advisory_cache"] entry the full
-    "Get AI Analysis & Upgrade Path" button (_advisory_controls) reads --
-    proven by triggering via the HUD button and asserting the advisory
-    expander's own content appears with no separate click on get_advisory."""
+    """The HUD's compact "AI Analysis" quick action (`_trigger_advisory`) —
+    the ONE trigger now (a duplicate full-page "Get AI Analysis & Upgrade
+    Path" button was removed this round, spec.md §7.4.1) — must populate
+    `st.session_state["advisory_cache"]` and have `_advisory_controls`'s
+    results panel (a pure display read now) pick it up with no separate
+    click of its own."""
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
     _register(at, "hud4", "hud4@example.com", "Hud Four")
@@ -2106,6 +2110,128 @@ def test_community_rate_my_build_flair_badge_shown_on_feed_and_thread(seeded_db)
     at.get_by_key(view_buttons[0]).click().run()
     thread_text = "\n".join(m.value for m in at.markdown)
     assert "Rate My Build" in thread_text
+
+
+def test_previous_builds_publish_form_requires_flair_before_creating_tagged_post(seeded_db):
+    """Clicking "Share to Community" on a Previous Builds card must NOT
+    publish immediately — it opens an inline form (description + flair);
+    only "Confirm & Publish" actually creates the real, tagged post, and the
+    original saved build is left completely untouched throughout."""
+    from db.repositories import builds_repo, community_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "publishform1", "publishform1@example.com", "Publish Form One")
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=at.session_state["auth_user"]["id"], name="Form Publish Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=False,
+    )
+
+    at.get_by_key("sidebar_nav_my_builds").click().run()
+    at.get_by_key(f"Share_to_Community_{build.id}").click().run()
+
+    # No post created yet — the click only opened the form.
+    assert community_repo.get_feed() == []
+    assert at.get_by_key(f"publish_flair_{build.id}") is not None
+
+    at.get_by_key(f"publish_flair_{build.id}").select("Looking for Help").run()
+    at.get_by_key(f"publish_description_{build.id}").set_value("Need advice on cooling.").run()
+    at.get_by_key(f"publish_confirm_{build.id}").click().run()
+
+    assert not at.exception
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    assert feed[0].flair == "Looking for Help"
+    assert feed[0].author_notes == "Need advice on cooling."
+    assert feed[0].build_id == build.id
+    # The original build row itself is untouched beyond the publish flip.
+    refreshed = builds_repo.get_build(build.id)
+    assert refreshed.name == "Form Publish Rig"
+    assert refreshed.is_public is True
+
+
+def test_your_posts_view_lists_authored_posts_only(seeded_db):
+    """"Your Posts" (sidebar, between Drafts and Community) shows only the
+    logged-in user's own posts, with their flair badge."""
+    from db.repositories import builds_repo, community_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "yourposts1", "yourposts1@example.com", "Your Posts One")
+    user_id = at.session_state["auth_user"]["id"]
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=user_id, name="Your Posts Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    post = community_repo.create_post(build.id, user_id, "Your Posts Rig", flair="Rate My Build")
+
+    at.get_by_key("sidebar_nav_your_posts").click().run()
+
+    assert not at.exception
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "Your Posts Rig" in page_text
+    assert "Rate My Build" in page_text
+    assert at.get_by_key(f"view_in_community_{post.id}") is not None
+    assert at.get_by_key(f"delete_post_{post.id}") is not None
+
+
+def test_your_posts_view_in_community_navigates_to_thread(seeded_db):
+    from db.repositories import builds_repo, community_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "yourposts2", "yourposts2@example.com", "Your Posts Two")
+    user_id = at.session_state["auth_user"]["id"]
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=user_id, name="View Nav Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    post = community_repo.create_post(build.id, user_id, "View Nav Rig")
+
+    at.get_by_key("sidebar_nav_your_posts").click().run()
+    at.get_by_key(f"view_in_community_{post.id}").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "community"
+    assert at.session_state["selected_post_id"] == post.id
+    thread_text = "\n".join(m.value for m in at.markdown)
+    assert "View Nav Rig" in thread_text
+
+
+def test_your_posts_delete_removes_post_but_keeps_saved_build(seeded_db):
+    from db.repositories import builds_repo, community_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "yourposts3", "yourposts3@example.com", "Your Posts Three")
+    user_id = at.session_state["auth_user"]["id"]
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=user_id, name="Delete Post Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    post = community_repo.create_post(build.id, user_id, "Delete Post Rig")
+
+    at.get_by_key("sidebar_nav_your_posts").click().run()
+    at.get_by_key(f"delete_post_{post.id}").click().run()
+    at.get_by_key(f"confirm_delete_post_{post.id}_yes").click().run()
+
+    assert not at.exception
+    assert community_repo.get_post(post.id) is None
+    # The saved build must survive completely untouched.
+    assert builds_repo.get_build(build.id) is not None
+    assert builds_repo.get_build(build.id).name == "Delete Post Rig"
 
 
 def test_part_picker_empty_slot_uses_wireframe_key_and_socket_match_badge(seeded_db):
@@ -2989,6 +3115,21 @@ def test_concierge_use_remaining_budget_spends_headroom_without_exceeding_ceilin
     last_message = at.session_state["concierge_messages"][-1]["content"]
     assert "Delta:" in last_message
     assert "Total:" in last_message
+
+
+def test_sidebar_nav_includes_your_posts_and_concierge_expanded_by_default(seeded_db):
+    """This round's sidebar restructure (spec.md §7.7/§7.8): "Your Posts" is
+    a real nav button between Drafts and Community, and the AI Concierge
+    expander is pinned open (expanded=True) on load rather than requiring a
+    click to reveal."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "sidebarorder1", "sidebarorder1@example.com", "Sidebar Order One")
+
+    assert at.get_by_key("sidebar_nav_your_posts") is not None
+    expanders = [e for e in at.expander if "AI Concierge" in (e.label or "")]
+    assert len(expanders) == 1
+    assert expanders[0].proto.expanded is True
 
 
 def test_concierge_never_calls_live_llm_without_api_key(seeded_db):

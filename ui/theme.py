@@ -437,17 +437,6 @@ def inject_css() -> None:
             box-shadow: 0 0 10px {PRIMARY_ACCENT}55;
         }}
 
-        /* Best-effort: push the sidebar's last element (Logout) toward the
-        bottom via flex layout. Streamlit's internal sidebar DOM structure can
-        shift between versions, so this degrades gracefully to a normal
-        top-down stack if the selector doesn't match. */
-        section[data-testid="stSidebar"] > div:first-child {{
-            display: flex;
-            flex-direction: column;
-            min-height: 100vh;
-        }}
-        .uncapped-sidebar-spacer {{ flex-grow: 1; }}
-
         /* Lock the sidebar to a fixed width and remove the native
         collapse/expand control — the app's own nav (Home/Create/Drafts/
         Previous Builds/Community) and the AI Concierge live only in the

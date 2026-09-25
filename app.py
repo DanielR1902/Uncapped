@@ -85,6 +85,7 @@ with st.sidebar:
             ("🛠️ Create New PC", "create_build"),
             ("📂 Previous Builds", "my_builds"),
             ("📝 View Drafts", "drafts"),
+            ("📮 Your Posts", "your_posts"),
             ("🌐 Community", "community"),
         )
         for label, target_page in nav_targets:
@@ -96,14 +97,22 @@ with st.sidebar:
 
         st.markdown("---")
 
-        render_concierge_widget()
-
-        st.markdown('<div class="uncapped-sidebar-spacer"></div>', unsafe_allow_html=True)
+        # Logout sits directly below the nav list now (between the two
+        # divider lines) rather than being pushed to the very bottom of the
+        # sidebar — the AI Concierge (pinned open below, expanded=True) is
+        # the new bottom-most element instead, per this round's restructure.
+        # The old `.uncapped-sidebar-spacer` flex-push (ui/theme.py) is no
+        # longer needed for this: Logout no longer needs pushing anywhere,
+        # it's already positioned exactly where this ordering puts it.
         if st.button("Logout", key="logout_button", use_container_width=True):
             if st.session_state.get("page") == "create_build":
                 state.teardown_builder()
             log_out()
             st.rerun()
+
+        st.markdown("---")
+
+        render_concierge_widget()
     else:
         st.caption("Not logged in")
 

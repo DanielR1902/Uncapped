@@ -285,6 +285,57 @@ def test_community_post_flair(temp_db):
     assert community_repo.get_post(rated_post.id).flair == "Rate My Build"
 
 
+def test_get_posts_for_user_scoped_to_author(temp_db):
+    """"Your Posts" (spec.md §7.6.2) — only the given user's own posts, newest
+    first, never another author's."""
+    run_seed()
+    alice = users_repo.create_user("postsalice", "hash", "postsalice@example.com", "Alice Posts")
+    bob = users_repo.create_user("postsbob", "hash", "postsbob@example.com", "Bob Posts")
+    cpu = components_repo.get_by_category("CPU")[0]
+
+    def _build_and_post(user, name):
+        build = builds_repo.create_build(
+            user_id=user.id, name=name, creation_mode="Free",
+            components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+            total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+        )
+        return community_repo.create_post(build.id, user.id, name)
+
+    alice_post = _build_and_post(alice, "Alice Rig")
+    _build_and_post(bob, "Bob Rig")
+
+    alice_posts = community_repo.get_posts_for_user(alice.id)
+    assert [p.id for p in alice_posts] == [alice_post.id]
+
+
+def test_delete_post_removes_post_and_comments_but_not_the_build(temp_db):
+    """"Your Posts" delete action (spec.md §7.6.2) — the crucial rule this
+    guards: deleting a community post must NEVER delete or alter the
+    underlying saved Build row (Previous Builds stays completely intact),
+    while the post's own comments DO cascade away with it."""
+    run_seed()
+    user = users_repo.create_user("delpost1", "hash", "delpost1@example.com", "Del Post One")
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=user.id, name="Deletable Post Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    post = community_repo.create_post(build.id, user.id, "Deletable Post Rig")
+    community_repo.add_comment(post.id, user.id, "First!")
+
+    community_repo.delete_post(post.id)
+
+    assert community_repo.get_post(post.id) is None
+    assert community_repo.get_comments(post.id) == []
+    # The build itself must survive untouched in Previous Builds.
+    assert builds_repo.get_build(build.id) is not None
+    assert builds_repo.get_build(build.id).name == "Deletable Post Rig"
+
+    # No-op, not a crash, on an already-deleted post.
+    community_repo.delete_post(post.id)
+
+
 def test_community_threaded_comments(temp_db):
     """A reply (parent_comment_id set) is a real, distinct row from a
     top-level comment, and get_comments still returns a FLAT list ordered

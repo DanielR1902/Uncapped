@@ -7,12 +7,15 @@ Bottleneck; the LLM-backed synergy/bottleneck read still auto-runs the
 instant a build first becomes complete in ANY mode, see
 `_maybe_auto_analyze`, it just no longer surfaces a source badge or a
 manual re-trigger button — a deliberate decluttering, not an oversight) →
-an explicit "✨ Get AI Analysis & Upgrade Path" advisory button (see
-`_advisory_controls`; a separate, click-gated feature from the auto-run
-synergy/bottleneck read above it, available in every mode) → a
-"Reset All Fields" control → the 8 core slots in a 2-column grid +
+the AI Build Advisory RESULTS panel (`_advisory_controls`; a separate,
+click-gated feature from the auto-run synergy/bottleneck read above it,
+available in every mode — but, as of this round's cleanup, triggered ONLY by
+the HUD's own compact "✨ AI Analysis" quick action, `_hud_actions`, never a
+second duplicate button here) → the 8 core slots in a 2-column grid +
 optional peripherals → save/publish (with an optional community post
-description when publishing).
+description when publishing). The HUD's own compact "🔄 Reset Build" action
+is likewise the ONE reset entry point now — a duplicate full-page "Reset All
+Fields" button that called the exact same underlying logic was removed.
 """
 from __future__ import annotations
 
@@ -178,12 +181,6 @@ def _do_reset_build(build_draft: dict) -> None:
     st.session_state.pop("budget_unlimited_input", None)
     st.session_state.pop("workload_profile_input", None)
     st.session_state.pop("workload_tier_input", None)
-
-
-def _reset_controls(build_draft: dict) -> None:
-    if st.button("🔄 Reset All Fields", key="reset_all_fields"):
-        _do_reset_build(build_draft)
-        st.rerun()
 
 
 def _candidates_for(build_draft: dict, build_state: dict, category: str) -> list:
@@ -563,12 +560,12 @@ def _apply_within_budget_optimization(
 
 
 def _advisory_cache_key(build_draft: dict, build_state: dict) -> tuple[str | None, float, tuple]:
-    """Shared cache-key computation (spec.md §7.4.1) — both the existing
-    "✨ Get AI Analysis & Upgrade Path" button (below) and the HUD's compact
-    "AI Analysis" quick action (`_hud_actions`) need to land in the SAME
-    `st.session_state["advisory_cache"]` entry for a given build, or the two
-    entry points would silently diverge into separate cached results for
-    what is logically the identical request."""
+    """Shared cache-key computation (spec.md §7.4.1) — the HUD's compact
+    "AI Analysis" quick action (`_hud_actions`, the ONE trigger now) and
+    `_advisory_controls`'s own results-display read both need to land on the
+    SAME `st.session_state["advisory_cache"]` entry for a given build, or a
+    click on the HUD button would populate a cache entry the results panel
+    then fails to find."""
     mode = build_draft.get("creation_mode")
     current_budget_or_cost = build_draft.get("budget_ceiling") if mode == "Budget" else None
     if not current_budget_or_cost:
@@ -629,20 +626,27 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
     describes — the same "a change invalidates the old read" philosophy
     `ui/state.py`'s `_invalidate_analysis` already applies to the synergy/
     bottleneck card.
+
+    NO OWN TRIGGER BUTTON (this round's cleanup — spec.md §7.4.1): this used
+    to render its own "✨ Get AI Analysis & Upgrade Path" button calling
+    `_trigger_advisory` directly, duplicating the HUD's own compact "✨ AI
+    Analysis" quick action (`_hud_actions`), which already calls the EXACT
+    same `_trigger_advisory` into the EXACT same shared cache
+    (`_advisory_cache_key`'s whole reason for existing). Two buttons that
+    populate the identical cache entry is real, confirmed redundancy, not two
+    different features — removed here, leaving the HUD's button as the ONE
+    trigger; this function is now purely a "display whatever's cached for
+    the current build, if anything" read, which is why a stale cache entry
+    for a DIFFERENT build/mode/cost still correctly shows nothing (the cache
+    key lookup below simply misses) rather than needing its own gating.
     """
     mode, current_budget_or_cost, cache_key = _advisory_cache_key(build_draft, build_state)
     cache = st.session_state.setdefault("advisory_cache", {})
 
-    if st.button(
-        "✨ Get AI Analysis & Upgrade Path",
-        key="get_advisory",
-        use_container_width=True,
-        disabled=len(build_state) < 2,
-    ):
-        _trigger_advisory(build_draft, build_state)
-
     advisory = cache.get(cache_key)
     if advisory is None:
+        if len(build_state) >= 2:
+            st.caption("Click **✨ AI Analysis** above to get optimization tips and an upgrade path.")
         return
 
     stretch_amount = round(current_budget_or_cost * 0.10 / 10) * 10
@@ -811,7 +815,11 @@ def render() -> None:
     _summary_header(build_draft, build_state)
     _advisory_controls(build_draft, build_state)
 
-    _reset_controls(build_draft)
+    # No own "Reset All Fields" button here anymore (this round's cleanup,
+    # spec.md §7.4.1) — it called the EXACT same `_do_reset_build` as the
+    # HUD's own compact "🔄 Reset Build" quick action, a real, confirmed
+    # duplicate, not a second feature; that HUD button is now the ONE reset
+    # entry point.
     _part_pickers(build_draft, build_state)
 
     # re-resolve after the picker section: a Select/Remove click above

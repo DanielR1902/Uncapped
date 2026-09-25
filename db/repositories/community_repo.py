@@ -56,6 +56,41 @@ def get_feed() -> list[CommunityPost]:
         return posts
 
 
+def get_posts_for_user(user_id: int) -> list[CommunityPost]:
+    """Every real, currently-shared post authored by `user_id` — newest
+    first, same ordering as `get_feed()` (§7.6.2's "Your Posts" management
+    view). Unlike `get_feed()`, this is scoped to one author, but shares the
+    exact same eager-load shape (`_POST_EAGER`) so a card here can show the
+    same build snapshot data the main feed's cards do."""
+    with session_scope() as session:
+        posts = list(
+            session.execute(
+                select(CommunityPost)
+                .where(CommunityPost.user_id == user_id)
+                .options(*_POST_EAGER)
+                .order_by(CommunityPost.created_at.desc())
+            )
+            .scalars()
+            .all()
+        )
+        session.expunge_all()
+        return posts
+
+
+def delete_post(post_id: int) -> None:
+    """Deletes ONLY the community post (and, via the DB-level ON DELETE
+    CASCADE on `community_comments.post_id`, its comments) — never the
+    underlying `Build` row (§7.6.2's "Your Posts" management view: deleting a
+    post must never touch the user's saved build in Previous Builds). No-op
+    if the post is already gone, matching `builds_repo.delete_build`'s own
+    precedent."""
+    with session_scope() as session:
+        post = session.get(CommunityPost, post_id)
+        if post is None:
+            return
+        session.delete(post)
+
+
 def add_comment(post_id: int, user_id: int, content: str, parent_comment_id: int | None = None) -> CommunityComment:
     """`parent_comment_id` (optional, defaults to `None` — a top-level comment)
     is the id of the comment this one directly replies to (spec.md §3.7/§7.6,

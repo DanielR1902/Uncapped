@@ -1243,7 +1243,7 @@ def _apply_concierge_action(action: dict | None) -> float | None:
 
 def render_concierge_widget() -> None:
     """Called from app.py's sidebar, only when a user is authenticated."""
-    with st.expander("💬 AI Concierge & Site Navigator", expanded=False):
+    with st.expander("💬 AI Concierge & Site Navigator", expanded=True):
         # Renders the FULL conversation history (never sliced/dropped here —
         # a deliberate reversal of an earlier round's display-only [-4:]
         # slice, which made older turns permanently unreachable). The fixed
