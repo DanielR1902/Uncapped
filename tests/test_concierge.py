@@ -138,6 +138,35 @@ def test_concierge_response_requires_reply_field():
         ConciergeResponse.model_validate({"action": None})
 
 
+def test_load_build_action_parses_budget_cap_usd():
+    """HARD CEILING / TARGET-ZONE ENFORCEMENT (spec.md §6.7 intent 3): a
+    budget-stated build-me request leaves `components` empty (or seed-only)
+    and carries the converted-to-USD `budget_cap_usd` instead — `None` when
+    absent (the pre-existing, unchanged no-budget shape)."""
+    payload = {
+        "reply": "Building a sturdy gaming rig within your budget.",
+        "action": {
+            "type": "load_build",
+            "components": {},
+            "budget_cap_usd": 1891.89,
+            "explanation": "Budget-mode solver will fill every category.",
+        },
+    }
+    response = ConciergeResponse.model_validate(payload)
+    assert response.action is not None
+    assert response.action.budget_cap_usd == 1891.89
+    assert response.action.components == {}
+
+
+def test_load_build_action_budget_cap_usd_defaults_to_none():
+    payload = {
+        "reply": "Built a rig around the RTX 4070.",
+        "action": {"type": "load_build", "components": {"CPU": 1, "GPU": 4}},
+    }
+    response = ConciergeResponse.model_validate(payload)
+    assert response.action.budget_cap_usd is None
+
+
 # ---------------------------------------------------------------------------
 # Intent 1: catalog questions
 # ---------------------------------------------------------------------------
@@ -210,7 +239,39 @@ def test_build_me_intent_with_valid_action_passes_through(monkeypatch):
     )
 
     assert result["source"] == "llm"
-    assert result["action"] == payload["action"]
+    # budget_cap_usd defaults to None and is always present in the dumped
+    # action (Part 2, spec.md §6.7 intent 3) — not part of the original
+    # payload, which predates that field.
+    assert result["action"] == {**payload["action"], "budget_cap_usd": None}
+
+
+def test_build_me_intent_with_stated_budget_passes_through_budget_cap(monkeypatch):
+    """A budget-stated build-me request ("... for up to 12000 NIS") — the
+    action carries `budget_cap_usd` and an empty `components` (nothing named)
+    rather than a full 8-category guess; `_validate_action` has nothing to
+    cross-check against an empty `components` dict, so this passes straight
+    through, exactly like the no-budget case above."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Building a sturdy gaming rig for you within your 12000 NIS budget.",
+        "action": {
+            "type": "load_build",
+            "components": {},
+            "budget_cap_usd": 3243.24,
+            "explanation": "Budget-mode solver fills every category toward the ceiling.",
+        },
+        "currency_switch": "NIS",
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "build a sturdy gaming computer that costs up to 12000 NIS", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["budget_cap_usd"] == 3243.24
+    assert result["action"]["components"] == {}
+    assert result["currency_switch"] == "NIS"
 
 
 # ---------------------------------------------------------------------------
@@ -1155,7 +1216,7 @@ def test_concierge_save_build_action_parses_fine_with_both_fields_present():
 def test_concierge_response_parses_publish_build_action_with_null_author_notes():
     payload = {
         "reply": "Published without a description.",
-        "action": {"type": "publish_build", "author_notes": None},
+        "action": {"type": "publish_build", "author_notes": None, "flair": "Rate My Build"},
     }
     response = ConciergeResponse.model_validate(payload)
     assert response.action is not None
@@ -1166,10 +1227,25 @@ def test_concierge_response_parses_publish_build_action_with_null_author_notes()
 def test_concierge_response_parses_publish_build_action_with_author_notes():
     payload = {
         "reply": "Published with your notes.",
-        "action": {"type": "publish_build", "author_notes": "Great 1440p gaming build on a budget."},
+        "action": {
+            "type": "publish_build",
+            "author_notes": "Great 1440p gaming build on a budget.",
+            "flair": "Looking for Help",
+        },
     }
     response = ConciergeResponse.model_validate(payload)
     assert response.action.author_notes == "Great 1440p gaming build on a budget."
+
+
+def test_concierge_response_publish_build_requires_flair():
+    """flair is REQUIRED (no default) on publish_build — the model must NEVER
+    publish "silently" with no tag chosen (Part 2, this round's directive)."""
+    payload = {
+        "reply": "Published without a description.",
+        "action": {"type": "publish_build", "author_notes": None},
+    }
+    with pytest.raises(PydanticValidationError):
+        ConciergeResponse.model_validate(payload)
 
 
 def test_save_build_first_message_asks_for_name_and_destination_with_no_action(monkeypatch):
@@ -1237,6 +1313,7 @@ def test_save_build_followup_with_both_name_and_destination_returns_action(monke
         "destination": "build",
         "publish_immediately": False,
         "author_notes": None,
+        "flair": None,
         "source": "studio",
         "source_post_id": None,
         "explanation": "Saving the active build as a finished build.",
@@ -1498,7 +1575,7 @@ def test_publish_confirmation_yes_then_description_no_returns_publish_action(mon
     ]
     payload = {
         "reply": "Published to the Community without a description.",
-        "action": {"type": "publish_build", "author_notes": None},
+        "action": {"type": "publish_build", "author_notes": None, "flair": "Rate My Build"},
     }
     monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
 
@@ -1507,7 +1584,7 @@ def test_publish_confirmation_yes_then_description_no_returns_publish_action(mon
     )
 
     assert result["source"] == "llm"
-    assert result["action"] == {"type": "publish_build", "author_notes": None}
+    assert result["action"] == {"type": "publish_build", "author_notes": None, "flair": "Rate My Build"}
 
 
 def test_publish_confirmation_with_description_text_returns_publish_action_with_notes(monkeypatch):
@@ -1526,7 +1603,11 @@ def test_publish_confirmation_with_description_text_returns_publish_action_with_
     ]
     payload = {
         "reply": "Published with your description!",
-        "action": {"type": "publish_build", "author_notes": "Great value 1440p gaming rig."},
+        "action": {
+            "type": "publish_build",
+            "author_notes": "Great value 1440p gaming rig.",
+            "flair": "Rate My Build",
+        },
     }
     monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
 
@@ -1542,6 +1623,7 @@ def test_publish_confirmation_with_description_text_returns_publish_action_with_
     assert result["action"] == {
         "type": "publish_build",
         "author_notes": "Great value 1440p gaming rig.",
+        "flair": "Rate My Build",
     }
 
 
@@ -1569,6 +1651,7 @@ def test_publish_confirmation_with_ai_generated_description_request_returns_comp
         "action": {
             "type": "publish_build",
             "author_notes": "Built around a Ryzen 7 5800X3D and RTX 4070 for smooth 1440p gaming.",
+            "flair": "Rate My Build",
         },
     }
     monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
@@ -1586,6 +1669,7 @@ def test_publish_confirmation_with_ai_generated_description_request_returns_comp
     assert result["action"] == {
         "type": "publish_build",
         "author_notes": "Built around a Ryzen 7 5800X3D and RTX 4070 for smooth 1440p gaming.",
+        "flair": "Rate My Build",
     }
 
 
@@ -1608,7 +1692,11 @@ def test_publish_confirmation_with_description_text_still_returns_verbatim_notes
     ]
     payload = {
         "reply": "Published with your description!",
-        "action": {"type": "publish_build", "author_notes": "My own hand-written description."},
+        "action": {
+            "type": "publish_build",
+            "author_notes": "My own hand-written description.",
+            "flair": "Looking for Help",
+        },
     }
     monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
 
@@ -1624,6 +1712,7 @@ def test_publish_confirmation_with_description_text_still_returns_verbatim_notes
     assert result["action"] == {
         "type": "publish_build",
         "author_notes": "My own hand-written description.",
+        "flair": "Looking for Help",
     }
 
 
@@ -2093,7 +2182,57 @@ def test_optimize_bottleneck_action_passes_through(monkeypatch):
     )
 
     assert result["source"] == "llm"
-    assert result["action"] == {"type": "optimize_bottleneck", "explanation": ""}
+    # target_percentage defaults to None and is always present in the dumped
+    # action (Part 2, this round's spec.md §6.7 intent 12).
+    assert result["action"] == {"type": "optimize_bottleneck", "target_percentage": None, "explanation": ""}
+
+
+def test_optimize_bottleneck_action_parses_explicit_target_percentage(monkeypatch):
+    """"try to get it under 10%" -> the model's own extracted numeric ceiling
+    is carried through verbatim on the action (never a fraction)."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Rebalancing your CPU/GPU pairing now.",
+        "action": {"type": "optimize_bottleneck", "target_percentage": 10.0},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    build_context = dict(CURRENT_BUILD_CONTEXT)
+    build_context["compatibility_issues"] = []
+    build_context["bottleneck"] = {"percentage": 39.0, "direction": "CPU-bound"}
+
+    result = concierge.get_concierge_response(
+        "try to get it under 10%. make the necessary changes please", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY,
+        current_build_context=build_context,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["target_percentage"] == 10.0
+
+
+def test_use_remaining_budget_action_passes_through(monkeypatch):
+    """"is there any upgrade possible within my budget?" -> a pure
+    pass-through use_remaining_budget action, no LLM-asserted catalog id or
+    price delta at all (Part 3, this round's directive: deterministic
+    upgrade arithmetic, never LLM-computed)."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Using your remaining budget on the best upgrades that fit.",
+        "action": {"type": "use_remaining_budget"},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    build_context = dict(CURRENT_BUILD_CONTEXT)
+    build_context["mode"] = "Budget"
+    build_context["budget_ceiling"] = 3243.24
+
+    result = concierge.get_concierge_response(
+        "is there any upgrade possible within my budget?", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY,
+        current_build_context=build_context,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {"type": "use_remaining_budget", "explanation": ""}
 
 
 # ---------------------------------------------------------------------------

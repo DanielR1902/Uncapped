@@ -2,12 +2,12 @@
 (spec.md §7.2/§7.11): hero header, capability matrix, tiered preset
 launchpad, a trending-builds reel, and inline auth modal (spec.md §7.3,
 intent.txt §2). Every WRITE action (loading a preset/draft into the Studio,
-the 3 primary nav buttons) still requires auth — this app has no real
-anonymous/guest session anywhere else (router.py's own comment: "all
-buttons locked" pre-login, intent.txt) — so "Continue as Guest Architect"
-below is a labeled invitation into registration, not real guest access;
-implementing actual anonymous browsing would be a foundational, app-wide
-gating change well beyond a home-page redesign.
+the 3 primary nav buttons, inspecting a trending build) requires auth — this
+app has no real anonymous/guest session anywhere else (router.py's own
+comment: "all buttons locked" pre-login, intent.txt); a logged-out visitor
+sees only the Login/Register forms, with an inline red notice next to the
+Preset Launchpad/Trending Builds section headers explaining why those
+buttons are locked.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import json
 
 import streamlit as st
 
-from auth.session import current_user, set_auth_mode
+from auth.session import current_user
 from db.repositories import community_repo, drafts_repo
 from engine import solvers
 from ui import state, theme
@@ -129,7 +129,8 @@ def _capability_matrix() -> None:
 
 
 def _preset_launchpad(authenticated: bool) -> None:
-    st.markdown(theme.section_header("Tiered Preset Launchpad"), unsafe_allow_html=True)
+    suffix = None if authenticated else theme.auth_required_notice()
+    st.markdown(theme.section_header("Tiered Preset Launchpad", suffix_html=suffix), unsafe_allow_html=True)
     currency = st.session_state.get("selected_currency", "USD")
     cols = st.columns(3)
     for col, (key, name, subtitle, profile, tier) in zip(cols, _PRESET_TIERS):
@@ -149,11 +150,12 @@ def _preset_launchpad(authenticated: bool) -> None:
                     _load_preset_into_studio(profile, tier)
 
 
-def _trending_builds_reel() -> None:
+def _trending_builds_reel(authenticated: bool) -> None:
     posts = community_repo.get_feed()[:3]
     if not posts:
         return
-    st.markdown(theme.section_header("Trending Community Builds"), unsafe_allow_html=True)
+    suffix = None if authenticated else theme.auth_required_notice()
+    st.markdown(theme.section_header("Trending Community Builds", suffix_html=suffix), unsafe_allow_html=True)
     currency = st.session_state.get("selected_currency", "USD")
     cols = st.columns(3)
     for col, post in zip(cols, posts):
@@ -167,8 +169,11 @@ def _trending_builds_reel() -> None:
                 st.markdown(f"**{sanitize_markdown(post.title)}**")
                 st.caption(format_currency(post.build.total_cost, currency))
                 if post.flair:
-                    st.markdown(theme.pulse_badge(post.flair, "flair"), unsafe_allow_html=True)
-                if st.button("Inspect Blueprint", key=f"trending_view_{post.id}", use_container_width=True):
+                    st.markdown(theme.flair_badge(post.flair), unsafe_allow_html=True)
+                if st.button(
+                    "Inspect Blueprint", key=f"trending_view_{post.id}", use_container_width=True,
+                    disabled=not authenticated,
+                ):
                     st.session_state["selected_post_id"] = post.id
                     st.session_state["page"] = "community"
                     st.rerun()
@@ -189,9 +194,6 @@ def _user_state_panel(authenticated: bool) -> None:
 
     st.info("Log in or create an account to unlock the Build Studio, Community, and saved builds.")
     render_auth_modal()
-    if st.button("Continue as Guest Architect", key="continue_as_guest"):
-        set_auth_mode("register")
-        st.rerun()
 
 
 def render() -> None:
@@ -203,4 +205,4 @@ def render() -> None:
     st.divider()
     _preset_launchpad(authenticated)
     st.divider()
-    _trending_builds_reel()
+    _trending_builds_reel(authenticated)

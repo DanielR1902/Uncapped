@@ -8,28 +8,30 @@ import re
 import streamlit as st
 
 
-# Sci-Fi "Data Observatory / Cyber-Telemetry HUD" palette (spec.md §7.7).
-# Values below ARE the palette — updating them here is the entire reskin,
-# since every view in this app already imports color constants from this one
-# module rather than hardcoding hex (db/CLAUDE.md-style single-source-of-
-# truth discipline); no tests assert on any specific hex value (checked
-# before this change), so swapping them in place is safe. Replaces the prior
-# Cyber-Minimalist / High-Tech Industrial round's palette entirely.
-BACKGROUND = "#050814"  # Deep Cyber Navy
-SURFACE = "#0c1024"  # Surface panels / telemetry modules
-SURFACE_BORDER = "rgba(0, 242, 254, 0.2)"
-GLASS_SURFACE = "rgba(12, 16, 36, 0.75)"  # backdrop-filter-blurred panel fill
-PRIMARY_ACCENT = "#00f2fe"  # Primary Telemetry Cyan — general CTA/accent color
-MATRIX_GREEN = "#10b981"  # Optimal/Compatible status — deliberately distinct
-# from PRIMARY_ACCENT now (the prior round's palette used ONE green for both
-# "primary accent" and "compatible"; this round's Data Observatory look
-# separates them: cyan is the general UI accent, green is reserved
-# specifically for a compatibility-positive/optimal signal).
+# High-Tech "Blueprint / Steel-Navy" palette (spec.md §7.7). Values below ARE
+# the palette — updating them here is the entire reskin, since every view in
+# this app already imports color constants from this one module rather than
+# hardcoding hex (db/CLAUDE.md-style single-source-of-truth discipline); no
+# tests assert on any specific hex value (checked before this change), so
+# swapping them in place is safe. Replaces the prior Data Observatory round's
+# palette entirely.
+BACKGROUND = "#070d14"  # Deep Blue-Grey Obsidian
+SURFACE = "#0c1724"  # Module panels / cards — Dark Steel Navy
+SURFACE_BORDER = "rgba(0, 229, 255, 0.22)"
+GLASS_SURFACE = "rgba(12, 23, 36, 0.75)"  # backdrop-filter-blurred panel fill
+BUTTON_SURFACE = "#102235"  # dark steel button background, distinct from SURFACE
+STEEL_MUTED = "#1e3247"  # Circuit Muted Steel — inactive button backgrounds / card headers
+PRIMARY_ACCENT = "#00e5ff"  # Blueprint Cyan/Teal — active borders, hover states, primary CTAs
+MATRIX_GREEN = "#00f090"  # Electric Mint/Green — Optimal/Compatible status, deliberately
+# distinct from PRIMARY_ACCENT (a prior round's palette used one green for both
+# "primary accent" and "compatible"; this separation is kept here too: cyan is
+# the general UI accent, green is reserved specifically for a compatibility-
+# positive/"system online" signal).
 ACCENT_MAGENTA = "#d946ef"  # Secondary Flux Purple/Magenta — used for
 # non-compatibility content tags (e.g. the "Rate My Build" flair badge, so
 # it reads as "a content type" rather than "a compatibility signal").
 WARNING_ACCENT = "#F2B134"  # near-budget / PSU-headroom-tight warnings
-DANGER_ACCENT = "#f43f5e"  # Critical Alert — failed compatibility
+DANGER_ACCENT = "#ff4757"  # Alert Red — failed compatibility, "must be logged in" notices
 TEXT_PRIMARY = "#E6EDF3"
 TEXT_MUTED = "#64748b"  # Muted Industrial Slate
 
@@ -104,6 +106,27 @@ def pulse_badge(text: str, status: str = "good") -> str:
     )
 
 
+# The two real, currently-selectable community post tags (spec.md §3.6/§3.7,
+# db.models.CommunityPost.flair) — "Rate My Build" reuses the "good"
+# (Matrix Green) pulse status, "Looking for Help" reuses "danger" (Alert
+# Red), matching this app's own existing semantic-color meanings (green =
+# positive/showcase, red = needs-attention) rather than introducing a THIRD,
+# one-off color pair that would duplicate what these two already mean.
+_FLAIR_STATUS = {
+    "Rate My Build": "good",
+    "Looking for Help": "danger",
+}
+
+
+def flair_badge(flair: str) -> str:
+    """`pulse_badge` for a real `CommunityPost.flair` value — green for "Rate
+    My Build", red for "Looking for Help". Falls back to the old generic
+    "flair" (magenta) status for any OTHER value (e.g. a historical post
+    seeded before these two became the only real options), so a legacy/
+    unrecognized flair string still renders instead of raising a KeyError."""
+    return pulse_badge(flair, _FLAIR_STATUS.get(flair, "flair"))
+
+
 def hud_chip(label: str, value: str, help_text: str | None = None, value_color: str | None = None) -> str:
     """One monospace-value telemetry chip for the Build Studio's HUD
     (spec.md §7.4.1) — a small caption label over a large monospace readout
@@ -123,7 +146,7 @@ def hud_chip(label: str, value: str, help_text: str | None = None, value_color: 
     )
 
 
-def section_header(text: str) -> str:
+def section_header(text: str, suffix_html: str | None = None) -> str:
     """Left-accent-bordered section heading (e.g. grouping build cards by
     workload profile in my_builds.py, or the community hardware blueprint's
     "Core Components"/"Storage & Cooling" groups) — a step up from a bare
@@ -131,10 +154,24 @@ def section_header(text: str) -> str:
     "tech label" formatting (spec.md §7.7): `text` is uppercased, non-
     alphanumeric runs collapsed to a single underscore, and prefixed
     `"// "` — e.g. "Core Components" -> "// CORE_COMPONENTS", matching a
-    mission-control panel title. Render via
-    `st.markdown(section_header(...), unsafe_allow_html=True)`."""
+    mission-control panel title. `suffix_html` (optional, e.g.
+    `auth_required_notice()` below) is inlined right after the label INSIDE
+    the same heading element, so it renders beside the text rather than on
+    its own line — used by `landing.py`'s Preset Launchpad/Trending Builds
+    headers to show a red "must be logged in" notice for a guest visitor.
+    Render via `st.markdown(section_header(...), unsafe_allow_html=True)`."""
     tech_label = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").upper()
-    return f'<div class="uncapped-section-header">// {tech_label}</div>'
+    return f'<div class="uncapped-section-header">// {tech_label}{suffix_html or ""}</div>'
+
+
+def auth_required_notice(text: str = "[ must be logged in to view these builds ]") -> str:
+    """Small red monospace inline notice (spec.md §7.11) for a guest-locked
+    section — pass as `section_header(..., suffix_html=auth_required_notice())`.
+    Render via `st.markdown(..., unsafe_allow_html=True)`."""
+    return (
+        f'<span style="color:{DANGER_ACCENT}; font-weight:600; font-family:{FONT_MONO}; '
+        f'margin-left:12px; font-size:0.85rem;">{text}</span>'
+    )
 
 
 def inject_css() -> None:
@@ -145,11 +182,17 @@ def inject_css() -> None:
 
         html, body, [class*="css"] {{ font-family: {FONT_SANS}; }}
         /* Streamlit's own chrome (sidebar, main container) painted to match
-        the Matte Carbon base — .streamlit/config.toml sets the same base
-        colors for native widgets, this covers the surrounding containers
-        config.toml's [theme] table doesn't reach. */
+        the Blueprint base — .streamlit/config.toml sets the same base colors
+        for native widgets, this covers the surrounding containers
+        config.toml's [theme] table doesn't reach. A faint radial cyan "aura"
+        (spec.md §7.11) layers a subtle circuit-mesh glow behind the content
+        without competing with it — a low-opacity radial-gradient overlay on
+        top of the solid background color, not a separate image asset. */
         [data-testid="stAppViewContainer"], [data-testid="stMain"] {{
             background-color: {BACKGROUND};
+            background-image: radial-gradient({PRIMARY_ACCENT}14 0%, transparent 60%);
+            background-repeat: no-repeat;
+            background-position: top center;
         }}
         .uncapped-mono {{ font-family: {FONT_MONO}; }}
 
@@ -289,14 +332,18 @@ def inject_css() -> None:
             color: {TEXT_PRIMARY};
         }}
 
-        /* Sharp, tactile button styling (spec.md §7.4.1) — thin micro-border
-        and a soft accent glow on the active/primary state, replacing
+        /* Sharp, tactile button styling (spec.md §7.4.1/§7.11) — dark steel
+        background, clean cyan border, subtle glow on hover, replacing
         Streamlit's flat default. Applies app-wide since every button already
         goes through Streamlit's own type="primary"/"secondary" mechanism. */
         .stButton button, .stFormSubmitButton button {{
+            background-color: {BUTTON_SURFACE};
             border-radius: 6px;
-            border: 1px solid {SURFACE_BORDER};
-            transition: box-shadow 0.15s ease, border-color 0.15s ease;
+            border: 1px solid {PRIMARY_ACCENT};
+            transition: box-shadow 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+        }}
+        .stButton button:hover, .stFormSubmitButton button:hover {{
+            box-shadow: 0 0 10px {PRIMARY_ACCENT}55;
         }}
         .stButton button[kind="primary"], .stFormSubmitButton button[kind="primary"] {{
             box-shadow: 0 0 10px {PRIMARY_ACCENT}55;
@@ -305,6 +352,91 @@ def inject_css() -> None:
         .stButton button[kind="primary"]:hover, .stFormSubmitButton button[kind="primary"]:hover {{
             box-shadow: 0 0 16px {PRIMARY_ACCENT}88;
         }}
+        /* Visibly locked/unclickable disabled state (spec.md §7.11 — guest
+        lockdown on the Preset Launchpad/Trending Builds buttons): muted
+        steel background/border and no hover glow, so a disabled button never
+        looks identical to a real, clickable one. */
+        .stButton button:disabled, .stFormSubmitButton button:disabled {{
+            background-color: {STEEL_MUTED} !important;
+            border-color: rgba(255,255,255,0.12) !important;
+            box-shadow: none !important;
+            opacity: 0.6;
+        }}
+        /* Uniform card heights across the Home page's 3 grids — Platform
+        Capability Matrix, Tiered Preset Launchpad, Trending Community
+        Builds (spec.md §7.11, ui/views/landing.py) — every card in all 3 is
+        a plain `st.container(border=True)` nested inside `st.columns(...)`,
+        no keys/classes distinguishing one grid's cards from another's, so
+        one generic, testid-based rule covers all 3 at once. Confirmed live
+        (Streamlit 1.63.0) the real DOM shape for a nested bordered
+        container is `stColumn > stVerticalBlock > stLayoutWrapper >
+        stVerticalBlock` (the INNER stVerticalBlock is the actual card,
+        holding the icon/title/caption/price/button element-containers as
+        direct children) — NOT `div[data-testid="column"] > div` as a first
+        guess might assume: "column" alone is not a real testid in this
+        Streamlit version, the real one is `stColumn`, and there is no
+        wrapper div directly beneath it without the intermediate
+        stLayoutWrapper layer. `align-items: stretch` on the row makes every
+        column match the tallest; `height: 100%` threaded down through the
+        column/wrapper/card makes the card itself fill that height;
+        `:has(div[data-testid="stButton"])` (not `:last-child`, which would
+        also wrongly catch the Capability Matrix's plain caption-only cards
+        that have no button at all) pins ONLY an element-container that
+        actually contains a button to the bottom via margin-top:auto,
+        leaving the title/caption content grouped at the top above it. */
+        div[data-testid="stHorizontalBlock"] {{
+            align-items: stretch;
+        }}
+        div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"] {{
+            height: 100%;
+        }}
+        div[data-testid="stColumn"] div[data-testid="stLayoutWrapper"] {{
+            height: 100%;
+        }}
+        div[data-testid="stColumn"] div[data-testid="stLayoutWrapper"] > div[data-testid="stVerticalBlock"] {{
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            min-height: 220px;
+        }}
+        div[data-testid="stColumn"] div[data-testid="stLayoutWrapper"] > div[data-testid="stVerticalBlock"]
+            > div[data-testid="stElementContainer"]:has(div[data-testid="stButton"]) {{
+            margin-top: auto;
+        }}
+
+        /* Currency segmented control (spec.md §7.7/§7.12, app.py's sidebar
+        `st.segmented_control(key="selected_currency", ...)`) — Deep Steel/
+        Cyan glow aesthetic, active segment highlighted in PRIMARY_ACCENT.
+        Confirmed live (Streamlit 1.63.0) this widget's real DOM is a
+        `div[data-testid="stButtonGroup"]` wrapper containing plain `<button>`
+        elements with NO distinguishing class or `data-testid` between the
+        active and inactive segments — the only live-verified difference is
+        the `aria-checked` attribute ("true" on the currently-selected
+        segment, "false" on the others), so styling MUST key off
+        `[aria-checked="true"]`, not a class selector (a class-based rule
+        silently matches nothing, since every segment shares the exact same
+        class list regardless of selection state). */
+        div[data-testid="stButtonGroup"] {{
+            gap: 4px;
+        }}
+        div[data-testid="stButtonGroup"] button {{
+            background-color: {BUTTON_SURFACE} !important;
+            border: 1px solid {SURFACE_BORDER} !important;
+            color: {TEXT_MUTED} !important;
+            transition: box-shadow 0.15s ease, border-color 0.15s ease,
+                background-color 0.15s ease, color 0.15s ease;
+        }}
+        div[data-testid="stButtonGroup"] button:hover {{
+            border-color: {PRIMARY_ACCENT}aa !important;
+            color: {TEXT_PRIMARY} !important;
+        }}
+        div[data-testid="stButtonGroup"] button[aria-checked="true"] {{
+            background-color: {STEEL_MUTED} !important;
+            border-color: {PRIMARY_ACCENT} !important;
+            color: {PRIMARY_ACCENT} !important;
+            box-shadow: 0 0 10px {PRIMARY_ACCENT}55;
+        }}
+
         /* Best-effort: push the sidebar's last element (Logout) toward the
         bottom via flex layout. Streamlit's internal sidebar DOM structure can
         shift between versions, so this degrades gracefully to a normal
@@ -336,10 +468,30 @@ def inject_css() -> None:
         /* No tag qualifier — confirmed live this element is actually a
         <div>, not a <button> as its testid name might suggest. */
         [data-testid="stSidebarCollapseButton"] {{ display: none !important; }}
+        /* Widened from an earlier round's 320px (spec.md §7.7/§7.8) — the
+        currency segmented control, nav buttons, and Concierge chat/telemetry
+        were cramped at that width. 420px keeps a real min/max range
+        (400-440px) rather than a single hard-pinned number, in case a future
+        Streamlit version's own layout math wants a few px of slack, while
+        still always overriding `width` itself for the same reason as
+        before: Streamlit's draggable-resize logic writes a plain
+        (non-!important) inline `width: <Npx>` that only an `!important`
+        `width` override here (not just `min-width`/`max-width`) actually
+        beats. */
         section[data-testid="stSidebar"] {{
-            width: 320px !important;
-            min-width: 320px !important;
-            max-width: 320px !important;
+            width: 420px !important;
+            min-width: 400px !important;
+            max-width: 440px !important;
+        }}
+        /* Breathing room for the sidebar's real content (currency control,
+        nav buttons, Concierge chat/telemetry) — confirmed live this is a
+        real testid (Streamlit 1.63.0), the direct wrapper around everything
+        app.py writes into the sidebar (nav/currency/chat), distinct from
+        `stSidebarHeader` (the collapse button/logo row, hidden above) so
+        this padding never affects that already-hidden element. */
+        div[data-testid="stSidebarUserContent"] {{
+            padding-left: 1.25rem !important;
+            padding-right: 1.25rem !important;
         }}
 
         /* Hardware picker slots (spec.md §7.4.1, ui/components/part_picker.py)

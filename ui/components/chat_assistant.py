@@ -245,6 +245,26 @@ from ui.format import CURRENCY_RATES, format_currency, sanitize_markdown
 # not a full spec dump.
 _SUMMARY_SPEC_FIELDS = ("socket", "ram_type", "capacity_gb", "interface")
 
+# optimize_bottleneck's own default target ceiling when the user's request
+# didn't state an explicit one (e.g. a bare "optimize the bottleneck") —
+# matches the same "roughly 10-12%" threshold llm/concierge.py's SYSTEM_PROMPT
+# already uses to decide whether this action is even offered in the first
+# place, so the applied target and the trigger condition stay consistent.
+_DEFAULT_BOTTLENECK_TARGET = 10.0
+
+# Bounded retry cap for optimize_bottleneck's own internal verification loop
+# (re-check the live bottleneck after each applied upgrade, try once more if
+# still above target) — never unbounded: a build that's genuinely peaked at
+# both CPU and GPU tiers must degrade gracefully (stop, return whatever was
+# reached) rather than looping forever or racking up unbounded LLM calls.
+_MAX_BOTTLENECK_OPTIMIZE_ATTEMPTS = 3
+
+# Bounded retry cap for use_remaining_budget's own internal spend-down loop —
+# higher than the bottleneck loop's cap since fully using a larger headroom
+# realistically spans several priority tiers (RAM, then Storage, then Cooler)
+# rather than stopping once a single percentage target is met.
+_MAX_BUDGET_UTILIZATION_ATTEMPTS = 5
+
 # Caps how much prior conversation gets resent to the LLM on every turn —
 # without this, `conversation_history` grows unboundedly with the whole
 # session's chat log, which just wastes tokens/cost on older, less relevant
@@ -266,6 +286,13 @@ _ANALYSIS_KEYWORDS = (
     "recommend",
     "improve",
     "bottleneck",
+    "budget",  # "how much can you add without going over budget?" — a real,
+    # confirmed gap: this phrasing has no "upgrade"/"optimi"/etc. substring at
+    # all, so advisory_context was never pre-fetched for it, leaving the
+    # BUDGET-LEEWAY UPGRADE REQUESTS carve-out (llm/concierge.py SYSTEM_PROMPT
+    # intent 4) with nothing to translate into a real modify_build action.
+    "headroom",
+    "remaining",
 )
 
 
@@ -549,7 +576,17 @@ def _apply_concierge_action(action: dict | None) -> float | None:
     `fix_warnings` applies `engine.solvers.resolve_compatibility_issues`'s
     own deterministic, catalog-grounded patch; `optimize_bottleneck` applies
     `llm.advisory.get_build_advisory`'s own already-zero-hallucination-
-    validated `within_budget.swaps` — this project's own architecture rule
+    validated `stretch_budget.actions` — its dedicated "target the
+    bottleneck category directly with a real upgrade" recommendation, NOT
+    `within_budget.swaps` (a cost-neutral rebalance that downgrades the
+    OTHER side and can return no swap at all once that side has no cheaper
+    option left — a real, confirmed dead end for an explicit "fix my
+    bottleneck" request). Runs in a small, bounded verification loop
+    (`_MAX_BOTTLENECK_OPTIMIZE_ATTEMPTS`): after applying one round of
+    stretch actions, the live bottleneck is re-checked against the action's
+    own `target_percentage` (or `_DEFAULT_BOTTLENECK_TARGET` when the user
+    didn't state one) and another round is fetched/applied if still above
+    target and further upgrades exist — this project's own architecture rule
     that compatibility (and, here, the deterministic engine's compute-
     balance read) is never LLM-gated (root CLAUDE.md) applies just as much
     to a Concierge-triggered fix as to a manual one. Both are no-ops
@@ -567,11 +604,23 @@ def _apply_concierge_action(action: dict | None) -> float | None:
     build total is meaningful) and for any no-op branch below (no active
     draft / build resolves to zero real components).
 
-    `load_build` always starts a fresh Free-mode draft (mirroring
-    `ui/views/community.py::_fork_into_studio`'s shape); `modify_build`
-    patches the existing draft in place, leaving every unmentioned category
-    untouched. Every id in `action["components"]` is already guaranteed real
-    by `llm/concierge.py`'s own zero-hallucination guard, so the defensive
+    `load_build` starts a fresh draft — Free-mode using the model's own
+    `components` picks verbatim (mirroring `ui/views/community.py::
+    _fork_into_studio`'s shape) when the request carried no budget figure, or
+    Budget-mode via `engine.solvers.initialize_budget_build` when the action
+    carries a real `budget_cap_usd` (spec.md §6.7 intent 3's HARD CEILING /
+    TARGET-ZONE ENFORCEMENT rule — see this function's own inline comments):
+    in that case the model's `components` are used only as seed pins for any
+    part the user explicitly named, never as the final build, since the
+    deterministic solver is what actually guarantees the ceiling is never
+    exceeded and converges close to it. `modify_build` patches the existing
+    draft in place, leaving every unmentioned category untouched, then — when
+    the draft carries a real `budget_ceiling` — re-clamps the FULL patched
+    selection back under it via that same solver if the patch pushed the
+    total over (the BUDGET HARD-CAP SAFETY NET, Part 2: never trust the
+    model's own "this fits" arithmetic alone). Every id in
+    `action["components"]` is already guaranteed real by `llm/concierge.py`'s
+    own zero-hallucination guard, so the defensive
     `components_repo.get_by_id` re-check here is belt-and-suspenders, not
     load-bearing — mirroring `ui/views/create_build.py::_apply_swaps`'s
     identical defensive pattern. Requested quantities are NOT trusted
@@ -868,7 +917,9 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         # never has to wait for a second round-trip they already answered.
         if action.get("publish_immediately"):
             builds_repo.set_public(build.id, True)
-            community_repo.create_post(build.id, user["id"], name, action.get("author_notes"))
+            community_repo.create_post(
+                build.id, user["id"], name, action.get("author_notes"), flair=action.get("flair"),
+            )
         return None
 
     if action_type == "publish_build":
@@ -878,33 +929,87 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         user = current_user()
         title = saved.get("name") or "Untitled build"
         builds_repo.set_public(saved["build_id"], True)
-        community_repo.create_post(saved["build_id"], user["id"], title, action.get("author_notes"))
+        community_repo.create_post(
+            saved["build_id"], user["id"], title, action.get("author_notes"), flair=action.get("flair"),
+        )
         return None
 
     if action_type in ("load_build", "modify_build"):
+        # BUDGET HARD-CAP (spec.md §6.7 intent 3's HARD CEILING / TARGET-ZONE
+        # ENFORCEMENT rule): only ever set on a `load_build` action, and only
+        # when the user's request stated a real budget/ceiling figure. The
+        # model's own `components` picks are NOT trusted for this case's
+        # arithmetic (the same "compatibility/budget math is never LLM-gated"
+        # rule root CLAUDE.md applies to compatibility) — instead, any
+        # explicitly-named parts in `components` are used as fixed seed pins,
+        # and `engine.solvers.initialize_budget_build` (already tested to
+        # both NEVER exceed a ceiling and converge close to — not just
+        # comfortably under — it) deterministically fills/downgrades
+        # everything else.
+        budget_cap_usd = action.get("budget_cap_usd") if action_type == "load_build" else None
         build_draft = st.session_state.get("build_draft")
-        # A modify_build with nothing to modify against starts a fresh Free
-        # draft too, same as load_build — a defensive fallback for the (should
-        # be rare, since the prompt tells the model not to do this) case of a
-        # modify_build arriving with no real active draft.
-        if action_type == "load_build" or not build_draft:
-            build_draft = state.new_build_draft("Free")
 
-        for category, component_id in action.get("components", {}).items():
-            component = components_repo.get_by_id(component_id)
-            if component is not None:
-                state.set_component(build_draft, category, component)
+        if budget_cap_usd:
+            seed_selection = {}
+            for category, component_id in action.get("components", {}).items():
+                component = components_repo.get_by_id(component_id)
+                if component is not None:
+                    seed_selection[category] = component
+            selection = solvers.initialize_budget_build(
+                budget_cap_usd, seed_selection=seed_selection or None, fill_peripherals_with_surplus=True,
+            )
+            build_draft = state.load_components_into_new_draft(
+                mode="Budget",
+                components={category: component.id for category, component in selection.items()},
+            )
+            build_draft["budget_ceiling"] = budget_cap_usd
+        else:
+            # A modify_build with nothing to modify against starts a fresh Free
+            # draft too, same as load_build — a defensive fallback for the (should
+            # be rare, since the prompt tells the model not to do this) case of a
+            # modify_build arriving with no real active draft.
+            if action_type == "load_build" or not build_draft:
+                build_draft = state.new_build_draft("Free")
 
-        requested_quantities = action.get("quantities", {})
-        if requested_quantities:
-            build_state = state.resolve_build_state(build_draft)
+            for category, component_id in action.get("components", {}).items():
+                component = components_repo.get_by_id(component_id)
+                if component is not None:
+                    state.set_component(build_draft, category, component)
+
+            requested_quantities = action.get("quantities", {})
+            if requested_quantities:
+                build_state = state.resolve_build_state(build_draft)
+                budget_ceiling = build_draft.get("budget_ceiling")
+                for category, requested_qty in requested_quantities.items():
+                    effective_max, _reason, _kind = state.resolve_effective_quantity_limit(
+                        build_state, category, build_draft.get("quantities", {}), budget_ceiling
+                    )
+                    clamped = min(requested_qty, effective_max) if effective_max is not None else requested_qty
+                    state.set_quantity(build_draft, category, max(1, clamped))
+
+            # BUDGET HARD-CAP SAFETY NET (Part 2 — "the AI is strictly
+            # prohibited from exceeding the cap by even 1 unit"): a
+            # `modify_build` patch (e.g. the BUDGET-LEEWAY UPGRADE REQUESTS
+            # carve-out applying `advisory_context.stretch_budget.actions`)
+            # is checked against the SYSTEM_PROMPT's own real-arithmetic
+            # BUDGET GUARDRAIL RULE, but that's a prompt instruction, not an
+            # enforcement — this re-checks the FINAL patched build's real,
+            # quantity-aware total in Python and, only if it's still over a
+            # real numeric `budget_ceiling`, re-clamps it via the exact same
+            # tested downgrade path the fresh-budget-build branch above uses
+            # (passing the full current selection as `seed_selection` so
+            # every category — not just the one this patch touched — is a
+            # candidate for the downgrade, cheapest/least-impactful swaps
+            # first). A no-op when there's no ceiling, or the patch is
+            # already within it (the overwhelmingly common case).
             budget_ceiling = build_draft.get("budget_ceiling")
-            for category, requested_qty in requested_quantities.items():
-                effective_max, _reason, _kind = state.resolve_effective_quantity_limit(
-                    build_state, category, build_draft.get("quantities", {}), budget_ceiling
-                )
-                clamped = min(requested_qty, effective_max) if effective_max is not None else requested_qty
-                state.set_quantity(build_draft, category, max(1, clamped))
+            if budget_ceiling:
+                current_state = state.resolve_build_state(build_draft)
+                current_total = state.build_total_cost(current_state, build_draft.get("quantities", {}))
+                if current_state and current_total > budget_ceiling:
+                    clamped_state = solvers.initialize_budget_build(budget_ceiling, seed_selection=current_state)
+                    for category, component in clamped_state.items():
+                        state.set_component(build_draft, category, component)
 
         st.session_state["build_draft"] = build_draft
         st.session_state["create_mode"] = build_draft.get("creation_mode") or "Free"
@@ -963,23 +1068,166 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         if not current_budget_or_cost:
             current_budget_or_cost = state.build_total_cost(build_state, quantities)
 
-        # Reuses llm.advisory's OWN already-zero-hallucination-validated
-        # optimization swaps (Free mode's own stated objective is exactly
-        # "bottleneck mitigation and CPU/GPU platform balance",
-        # llm/CLAUDE.md) rather than inventing a second, competing
-        # bottleneck-mitigation algorithm here — the same "one real
-        # implementation, never a second copy" discipline `_current_build_
-        # context`'s own bottleneck reading already follows.
-        advisory = get_build_advisory(
-            build_state, mode, current_budget_or_cost,
-            profile=build_draft.get("workload_profile"),
-            bottleneck_info=(st.session_state.get("build_draft_analysis") or {}).get("bottleneck"),
-            quantities=quantities,
-        )
-        for swap in advisory["within_budget"]["swaps"]:
-            component = components_repo.get_by_id(swap["replace_with_id"])
-            if component is not None:
-                state.set_component(build_draft, swap["category"], component)
+        target_percentage = action.get("target_percentage")
+        if target_percentage is None:
+            target_percentage = _DEFAULT_BOTTLENECK_TARGET
+
+        # BOTTLENECK-TARGETING FIX (root-cause fix for "AI fails to reduce
+        # bottleneck" / "hallucinates irrelevant swaps"): `within_budget.
+        # swaps` (used here previously) is a cost-neutral REBALANCE — it
+        # downgrades the NON-bottlenecked side to fund a modest paired
+        # upgrade of the bottlenecked one, and returns NO swap at all once
+        # that non-bottlenecked side has no cheaper compatible option left —
+        # a real, confirmed dead end that left an explicit "fix my
+        # bottleneck" request doing nothing. `stretch_budget.actions` is
+        # llm.advisory's own dedicated "target the bottleneck category
+        # directly with a real upgrade" recommendation for Free mode's own
+        # stated objective (llm/CLAUDE.md) — the correct one to apply here,
+        # never the rebalance-only swap. Runs in a bounded retry loop: after
+        # applying one round of upgrades, re-check the LIVE bottleneck
+        # against `target_percentage` and, if still above it and a further
+        # real stretch upgrade exists, fetch and apply one more — capped at
+        # _MAX_BOTTLENECK_OPTIMIZE_ATTEMPTS so a build that's genuinely
+        # peaked at both CPU and GPU tiers degrades gracefully instead of
+        # looping or spamming LLM calls indefinitely.
+        for _ in range(_MAX_BOTTLENECK_OPTIMIZE_ATTEMPTS):
+            advisory = get_build_advisory(
+                build_state, mode, current_budget_or_cost,
+                profile=build_draft.get("workload_profile"),
+                bottleneck_info=(st.session_state.get("build_draft_analysis") or {}).get("bottleneck"),
+                quantities=quantities,
+            )
+            actions = advisory["stretch_budget"]["actions"]
+            if not actions:
+                break
+
+            for stretch_action in actions:
+                if stretch_action.get("action") == "set_quantity":
+                    category = stretch_action.get("category")
+                    effective_max, _reason, _kind = state.resolve_effective_quantity_limit(
+                        build_state, category, quantities,
+                        current_budget_or_cost if mode == "Budget" else None,
+                    )
+                    requested_qty = stretch_action.get("quantity", 1)
+                    clamped_qty = min(requested_qty, effective_max) if effective_max is not None else requested_qty
+                    state.set_quantity(build_draft, category, max(1, clamped_qty))
+                else:
+                    component = components_repo.get_by_id(stretch_action.get("replace_with_id"))
+                    if component is not None:
+                        state.set_component(build_draft, stretch_action.get("category"), component)
+
+            build_state = state.resolve_build_state(build_draft)
+            quantities = build_draft.get("quantities", {})
+
+            # BUDGET HARD-CAP SAFETY NET (Part 2 precedent, applied here too):
+            # llm.advisory's own Budget-mode objective already keeps
+            # stretch_budget within remaining_budget, but this loop never
+            # trusts that alone — if a round of stretch actions somehow still
+            # pushed the total over a real ceiling, re-clamp deterministically
+            # via the same tested solver before continuing.
+            if mode == "Budget":
+                new_total = state.build_total_cost(build_state, quantities)
+                if new_total > current_budget_or_cost:
+                    clamped_state = solvers.initialize_budget_build(
+                        current_budget_or_cost, seed_selection=build_state,
+                    )
+                    for category, component in clamped_state.items():
+                        state.set_component(build_draft, category, component)
+                    build_state = state.resolve_build_state(build_draft)
+                    break
+
+            live = live_bottleneck_and_synergy(build_state) if len(build_state) >= 2 else None
+            if live is None or live[1] <= target_percentage:
+                break
+
+        st.session_state["build_draft"] = build_draft
+        st.session_state["page"] = "create_build"
+        st.session_state["build_draft_analysis"] = None
+
+        final_build_state = state.resolve_build_state(build_draft)
+        if not final_build_state:
+            return None
+        return state.build_total_cost(final_build_state, build_draft.get("quantities", {}))
+
+    if action_type == "use_remaining_budget":
+        build_draft = st.session_state.get("build_draft")
+        if not build_draft:
+            return None
+        mode = build_draft.get("creation_mode") or "Free"
+        budget_ceiling = build_draft.get("budget_ceiling")
+        if mode != "Budget" or not budget_ceiling:
+            return None
+        build_state = state.resolve_build_state(build_draft)
+        if not build_state:
+            return None
+        quantities = build_draft.get("quantities", {})
+
+        # DETERMINISTIC MULTI-TIER UPGRADE (root-cause fix for "AI math
+        # hallucinations" — a real, confirmed failure in both directions:
+        # falsely rejecting an affordable upgrade, and separately, spending
+        # only a small fraction of real remaining headroom). The model never
+        # computes "does this still fit?" itself — every round below calls
+        # `llm.advisory.get_build_advisory`'s OWN Budget-mode objective (which
+        # already keeps every proposal within its own computed
+        # `remaining_budget`, per llm/advisory.py's SYSTEM_PROMPT) and applies
+        # its `stretch_budget.actions` (the SAME priority-ordered CPU/GPU ->
+        # RAM -> Storage -> Cooler chain `optimize_bottleneck` above reuses),
+        # re-deriving the REAL remaining headroom in Python after every round
+        # via `state.build_total_cost`, never trusting a stated figure.
+        # Bounded at `_MAX_BUDGET_UTILIZATION_ATTEMPTS` rounds (more than the
+        # bottleneck loop's cap, since fully using a larger headroom
+        # realistically spans several tiers — RAM, then Storage, then
+        # Cooler — not just one or two) so a build that's already
+        # genuinely maxed out (every category peaked) degrades gracefully
+        # instead of looping forever.
+        for _ in range(_MAX_BUDGET_UTILIZATION_ATTEMPTS):
+            current_total = state.build_total_cost(build_state, quantities)
+            remaining_headroom = budget_ceiling - current_total
+            if remaining_headroom <= 0:
+                break
+
+            advisory = get_build_advisory(
+                build_state, mode, budget_ceiling,
+                profile=build_draft.get("workload_profile"),
+                bottleneck_info=(st.session_state.get("build_draft_analysis") or {}).get("bottleneck"),
+                quantities=quantities,
+            )
+            stretch = advisory["stretch_budget"]
+            actions = stretch["actions"]
+            # No further real upgrade fits anywhere in the priority chain, or
+            # advisory proposed something that wouldn't actually spend any
+            # more (no progress) — stop rather than loop with no effect.
+            if not actions or not stretch.get("added_cost_usd"):
+                break
+
+            for stretch_action in actions:
+                if stretch_action.get("action") == "set_quantity":
+                    category = stretch_action.get("category")
+                    effective_max, _reason, _kind = state.resolve_effective_quantity_limit(
+                        build_state, category, quantities, budget_ceiling,
+                    )
+                    requested_qty = stretch_action.get("quantity", 1)
+                    clamped_qty = min(requested_qty, effective_max) if effective_max is not None else requested_qty
+                    state.set_quantity(build_draft, category, max(1, clamped_qty))
+                else:
+                    component = components_repo.get_by_id(stretch_action.get("replace_with_id"))
+                    if component is not None:
+                        state.set_component(build_draft, stretch_action.get("category"), component)
+
+            build_state = state.resolve_build_state(build_draft)
+            quantities = build_draft.get("quantities", {})
+
+            # BUDGET HARD-CAP SAFETY NET (Part 2 precedent, applied here too):
+            # never trust llm.advisory's own remaining_budget arithmetic
+            # alone — re-clamp deterministically if a round somehow still
+            # pushed the total over the real ceiling.
+            new_total = state.build_total_cost(build_state, quantities)
+            if new_total > budget_ceiling:
+                clamped_state = solvers.initialize_budget_build(budget_ceiling, seed_selection=build_state)
+                for category, component in clamped_state.items():
+                    state.set_component(build_draft, category, component)
+                build_state = state.resolve_build_state(build_draft)
+                break
 
         st.session_state["build_draft"] = build_draft
         st.session_state["page"] = "create_build"
@@ -1043,6 +1291,30 @@ def render_concierge_widget() -> None:
                     active_currency=_active_currency(),
                     currency_rates=CURRENCY_RATES,
                 )
+            # RIGOROUS TELEMETRY REPLY FORMAT — snapshot the BEFORE state for
+            # the 3 action types that patch an EXISTING build (modify_build/
+            # fix_warnings/optimize_bottleneck have a meaningful "before"; a
+            # brand-new load_build does not) so the delta-reporting block
+            # below can state a real before -> after bottleneck/synergy/cost
+            # change — never trusting the model's own arithmetic for any of
+            # these numbers, the same discipline as the pre-existing
+            # AUTHORITATIVE TOTAL-COST LINE this extends.
+            pending_action_type = (result.get("action") or {}).get("type")
+            before_build_draft = (
+                st.session_state.get("build_draft")
+                if pending_action_type in (
+                    "modify_build", "fix_warnings", "optimize_bottleneck", "use_remaining_budget",
+                )
+                else None
+            )
+            before_build_state = state.resolve_build_state(before_build_draft) if before_build_draft else {}
+            before_total = (
+                state.build_total_cost(before_build_state, before_build_draft.get("quantities", {}))
+                if before_build_state
+                else None
+            )
+            before_live = live_bottleneck_and_synergy(before_build_state) if len(before_build_state) >= 2 else None
+
             # Apply BEFORE finalizing the assistant message so the real,
             # Python-computed total (if any) is available to append to the
             # SAME message the user sees — see this module's docstring's
@@ -1110,32 +1382,59 @@ def render_concierge_widget() -> None:
                     if build_state:
                         real_total = state.build_total_cost(build_state, build_draft.get("quantities", {}))
             reply_content = result["reply"]
-            if real_total is not None:
-                reply_content = f"{reply_content}\n\n**Total: {format_currency(real_total, target_currency)}**"
-            # AUTHORITATIVE FIX-STATUS LINE (spec.md §6.7 intents 11/12): the
-            # model's own `reply` never claims a specific swap happened
-            # (SYSTEM_PROMPT says so explicitly, since it doesn't know which
-            # part the deterministic resolver picked) — this appends the
-            # REAL, freshly-recomputed post-fix state, the same
-            # "never trust what the model typed, restate the Python-computed
-            # truth" discipline the Total line above already follows.
             applied_action_type = (result.get("action") or {}).get("type")
-            if applied_action_type in ("fix_warnings", "optimize_bottleneck"):
+
+            # RIGOROUS TELEMETRY REPLY FORMAT: for the 4 action types that
+            # patch an EXISTING build (modify_build/fix_warnings/
+            # optimize_bottleneck/use_remaining_budget), replace the plain
+            # "Total: ..." line below with a concise, fully Python-computed
+            # technical summary — bottleneck/synergy before -> after, plus a
+            # cost delta — instead of just a bare new total. Currency-safe by
+            # construction: every number here is run through
+            # `format_currency(..., target_currency)`,
+            # the same function every other price in this app already goes
+            # through, so a NIS/EUR session can never see a stray "$" — the
+            # model's own reply text is never trusted for any of these
+            # numbers (same "never trust what the model typed, restate the
+            # Python-computed truth" discipline the old AUTHORITATIVE
+            # TOTAL-COST LINE / AUTHORITATIVE FIX-STATUS LINE this replaces
+            # already followed).
+            if (
+                applied_action_type in (
+                    "modify_build", "fix_warnings", "optimize_bottleneck", "use_remaining_budget",
+                )
+                and real_total is not None
+            ):
                 build_draft = st.session_state.get("build_draft")
                 build_state = state.resolve_build_state(build_draft) if build_draft else {}
+                lines: list[str] = []
                 if applied_action_type == "fix_warnings":
                     remaining = evaluate_build(build_state, (build_draft or {}).get("quantities", {})).issues
-                    status = (
+                    lines.append(
                         "0 compatibility warnings remaining."
                         if not remaining
                         else f"{len(remaining)} warning(s) still remaining: {remaining[0]}"
                     )
-                else:
-                    live = live_bottleneck_and_synergy(build_state) if len(build_state) >= 2 else None
-                    status = (
-                        f"Bottleneck now {live[1]:.0f}% ({live[2]})." if live is not None else "Bottleneck unavailable."
+                after_live = live_bottleneck_and_synergy(build_state) if len(build_state) >= 2 else None
+                if before_live is not None and after_live is not None:
+                    lines.append(
+                        f"Bottleneck: {before_live[1]:.0f}% -> {after_live[1]:.0f}% ({after_live[2]}) | "
+                        f"Synergy: {before_live[0]:.0f} -> {after_live[0]:.0f}"
                     )
-                reply_content = f"{reply_content}\n\n**{status}**"
+                elif applied_action_type == "optimize_bottleneck" and after_live is None:
+                    lines.append("Bottleneck unavailable.")
+                if before_total is not None:
+                    delta = real_total - before_total
+                    sign = "+" if delta >= 0 else "-"
+                    lines.append(
+                        f"Delta: {sign}{format_currency(abs(delta), target_currency)} | "
+                        f"Total: {format_currency(real_total, target_currency)}"
+                    )
+                else:
+                    lines.append(f"Total: {format_currency(real_total, target_currency)}")
+                reply_content = f"{reply_content}\n\n" + "\n\n".join(f"**{line}**" for line in lines)
+            elif real_total is not None:
+                reply_content = f"{reply_content}\n\n**Total: {format_currency(real_total, target_currency)}**"
             st.session_state["concierge_messages"].append(
                 {"role": "assistant", "content": sanitize_markdown(reply_content)}
             )

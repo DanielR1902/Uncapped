@@ -138,6 +138,21 @@ class ConciergeLoadBuildAction(BaseModel):
 
     type: Literal["load_build"] = "load_build"
     components: dict[str, int]
+    # Real, converted-to-USD working budget (see SYSTEM_PROMPT's BUDGET
+    # CURRENCY CONVERSION rule) whenever the user's request stated a
+    # ceiling/budget figure ("build me a PC for up to 12000 NIS") — `None`
+    # for a plain, no-budget build-me request (the pre-existing, unchanged
+    # behavior). This is NOT trusted for arithmetic on its own: the caller
+    # (`ui/components/chat_assistant.py`) does not use this model's own
+    # `components` picks as the final build when this field is set — it
+    # treats `components` as, at most, a seed pin for any part the user
+    # explicitly NAMED, and hands the real allocation to
+    # `engine.solvers.initialize_budget_build`, which both guarantees the
+    # hard ceiling (never exceeded, even by one currency unit) and is
+    # empirically tested to converge toward — not just under — that ceiling.
+    # Root CLAUDE.md's "compatibility is never LLM-gated" rule, applied here
+    # to budget math: the model recognizes the ceiling, Python enforces it.
+    budget_cap_usd: float | None = None
     # Optional, no functional consumer anywhere in ui/ — this is a purely
     # internal/audit note, never the user-facing text (that's `reply`, on
     # ConciergeResponse). Made optional after a real, confirmed regression:
@@ -344,6 +359,20 @@ class ConciergeSaveBuildAction(BaseModel):
     # nothing here asked it to.
     publish_immediately: bool = False
     author_notes: str | None = None
+    # Publication tag/status (spec.md §3.6/§3.7, db.models.CommunityPost.flair
+    # — the SAME column `ui/views/create_build.py`'s own "Share / Rate My
+    # Build" dialog and "Also publish to Community" checkbox now write to,
+    # via `db.repositories.community_repo.create_post`'s existing `flair`
+    # param). Only ever meaningful together with `publish_immediately: true`
+    # (a "draft" destination never publishes, and an ordinary non-fast-track
+    # publish captures its own flair on the LATER `publish_build` turn
+    # instead — see that action's own `flair` field). REQUIRED to be
+    # non-null whenever `publish_immediately` is true: the model must NEVER
+    # publish "silently" with no tag — if the user's fast-track message
+    # didn't also name one, `publish_immediately` itself must stay `false`
+    # and the flair question asked as a follow-up instead (see SYSTEM_
+    # PROMPT's SAVE & PUBLISH REQUESTS intent).
+    flair: Literal["Rate My Build", "Looking for Help"] | None = None
     # Which build's data gets persisted — see this class's own docstring for
     # the full explanation. `source_post_id` is only meaningful (and only
     # cross-checked by `_validate_action`) when `source == "community"`.
@@ -375,10 +404,22 @@ class ConciergePublishBuildAction(BaseModel):
     `author_notes` is optional free text for the "would you like to add a
     description?" follow-up branch — `None` when the user declined to add
     one, or a real value on the specific later turn where the user typed the
-    actual description text."""
+    actual description text.
+
+    `flair` is REQUIRED (no default) — the model must have already asked
+    "Would you like to publish this as 'Rate My Build' or 'Looking for
+    Help'?" and received one of those two answers on an earlier turn of this
+    SAME publish flow before this action can ever be returned (see SYSTEM_
+    PROMPT's SAVE & PUBLISH REQUESTS intent) — the same "a required field
+    makes it a structural guarantee, not just a prompt hope" precedent as
+    `ConciergeSaveBuildAction.name`/`.destination`. This is what makes "never
+    publish silently with no tag" an enforced guarantee: a non-compliant
+    response missing this field fails Pydantic validation outright and falls
+    back to the heuristic reply instead of silently publishing untagged."""
 
     type: Literal["publish_build"] = "publish_build"
     author_notes: str | None = None
+    flair: Literal["Rate My Build", "Looking for Help"]
 
 
 class ConciergeOpenCommunityBuildAction(BaseModel):
@@ -491,6 +532,45 @@ class ConciergeOptimizeBottleneckAction(BaseModel):
     `ConciergeFixWarningsAction` above."""
 
     type: Literal["optimize_bottleneck"] = "optimize_bottleneck"
+    # The user's own explicit target ceiling, when they stated one (e.g. "get
+    # it under 10%", "reduce the bottleneck to below 8 percent") — a plain
+    # percentage number, never a fraction (10.0, not 0.10). `None` when no
+    # explicit number was given; the caller falls back to a sensible default
+    # (see ui/components/chat_assistant.py's own constant) rather than
+    # guessing a number here.
+    target_percentage: float | None = None
+    explanation: str = ""
+
+
+class ConciergeUseRemainingBudgetAction(BaseModel):
+    """The user's explicit request to spend whatever budget headroom is left
+    on the CURRENTLY ACTIVE build (e.g. "is there any upgrade possible within
+    my budget?", "how much can you add without going over budget?", "upgrade
+    what you can with the remaining budget") — requires `current_build_
+    context["mode"] == "Budget"` with a real numeric ceiling (see llm/
+    concierge.py SYSTEM_PROMPT); if there's no active Budget-mode build, or
+    it's already effectively maxed out, the model must say so plainly in
+    `reply` and return `action: null` instead.
+
+    Carries NO LLM-asserted catalog id, category, or price delta — a real,
+    confirmed failure mode this replaces: the model is NOT reliable at
+    computing "current total + delta <= budget cap" arithmetic itself (it has
+    both falsely rejected a real, affordable upgrade and, separately,
+    proposed a single small upgrade while leaving hundreds of real currency
+    units of headroom unspent). The actual multi-tier upgrade sequence — CPU/
+    GPU swap, then RAM capacity, then Storage volume, then Cooler/PSU
+    headroom, exactly mirroring `llm.advisory.py`'s own priority-ordered
+    `stretch_budget` fallthrough chain — is computed entirely in Python by
+    `ui/components/chat_assistant.py::_apply_concierge_action`, which calls
+    `llm.advisory.get_build_advisory` in a small bounded loop (mirroring
+    `ConciergeOptimizeBottleneckAction`'s own verification loop exactly),
+    applying one real, catalog-priced `stretch_budget` action per round and
+    re-checking the real remaining headroom after each one, until either the
+    headroom is exhausted or no further real upgrade exists. This action only
+    carries the RECOGNIZED INTENT — a pure pass-through, same reasoning as
+    `ConciergeFixWarningsAction`/`ConciergeOptimizeBottleneckAction` above."""
+
+    type: Literal["use_remaining_budget"] = "use_remaining_budget"
     explanation: str = ""
 
 
@@ -517,11 +597,15 @@ class ConciergeResponse(BaseModel):
     active build's real compatibility issues (`fix_warnings` — requires a
     non-empty `current_build_context["compatibility_issues"]`; the actual
     fix is computed by `engine.solvers.resolve_compatibility_issues`, never
-    an LLM-chosen part — see `ConciergeFixWarningsAction`'s docstring), or a
+    an LLM-chosen part — see `ConciergeFixWarningsAction`'s docstring), a
     request to reduce the active build's bottleneck percentage
     (`optimize_bottleneck` — the actual rebalancing swap comes from
     `llm.advisory.get_build_advisory`'s own zero-hallucination-validated
-    `within_budget.swaps` — see `ConciergeOptimizeBottleneckAction`'s
+    `stretch_budget.actions` — see `ConciergeOptimizeBottleneckAction`'s
+    docstring), or a request to spend remaining Budget-mode headroom
+    (`use_remaining_budget` — a bounded, multi-tier (CPU/GPU -> RAM ->
+    Storage -> Cooler/PSU) upgrade sequence computed entirely in Python, same
+    zero-LLM-arithmetic precedent — see `ConciergeUseRemainingBudgetAction`'s
     docstring); it is `None` for catalog-question, community-recommendation,
     and optimization/analysis intents, and also `None` (with `reply` saying
     so) when a named part could
@@ -532,8 +616,9 @@ class ConciergeResponse(BaseModel):
     when a mid-flow reply is still gathering information (e.g. asking for
     the still-missing name or destination, asking whether to publish, or
     asking for a description) before there's anything to act on yet, or
-    when a `fix_warnings`/`optimize_bottleneck` request has no active build,
-    no real issues, or an already-acceptable bottleneck to act on.
+    when a `fix_warnings`/`optimize_bottleneck`/`use_remaining_budget` request
+    has no active build, no real issues/ceiling, or is already
+    acceptable/maxed-out.
 
     `currency_switch` (optional, default `None`) is a SEPARATE, top-level
     field — deliberately NOT nested inside `action` — because it must be able
@@ -563,6 +648,7 @@ class ConciergeResponse(BaseModel):
         | ConciergeLoadSavedBuildAction
         | ConciergeFixWarningsAction
         | ConciergeOptimizeBottleneckAction
+        | ConciergeUseRemainingBudgetAction
         | None
     ) = None
     currency_switch: Literal["USD", "EUR", "NIS"] | None = None

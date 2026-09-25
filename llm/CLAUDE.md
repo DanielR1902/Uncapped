@@ -77,7 +77,7 @@ def get_concierge_response(
                                         # THE USER'S MESSAGE to USD before picking parts (intent 3's BUDGET
                                         # CURRENCY CONVERSION rule), never for quoting a price back to the user
 ) -> dict: ...  # never raises; {"reply": str (<=2 sentences, prompt-only enforced),
-                 #  "action": {"type": "load_build", "components": {category: id}, "explanation": str}
+                 #  "action": {"type": "load_build", "components": {category: id}, "budget_cap_usd": float|None, "explanation": str}
                  #          | {"type": "modify_build", "components": {category: id}, "quantities": {category: int}, "explanation": str}
                  #          | {"type": "navigate", "navigate_to": "landing"|"create_build"|"my_builds"|"community"|"drafts",
                  #             "filters": {"build_type": "All"|"Budget"|"Workload"|"Free", "max_price": float|None,
@@ -90,7 +90,7 @@ def get_concierge_response(
                  #          | {"type": "open_community_build", "post_id": int}
                  #          | {"type": "load_saved_build", "source": "draft"|"build"|"community", "id": int}
                  #          | {"type": "fix_warnings", "explanation": str}
-                 #          | {"type": "optimize_bottleneck", "explanation": str}
+                 #          | {"type": "optimize_bottleneck", "target_percentage": float|None, "explanation": str}
                  #          | None,
                  #  "currency_switch": "USD"|"EUR"|"NIS"|None,  # top-level, co-occurs with any action above
                  #  "source": "llm" | "heuristic"}

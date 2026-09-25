@@ -275,7 +275,7 @@ def _thread_view(post) -> None:
     )
     st.title(post.title)
     if post.flair:
-        st.markdown(theme.pulse_badge(post.flair, "flair"), unsafe_allow_html=True)
+        st.markdown(theme.flair_badge(post.flair), unsafe_allow_html=True)
     if post.author_notes:
         st.markdown(post.author_notes)
 
@@ -512,7 +512,7 @@ def render() -> None:
                 sanitize_markdown(f"### {post.title} | {format_currency(post.build.total_cost, currency)}")
             )
             if post.flair:
-                st.markdown(theme.pulse_badge(post.flair, "flair"), unsafe_allow_html=True)
+                st.markdown(theme.flair_badge(post.flair), unsafe_allow_html=True)
             st.caption(_post_subtitle(post.build, post.created_at))
             if st.button("View", key=f"view_post_{post.id}"):
                 st.session_state["selected_post_id"] = post.id

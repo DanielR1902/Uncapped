@@ -45,12 +45,21 @@ with st.sidebar:
         if pending_currency is not None:
             st.session_state["selected_currency"] = pending_currency
 
-        # Global currency display preference (spec.md §7.7/§6.7, ui/format.py). Pure
-        # display-layer: every stored/compared price stays USD regardless of this
-        # choice. `key="selected_currency"` writes directly into the canonical
-        # session-state key every view/the Concierge already reads — a plain
-        # `st.selectbox` already triggers a full script rerun on its own the instant
-        # its value changes, so no separate explicit st.rerun() is needed here.
+        # Global currency display preference (spec.md §7.7/§6.7/§7.12, ui/format.py).
+        # Pure display-layer: every stored/compared price stays USD regardless of
+        # this choice. A horizontal 3-segment control (`st.segmented_control`,
+        # replacing the prior plain `st.selectbox` — same underlying mechanism:
+        # `key="selected_currency"` still writes directly into the canonical
+        # session-state key every view/the Concierge already reads, and a value
+        # change still triggers a full script rerun on its own, so no separate
+        # explicit st.rerun() is needed here). `required=True` is load-bearing: by
+        # default `st.segmented_control` allows clicking the ALREADY-active segment
+        # to deselect it entirely (a real, single-select toggle-off UX meant for
+        # filter-style controls), which would leave `selected_currency` as `None`
+        # — a value nothing downstream (`ui.format.format_currency` et al.)
+        # expects; `required=True` disables that deselect entirely, so exactly one
+        # of the 3 segments is always active, matching a dropdown's own
+        # always-has-a-value guarantee.
         #
         # Deliberately rendered BEFORE the nav-buttons loop below (not after it):
         # a nav button's own click handler calls st.rerun() immediately upon a
@@ -60,11 +69,13 @@ with st.sidebar:
         # prior session-state value and re-showing its index=0 default instead of
         # what the user had actually selected. Placing it ahead of any early-exit
         # button sidesteps that entirely, since it's always reached every pass.
-        st.selectbox(
+        st.segmented_control(
             "Currency",
             CURRENCY_CODES,
             key="selected_currency",
             format_func=currency_label,
+            selection_mode="single",
+            required=True,
         )
 
         st.markdown("---")

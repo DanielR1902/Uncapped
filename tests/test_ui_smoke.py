@@ -349,6 +349,67 @@ def test_landing_preset_buttons_disabled_when_logged_out(seeded_db):
     assert at.get_by_key("load_preset_ultra").disabled is True
 
 
+def test_landing_no_guest_architect_bypass_button(seeded_db):
+    """The "Continue as Guest Architect" button was removed entirely (spec.md
+    §7.11) — a logged-out visitor sees only the real Login/Register forms,
+    no bypass button of any kind."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+
+    assert not any(b.key == "continue_as_guest" for b in at.button)
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "Continue as Guest Architect" not in page_text
+
+
+def test_landing_guest_lockdown_notice_and_trending_button_disabled(seeded_db):
+    """Logged out: the red "must be logged in" notice appears beside BOTH
+    the Preset Launchpad and Trending Builds section headers, and the
+    Trending reel's own "Inspect Blueprint" button is disabled -- a real
+    gap from an earlier round (only the preset buttons were gated then,
+    this one wasn't)."""
+    from db.repositories import builds_repo, community_repo, components_repo, users_repo
+
+    user = users_repo.create_user("guestlockdown1", "hash", "guestlockdown1@example.com", "Guest Lockdown One")
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=user.id, name="Guest Lockdown Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    post = community_repo.create_post(build.id, user.id, "Guest Lockdown Rig")
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert page_text.count("must be logged in to view these builds") == 2
+
+    assert at.get_by_key(f"trending_view_{post.id}").disabled is True
+
+
+def test_landing_guest_lockdown_clears_and_button_active_when_logged_in(seeded_db):
+    """Logging in must remove both red notices and re-enable the Trending
+    reel's "Inspect Blueprint" button for a real, existing shared post."""
+    from db.repositories import builds_repo, community_repo, components_repo, users_repo
+
+    author = users_repo.create_user("guestlockdown2", "hash", "guestlockdown2@example.com", "Guest Lockdown Two")
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=author.id, name="Guest Lockdown Rig Two", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    post = community_repo.create_post(build.id, author.id, "Guest Lockdown Rig Two")
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "loggedinviewer1", "loggedinviewer1@example.com", "Logged In Viewer One")
+
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "must be logged in to view these builds" not in page_text
+    assert at.get_by_key(f"trending_view_{post.id}").disabled is False
+
+
 def test_landing_load_preset_populates_studio_and_navigates(seeded_db):
     """Clicking "Load Preset to Studio" must populate a real, fully
     compatible Workload build (engine.solvers.allocate_workload_baseline)
@@ -2733,6 +2794,203 @@ def test_concierge_load_build_action_applies_immediately_no_confirmation(seeded_
     assert not any(b.key == "concierge_confirm_load" for b in at.button)
 
 
+def test_concierge_load_build_with_budget_cap_uses_deterministic_solver(seeded_db, monkeypatch):
+    """HARD CEILING / TARGET-ZONE ENFORCEMENT (Part 2): a load_build action
+    carrying `budget_cap_usd` must NOT use the model's own (here, empty)
+    `components` as the final build — engine.solvers.initialize_budget_build
+    fills every category, lands the build in Budget mode with a real
+    `budget_ceiling`, and never exceeds the stated cap."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from engine.solvers import CATEGORY_ORDER
+
+    ceiling = 1500.0
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        **kwargs,
+    ):
+        return {
+            "reply": "Building a rig within your budget.",
+            "action": {
+                "type": "load_build",
+                "components": {},
+                "budget_cap_usd": ceiling,
+                "explanation": "Budget-mode solver fills every category.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge_budget", "concierge_budget@example.com", "Concierge Budget")
+
+    at.get_by_key("concierge_chat_input").set_value("build me a PC for up to 1500 USD").run()
+
+    assert not at.exception
+    draft = at.session_state["build_draft"]
+    assert draft["creation_mode"] == "Budget"
+    assert draft["budget_ceiling"] == ceiling
+    # fill_peripherals_with_surplus=True may also add peripheral categories —
+    # only the 8 core categories are required to be present.
+    assert set(CATEGORY_ORDER).issubset(draft["components"].keys())
+    from db.repositories import components_repo
+
+    total = sum(
+        components_repo.get_by_id(component_id).price_usd for component_id in draft["components"].values()
+    )
+    assert total <= ceiling
+
+
+def test_concierge_modify_build_hard_cap_never_exceeds_ceiling(seeded_db, monkeypatch):
+    """BUDGET HARD-CAP SAFETY NET (Part 2): a modify_build patch that would
+    push an already-Budget-mode build's total over its real ceiling is
+    re-clamped in Python — never trusted to the model's own arithmetic
+    alone."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine import solvers
+
+    ceiling = 900.0
+    selection = solvers.initialize_budget_build(ceiling)
+    priciest_gpu = max(components_repo.get_by_category("GPU"), key=lambda c: c.price_usd)
+
+    def _fake_response(
+        user_message,
+        conversation_history,
+        catalog_summary,
+        community_summary,
+        current_build_context=None,
+        advisory_context=None,
+        **kwargs,
+    ):
+        return {
+            "reply": "Upgrading the GPU.",
+            "action": {
+                "type": "modify_build",
+                "components": {"GPU": priciest_gpu.id},
+                "quantities": {},
+                "explanation": "Swapped in the priciest GPU.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge_hardcap", "concierge_hardcap@example.com", "Concierge Hardcap")
+    at.session_state["build_draft"] = {
+        "name": "",
+        "creation_mode": "Budget",
+        "workload_profile": None,
+        "tier": "Mid",
+        "budget_ceiling": ceiling,
+        "components": {category: component.id for category, component in selection.items()},
+        "quantities": {},
+    }
+    at.session_state["page"] = "create_build"
+
+    at.get_by_key("concierge_chat_input").set_value("upgrade my GPU to the best one").run()
+
+    assert not at.exception
+    draft = at.session_state["build_draft"]
+    total = sum(
+        components_repo.get_by_id(component_id).price_usd for component_id in draft["components"].values()
+    )
+    assert total <= ceiling
+
+
+def test_concierge_use_remaining_budget_spends_headroom_without_exceeding_ceiling(seeded_db, monkeypatch):
+    """Part 3 (this round's directive): the deterministic multi-tier
+    spend-down loop must apply MULTIPLE real, affordable rounds of upgrade
+    (never stopping after just one, the real "leaves hundreds unused"
+    complaint) while never exceeding the real ceiling, and must stop once no
+    further real upgrade exists — never a no-op, never an infinite loop.
+    `get_build_advisory` itself is mocked directly (a stateful fake returning
+    a different real, catalog-priced action each call) so this test verifies
+    the LOOP logic in `_apply_concierge_action` itself, independent of
+    whatever a specific real build happens to have headroom for via the
+    heuristic/live advisory path (already covered by other tests)."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine import solvers
+
+    ceiling = 3243.24
+    selection = solvers.initialize_budget_build(ceiling, fill_peripherals_with_surplus=True)
+
+    ram_options = sorted(components_repo.get_by_category("RAM"), key=lambda c: c.price_usd)
+    storage_options = sorted(components_repo.get_by_category("Storage"), key=lambda c: c.price_usd)
+    upgrade_a = next(c for c in ram_options if c.id != selection["RAM"].id)
+    upgrade_b = next(c for c in storage_options if c.id != selection["Storage"].id)
+
+    call_count = {"n": 0}
+
+    def _fake_advisory(build_state, mode, current_budget_or_cost, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            actions = [{"action": "swap", "category": "RAM", "replace_with_id": upgrade_a.id}]
+        elif call_count["n"] == 2:
+            actions = [{"action": "swap", "category": "Storage", "replace_with_id": upgrade_b.id}]
+        else:
+            actions = []  # no further real upgrade — the loop must stop here
+        return {
+            "pros": [], "cons": [],
+            "within_budget": {"explanation": "", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {"explanation": "", "actions": actions, "added_cost_usd": 1.0 if actions else 0.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_build_advisory", _fake_advisory)
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        assert current_build_context["mode"] == "Budget"
+        return {
+            "reply": "Using your remaining budget on the best upgrades that fit.",
+            "action": {"type": "use_remaining_budget"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "userembudget1", "userembudget1@example.com", "Use Remaining Budget One")
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Budget", "workload_profile": None, "tier": "Mid",
+        "budget_ceiling": ceiling,
+        "components": {category: component.id for category, component in selection.items()},
+        "quantities": {},
+    }
+    at.session_state["page"] = "create_build"
+
+    at.get_by_key("concierge_chat_input").set_value("upgrade what you can with the remaining budget").run()
+
+    assert not at.exception
+    # The loop must run BOTH real rounds (RAM, then Storage) and then stop as
+    # soon as the 3rd call returns no actions — never looping further, never
+    # stopping after just the first round (the real "leaves headroom unused"
+    # complaint this fix addresses).
+    assert call_count["n"] == 3
+    draft = at.session_state["build_draft"]
+    final_total = sum(
+        components_repo.get_by_id(component_id).price_usd for component_id in draft["components"].values()
+    )
+    assert final_total <= ceiling  # hard cap never exceeded, even after 2 applied rounds
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "Delta:" in last_message
+    assert "Total:" in last_message
+
+
 def test_concierge_never_calls_live_llm_without_api_key(seeded_db):
     """No mocking at all: with no OPENROUTER_API_KEY/MODEL configured (the
     _no_live_llm_calls autouse fixture clears both), sending a message must
@@ -3663,6 +3921,100 @@ def test_concierge_save_build_fast_track_with_publish_immediately_persists_both_
     assert len(feed) == 1
     assert feed[0].build_id == builds[0].id
     assert at.session_state["concierge_last_saved_build"] == {"build_id": builds[0].id, "name": "Workstation"}
+
+
+def test_concierge_save_build_fast_track_publish_carries_flair_tag(seeded_db, monkeypatch):
+    """Part 2 (this round's directive — unified publishing with status tags):
+    a fast-track save+publish action carrying a `flair` must land on the
+    real CommunityPost row, so the feed/thread badge reflects the user's own
+    chosen tag rather than always defaulting to one or nothing."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "fasttrackflair1", "fasttrackflair1@example.com", "Fast Track Flair One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Saved 'Workstation' and published it to the Community as Looking for Help!",
+            "action": {
+                "type": "save_build",
+                "name": "Workstation",
+                "destination": "build",
+                "publish_immediately": True,
+                "author_notes": None,
+                "flair": "Looking for Help",
+                "explanation": "Fast-track save + publish with a tag.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value(
+        "save build as workstation and publish to community as looking for help"
+    ).run()
+
+    assert not at.exception
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    assert feed[0].flair == "Looking for Help"
+
+
+def test_concierge_publish_build_carries_flair_tag(seeded_db, monkeypatch):
+    """The separate, later-turn publish_build action must also carry its
+    `flair` through to the real post."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "publishflair1", "publishflair1@example.com", "Publish Flair One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    def _fake_save_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Saved as 'Workstation'! Would you like to publish it to the Community as well?",
+            "action": {
+                "type": "save_build", "name": "Workstation", "destination": "build",
+                "explanation": "Saving now.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_save_response)
+    at.get_by_key("concierge_chat_input").set_value("save this build named Workstation").run()
+    assert not at.exception
+
+    def _fake_publish_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Published to the Community as Rate My Build!",
+            "action": {"type": "publish_build", "author_notes": None, "flair": "Rate My Build"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_publish_response)
+    at.get_by_key("concierge_chat_input").set_value("Rate My Build").run()
+
+    assert not at.exception
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    assert feed[0].flair == "Rate My Build"
 
 
 def test_concierge_save_build_without_publish_immediately_stays_private(seeded_db, monkeypatch):
@@ -4598,9 +4950,10 @@ def test_concierge_fix_warnings_noop_without_active_build(seeded_db, monkeypatch
 
 def test_concierge_optimize_bottleneck_applies_advisory_swap(seeded_db, monkeypatch):
     """A mocked optimize_bottleneck action must apply llm.advisory.get_
-    build_advisory's own real within_budget.swaps -- never a part the
-    Concierge response itself named (it names none) -- and the resulting
-    build_draft must reflect a real, resolvable catalog swap."""
+    build_advisory's own real stretch_budget.actions (the bottleneck-
+    targeting upgrade, not the cost-neutral within_budget rebalance) -- never
+    a part the Concierge response itself named (it names none) -- and the
+    resulting build_draft must reflect a real, resolvable catalog swap."""
     import ui.components.chat_assistant as chat_assistant_module
     from db.repositories import components_repo
 
@@ -4632,7 +4985,9 @@ def test_concierge_optimize_bottleneck_applies_advisory_swap(seeded_db, monkeypa
 
     assert not at.exception
     last_message = at.session_state["concierge_messages"][-1]
-    assert "Bottleneck now" in last_message["content"] or "Bottleneck unavailable." in last_message["content"]
+    # RIGOROUS TELEMETRY REPLY FORMAT (Part 2, this round): the old bare
+    # "Bottleneck now X%." line was replaced with a before -> after delta.
+    assert "Bottleneck:" in last_message["content"] or "Bottleneck unavailable." in last_message["content"]
     # The build_draft must still resolve to a real, complete, valid build
     # afterward, whether or not a beneficial swap existed for THIS specific
     # already-cheapest-of-each-category starting point.
@@ -4640,6 +4995,70 @@ def test_concierge_optimize_bottleneck_applies_advisory_swap(seeded_db, monkeypa
     assert set(after_components.keys()) == set(before_components.keys())
     for component_id in after_components.values():
         assert components_repo.get_by_id(component_id) is not None
+
+
+def test_concierge_optimize_bottleneck_upgrades_the_bottlenecked_category(seeded_db, monkeypatch):
+    """Root-cause regression test for the real bug this round's directive
+    described ("AI fails to reduce bottleneck" / "hallucinates irrelevant
+    swaps"): a genuinely CPU-bound build (a budget AM4 CPU paired with a
+    flagship GPU — real, confirmed-live-compatible parts) must get its CPU
+    swapped for a pricier compatible one, never an unrelated category. Uses
+    the real heuristic advisory path (no OPENROUTER_API_KEY, per the
+    `_no_live_llm_calls` autouse fixture) so this is deterministic, no live
+    network call."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine.compatibility import evaluate_build
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "AMD Ryzen 5 5600")
+    gpu = _find("GPU", "AMD Radeon RX 7900 XTX")
+    mobo = _find("Motherboard", "MSI B550-A PRO")
+    ram = _find("RAM", "Kingston FURY Beast 32GB (2x16GB) DDR4-3200")
+    storage = _find("Storage", "WD Black SN850X 2TB")
+    psu = _find("PSU", "Corsair RM850x")
+    case = _find("Case", "Corsair 4000D Airflow")
+    cooler = _find("Cooler", "Thermalright Peerless Assassin 120 SE")
+
+    build_state = {
+        "CPU": cpu, "Motherboard": mobo, "GPU": gpu, "RAM": ram, "Storage": storage,
+        "PSU": psu, "Case": case, "Cooler": cooler,
+    }
+    report = evaluate_build(build_state)
+    assert report.is_compatible  # sanity: the fixture build is actually valid
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "optbottleneck2", "optbottleneck2@example.com", "Opt Bottleneck Two")
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Free", "workload_profile": None, "tier": "Mid", "budget_ceiling": None,
+        "components": {cat: c.id for cat, c in build_state.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Free"
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        assert current_build_context["bottleneck"]["direction"] == "CPU-bound"
+        return {
+            "reply": "Rebalancing your CPU/GPU pairing now.",
+            "action": {"type": "optimize_bottleneck", "target_percentage": 10.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("try to get it under 10%").run()
+
+    assert not at.exception
+    after_cpu_id = at.session_state["build_draft"]["components"]["CPU"]
+    assert after_cpu_id != cpu.id  # the CPU itself must have actually changed
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "Bottleneck:" in last_message
+    assert "Delta:" in last_message
 
 
 # ---------------------------------------------------------------------------

@@ -218,11 +218,15 @@ class CommunityPost(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     author_notes: Mapped[str | None] = mapped_column(Text)
-    # Optional post flair (spec.md §3.7/§7.6.1) — today the only real value is
-    # "Rate My Build" (Build Studio's dedicated feedback-request flow, distinct
-    # from a plain "Also publish to Community" save); NULL for every other
-    # post, including ones shared before this column existed (additive
-    # migration, db/database.py::_ensure_community_posts_flair_column).
+    # Optional post flair (spec.md §3.7/§7.6.1) — the two real, currently-
+    # selectable values are "Rate My Build" (green badge) and "Looking for
+    # Help" (red badge), chosen by the publisher via a dropdown at every real
+    # publish entry point (Build Studio's HUD "Share / Rate My Build" dialog,
+    # the bottom "Also publish to Community" checkbox, and the AI Concierge's
+    # own publish flow, which now always asks which one before ever
+    # publishing); NULL for a post shared before this column existed at all
+    # (additive migration, db/database.py::_ensure_community_posts_flair_column)
+    # or before the tag became a required choice.
     flair: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()

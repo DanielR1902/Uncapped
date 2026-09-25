@@ -307,18 +307,23 @@ def _rate_my_build_title(build_state: dict) -> str:
     return "[Spec Check] My Build"
 
 
+_FLAIR_OPTIONS = ("Rate My Build", "Looking for Help")
+
+
 @st.dialog("Share / Rate My Build")
 def _rate_my_build_dialog(build_draft: dict, build_state: dict) -> None:
     """"Rate My Build" direct export (spec.md §7.4.1) — a dedicated
     feedback-request shortcut distinct from `_save_actions`' general
     "Also publish to Community" checkbox: it always publishes (there is no
     private option here, the whole point is to ask the community), tags
-    the post with `flair="Rate My Build"` (`db.repositories.community_repo`,
-    spec.md §3.6), and jumps straight to the new post's thread view instead
-    of landing on `my_builds`. Persists the CURRENT build_state as a real,
-    new `Build` row exactly like `_save_actions`' publish branch does
-    (same repository calls, same score fields) — a build doesn't need to be
-    saved first for this to work, matching that same button's own
+    the post with the user's own chosen `flair` (`_FLAIR_OPTIONS` —
+    "Rate My Build" or "Looking for Help", `db.repositories.community_repo`,
+    spec.md §3.6/§3.7 — no longer hardcoded to "Rate My Build" regardless of
+    the user's actual intent), and jumps straight to the new post's thread
+    view instead of landing on `my_builds`. Persists the CURRENT build_state
+    as a real, new `Build` row exactly like `_save_actions`' publish branch
+    does (same repository calls, same score fields) — a build doesn't need
+    to be saved first for this to work, matching that same button's own
     `disabled=not build_state` gating (a build doesn't need every core slot
     filled to ask "is this PSU sufficient?" about the parts already
     chosen)."""
@@ -333,6 +338,10 @@ def _rate_my_build_dialog(build_draft: dict, build_state: dict) -> None:
     tdp = sum((c.tdp_watts or 0) for c in build_state.values())
 
     title = st.text_input("Title", value=_rate_my_build_title(build_state), key="rate_my_build_title")
+    flair = st.selectbox(
+        "Publication Category / Intent", _FLAIR_OPTIONS, key="rate_my_build_flair",
+    )
+    st.markdown(theme.flair_badge(flair), unsafe_allow_html=True)
 
     snap_cols = st.columns(3)
     snap_cols[0].metric("💰 Price", format_currency(total_cost, currency))
@@ -368,7 +377,7 @@ def _rate_my_build_dialog(build_draft: dict, build_state: dict) -> None:
         )
         post = community_repo.create_post(
             build.id, user["id"], title or _rate_my_build_title(build_state),
-            description or None, flair="Rate My Build",
+            description or None, flair=flair,
         )
         # Same "leaving the builder with a real, persisted result" teardown
         # _save_actions' publish branch performs — no database write of its
@@ -701,9 +710,14 @@ def _save_actions(build_draft: dict, build_state: dict) -> None:
 
     publish = False
     community_description = ""
+    community_flair = _FLAIR_OPTIONS[0]
     if not save_as_draft:
         publish = st.checkbox("Also publish to Community", key="publish_checkbox")
         if publish:
+            community_flair = st.selectbox(
+                "Publication Category / Intent", _FLAIR_OPTIONS, key="publish_flair_select",
+            )
+            st.markdown(theme.flair_badge(community_flair), unsafe_allow_html=True)
             community_description = st.text_area(
                 "Community post description",
                 placeholder="Share your thoughts, use-case, or notes about this build...",
@@ -748,7 +762,10 @@ def _save_actions(build_draft: dict, build_state: dict) -> None:
                 is_public=publish,
             )
             if publish:
-                community_repo.create_post(build.id, user["id"], name or "Untitled build", community_description or None)
+                community_repo.create_post(
+                    build.id, user["id"], name or "Untitled build", community_description or None,
+                    flair=community_flair,
+                )
 
             st.success("Build saved!")
             destination_page = "my_builds"
