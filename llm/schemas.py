@@ -453,6 +453,47 @@ class ConciergeLoadSavedBuildAction(BaseModel):
     id: int
 
 
+class ConciergeFixWarningsAction(BaseModel):
+    """The user's explicit request to resolve the CURRENTLY ACTIVE build's
+    real compatibility issues (e.g. "fix the warnings in my build", "resolve
+    the compatibility issue") — requires `current_build_context` to carry a
+    non-empty `compatibility_issues` list (see llm/concierge.py's SYSTEM_
+    PROMPT); if there's no active build, or it has no real issues right now,
+    the model must say so plainly in `reply` and return `action: null`
+    instead. Carries NO LLM-asserted catalog id or category — per this
+    project's own architecture rule that compatibility is never LLM-gated
+    (root CLAUDE.md), the actual fix is computed entirely by
+    `engine.solvers.resolve_compatibility_issues` (deterministic, catalog-
+    grounded, re-validated against `engine.compatibility` after every
+    candidate swap); this action only carries the RECOGNIZED INTENT, exactly
+    like `ConciergeNavigateAction`/`ConciergePublishBuildAction` are pure
+    pass-throughs with nothing for `_validate_action` to zero-hallucination-
+    check."""
+
+    type: Literal["fix_warnings"] = "fix_warnings"
+    explanation: str = ""
+
+
+class ConciergeOptimizeBottleneckAction(BaseModel):
+    """The user's explicit request to reduce the CURRENTLY ACTIVE build's
+    bottleneck percentage (e.g. "optimize the bottleneck", "reduce the
+    bottleneck", "rebalance my CPU and GPU") — requires `current_build_
+    context` to carry a `bottleneck` reading above the target (see
+    llm/concierge.py SYSTEM_PROMPT); if there's no active build, or it's
+    already well-balanced, the model must say so plainly in `reply` and
+    return `action: null` instead. Carries NO LLM-asserted catalog id or
+    category — the actual rebalancing swap comes from
+    `llm.advisory.get_build_advisory`'s own already-zero-hallucination-
+    validated `within_budget.swaps` (Free mode's own stated optimization
+    objective is exactly "bottleneck mitigation and CPU/GPU platform
+    balance", llm/CLAUDE.md), applied by the caller — never a fresh part
+    choice invented by THIS response. A pure pass-through, same reasoning as
+    `ConciergeFixWarningsAction` above."""
+
+    type: Literal["optimize_bottleneck"] = "optimize_bottleneck"
+    explanation: str = ""
+
+
 class ConciergeResponse(BaseModel):
     """Response shape for the Concierge chat feature (see llm/concierge.py).
     `reply` is always present (conversational answer to the user's message).
@@ -472,16 +513,27 @@ class ConciergeResponse(BaseModel):
     EXISTING draft/saved build/community post directly into the Build Studio
     for editing (`load_saved_build`, resolved against `drafts_summary`/
     `previous_builds_summary`/`community_summary` — see
-    `ConciergeLoadSavedBuildAction`'s docstring); it is `None` for
-    catalog-question, community-recommendation, and optimization/analysis
-    intents, and also `None` (with `reply` saying so) when a named part could
+    `ConciergeLoadSavedBuildAction`'s docstring), a request to resolve the
+    active build's real compatibility issues (`fix_warnings` — requires a
+    non-empty `current_build_context["compatibility_issues"]`; the actual
+    fix is computed by `engine.solvers.resolve_compatibility_issues`, never
+    an LLM-chosen part — see `ConciergeFixWarningsAction`'s docstring), or a
+    request to reduce the active build's bottleneck percentage
+    (`optimize_bottleneck` — the actual rebalancing swap comes from
+    `llm.advisory.get_build_advisory`'s own zero-hallucination-validated
+    `within_budget.swaps` — see `ConciergeOptimizeBottleneckAction`'s
+    docstring); it is `None` for catalog-question, community-recommendation,
+    and optimization/analysis intents, and also `None` (with `reply` saying
+    so) when a named part could
     not be found in `catalog_summary` at all, when a modify/save request has
     no active build to act on, when no post in `community_summary` matches a
     requested deep-link target, when no item in the relevant summary matches
     a requested load-into-studio target (or the request is ambiguous), or
     when a mid-flow reply is still gathering information (e.g. asking for
     the still-missing name or destination, asking whether to publish, or
-    asking for a description) before there's anything to act on yet.
+    asking for a description) before there's anything to act on yet, or
+    when a `fix_warnings`/`optimize_bottleneck` request has no active build,
+    no real issues, or an already-acceptable bottleneck to act on.
 
     `currency_switch` (optional, default `None`) is a SEPARATE, top-level
     field — deliberately NOT nested inside `action` — because it must be able
@@ -509,6 +561,8 @@ class ConciergeResponse(BaseModel):
         | ConciergePublishBuildAction
         | ConciergeOpenCommunityBuildAction
         | ConciergeLoadSavedBuildAction
+        | ConciergeFixWarningsAction
+        | ConciergeOptimizeBottleneckAction
         | None
     ) = None
     currency_switch: Literal["USD", "EUR", "NIS"] | None = None

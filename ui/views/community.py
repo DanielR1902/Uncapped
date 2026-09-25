@@ -2,16 +2,36 @@
 `pending_community_filters` staging key (`_apply_pending_community_filters`)
 that `ui/components/chat_assistant.py` sets when a Concierge `navigate`
 action targets this page with a `filters` payload — see that function's
-docstring."""
+docstring.
+
+Posts are shown strictly chronologically, newest first (`community_repo.get_feed`)
+— there is no voting/scoring mechanism (a prior Reddit-style upvote/downvote
+implementation was removed entirely by a later product decision; see git
+history). Comments support threaded replies (`CommunityComment.parent_comment_id`)
+— `community_repo.get_comments` still returns a FLAT, chronological list
+(unchanged, so existing callers/tests keep working); grouping that flat list
+into a parent/child tree and rendering it with indentation is this view's own
+job (`_group_comments_by_parent`/`_render_comment_node`), not the
+repository's — building a presentation tree from real data is a UI concern,
+not business logic (db/CLAUDE.md)."""
 from __future__ import annotations
+
+import html
+from collections import defaultdict
 
 import streamlit as st
 
 from auth.session import current_user
 from db.repositories import builds_repo, community_repo, users_repo
-from ui import state
+from ui import state, theme
 from ui.components.build_card import render_build_card
-from ui.format import format_currency, humanize_profile, sanitize_markdown
+from ui.format import format_currency, humanize_profile, sanitize_markdown, time_ago
+
+# Reply nesting keeps growing visually indented up to this many levels, then
+# flattens out (still a real reply relationship in the data either way) —
+# the same practical "don't run comments off the right edge of the screen"
+# cap Reddit's own UI applies.
+_MAX_VISUAL_REPLY_DEPTH = 6
 
 
 def _post_subtitle(build, created_at) -> str:
@@ -80,21 +100,159 @@ def _submit_comment(post_id: int) -> None:
     st.session_state["new_comment_input"] = ""
 
 
-@st.fragment
-def _comments_section(post) -> None:
-    """Fragment-scoped so posting a comment only re-renders this box, not the
-    whole thread page above it (header, cost breakdown, component list) —
-    keeps the page from fully reflowing/jumping back to the top on submit."""
-    st.markdown("#### Comments")
-    comments = community_repo.get_comments(post.id)
+def _set_reply_target(comment_id: int | None) -> None:
+    """on_click callback backing both the "Reply" button (opens the reply box
+    under a specific comment, `comment_id`) and "Cancel" (`None`, closes
+    whichever one is open). `community_reply_target` holds a real
+    `CommunityComment.id` or `None` — a comment id is globally unique across
+    every post, so this needs no per-post scoping: navigating to a
+    DIFFERENT post while a reply box was open just means that id matches
+    nothing in the new post's own comment list, and no reply box renders
+    anywhere — self-correcting, no explicit cleanup needed."""
+    st.session_state["community_reply_target"] = comment_id
+
+
+def _submit_reply(post_id: int, parent_comment_id: int) -> None:
+    """on_click callback for a specific comment's own "Post reply" button —
+    same reasoning as `_submit_comment` for why this must run as a callback
+    (clearing the text_area's OWN keyed value) rather than inline in the
+    render pass. Each reply box gets its own widget key
+    (`reply_input_{parent_comment_id}`) since, unlike the single top-level
+    "Add a comment" box, more than one of these can exist in the comment
+    tree's data even though only one is ever OPEN (rendered) at a time."""
+    key = f"reply_input_{parent_comment_id}"
+    content = st.session_state.get(key, "").strip()
+    if content:
+        community_repo.add_comment(post_id, current_user()["id"], content, parent_comment_id=parent_comment_id)
+    st.session_state[key] = ""
+    st.session_state["community_reply_target"] = None
+
+
+def _group_comments_by_parent(comments: list) -> dict[int | None, list]:
+    """`community_repo.get_comments`'s flat, chronological (oldest-first)
+    list, regrouped by `parent_comment_id` (`None` for a top-level comment) —
+    the shape `_render_comment_node` recurses over. Each group is already in
+    chronological order (inherited from the input list's own order), so
+    replies-to-the-same-parent render oldest-first too, matching the
+    directive's "sorted chronologically" requirement at every level, not just
+    the top one."""
+    grouped: dict[int | None, list] = defaultdict(list)
     for comment in comments:
+        grouped[comment.parent_comment_id].append(comment)
+    return grouped
+
+
+def _render_comment_node(post_id: int, comment, children_by_parent: dict, depth: int) -> None:
+    """Recursively renders `comment` and every reply nested under it,
+    visually indented one step deeper per level (capped at
+    `_MAX_VISUAL_REPLY_DEPTH` — the underlying reply relationship itself is
+    never capped, only how far right the indentation keeps shifting).
+
+    Indentation uses `st.columns([spacer, content])`, NOT a raw injected HTML
+    `<div style="margin-left:...">` — Streamlit widgets (the "Reply" button,
+    the reply `st.text_area`) are each their own independent component in the
+    page's DOM; they are never children of an `st.markdown(unsafe_allow_html=
+    True)` call's injected HTML, so a CSS margin/indent on that markup alone
+    would leave the interactive controls flush-left regardless of depth. A
+    `st.columns` split is the real, Streamlit-native way to shift an entire
+    block — text AND widgets — to the right. The visual "connector line" look
+    (a left border) IS achieved via CSS (`.uncapped-comment-reply`,
+    ui/theme.py) — that part only ever wraps the STATIC text content
+    (avatar/name/timestamp/body), never a widget, so it's safe."""
+    visual_depth = min(depth, _MAX_VISUAL_REPLY_DEPTH)
+    if visual_depth > 0:
+        _, content_col = st.columns([0.05 * visual_depth, 1 - 0.05 * visual_depth])
+    else:
+        content_col = st.container()
+
+    with content_col:
         author = users_repo.get_by_id(comment.user_id)
         author_name = author.full_name if author is not None else "Unknown user"
-        st.markdown(f"**{author_name}** · {comment.created_at:%Y-%m-%d %H:%M}")
-        st.write(comment.content)
+        css_class = "uncapped-comment-reply" if depth > 0 else "uncapped-comment-top"
+        st.markdown(
+            f'<div class="{css_class}">'
+            f'<strong>👤 {html.escape(author_name)}</strong> '
+            f'<span class="uncapped-muted">· {time_ago(comment.created_at)}</span><br>'
+            f'{html.escape(comment.content)}'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.button("Reply", key=f"reply_btn_{comment.id}", on_click=_set_reply_target, args=(comment.id,))
+        if st.session_state.get("community_reply_target") == comment.id:
+            st.text_area("Your reply", key=f"reply_input_{comment.id}")
+            reply_cols = st.columns(2)
+            reply_cols[0].button(
+                "Post reply",
+                key=f"submit_reply_{comment.id}",
+                type="primary",
+                on_click=_submit_reply,
+                args=(post_id, comment.id),
+            )
+            reply_cols[1].button(
+                "Cancel", key=f"cancel_reply_{comment.id}", on_click=_set_reply_target, args=(None,)
+            )
+
+        for child in children_by_parent.get(comment.id, []):
+            _render_comment_node(post_id, child, children_by_parent, depth + 1)
+
+
+@st.fragment
+def _comments_section(post) -> None:
+    """Fragment-scoped so posting a comment/reply only re-renders this box,
+    not the whole thread page above it (header, cost breakdown, component
+    list) — keeps the page from fully reflowing/jumping back to the top on
+    submit. Threaded (spec.md §7.6): `community_repo.get_comments` still
+    returns a flat, chronological list — `_group_comments_by_parent` +
+    `_render_comment_node` build and render the reply tree from it here."""
+    st.markdown("#### Comments")
+    comments = community_repo.get_comments(post.id)
+    children_by_parent = _group_comments_by_parent(comments)
+    for top_level_comment in children_by_parent.get(None, []):
+        _render_comment_node(post.id, top_level_comment, children_by_parent, depth=0)
 
     st.text_area("Add a comment", key="new_comment_input")
     st.button("Post comment", key="post_comment", on_click=_submit_comment, args=(post.id,))
+
+
+# Industrial hardware blueprint grouping (spec.md §7.6.1) — every
+# BuildComponent's `.category` falls into exactly one of these two named
+# groups, or (peripherals only) neither; grouping is purely a presentation
+# concern for this view, never business logic (db/CLAUDE.md).
+_BLUEPRINT_GROUPS = (
+    ("Core Components", ("CPU", "GPU", "Motherboard", "RAM", "PSU", "Case")),
+    ("Storage & Cooling", ("Storage", "Cooler")),
+)
+
+
+def _render_hardware_blueprint(components) -> None:
+    """Groups a build's real, persisted `BuildComponent` rows into the
+    industrial "hardware blueprint card" groups above (spec.md §7.6.1) —
+    replaces the old flat bullet list with the same underlying data, just
+    organized the way an actual spec sheet reads. A quantity > 1 (only ever
+    meaningful for RAM/Storage) still gets an "(xN)" badge with the line's
+    real per-line total (unit price × quantity), unchanged from before."""
+    currency = st.session_state.get("selected_currency", "USD")
+    by_category = {bc.category: bc for bc in components}
+    grouped_categories: set[str] = set()
+
+    for group_name, categories in _BLUEPRINT_GROUPS:
+        rows = [by_category[cat] for cat in categories if cat in by_category]
+        grouped_categories.update(categories)
+        if not rows:
+            continue
+        st.markdown(theme.section_header(group_name), unsafe_allow_html=True)
+        for bc in rows:
+            label = f"{bc.category} (x{bc.quantity})" if bc.quantity > 1 else bc.category
+            total_price = bc.component.price_usd * bc.quantity
+            st.write(f"- **{label}**: {bc.component.name} ({format_currency(total_price, currency)})")
+
+    leftover = [bc for cat, bc in by_category.items() if cat not in grouped_categories]
+    if leftover:
+        st.markdown(theme.section_header("Peripherals"), unsafe_allow_html=True)
+        for bc in leftover:
+            label = f"{bc.category} (x{bc.quantity})" if bc.quantity > 1 else bc.category
+            total_price = bc.component.price_usd * bc.quantity
+            st.write(f"- **{label}**: {bc.component.name} ({format_currency(total_price, currency)})")
 
 
 def _thread_view(post) -> None:
@@ -102,25 +260,29 @@ def _thread_view(post) -> None:
         st.session_state["selected_post_id"] = None
         st.rerun()
 
+    # Clean header (spec.md §7.6): avatar + "u/{author}" + "• {time_ago}"
+    # above a large, bold post title — author_name/content are real
+    # user-supplied text, HTML-escaped before this unsafe_allow_html=True
+    # markup (the same discipline theme.avatar_html itself already applies
+    # internally).
+    st.markdown(
+        f'<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px;">'
+        f"{theme.avatar_html(post.user.full_name)}"
+        f'<span style="font-weight:600;">u/{html.escape(post.user.full_name)}</span>'
+        f'<span class="uncapped-muted">• {time_ago(post.created_at)}</span>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
     st.title(post.title)
-    st.caption(f"by {post.user.full_name} · {post.created_at:%Y-%m-%d}")
+    if post.flair:
+        st.markdown(theme.pulse_badge(post.flair, "flair"), unsafe_allow_html=True)
     if post.author_notes:
         st.markdown(post.author_notes)
 
     render_build_card(post.build)
 
-    st.markdown("#### Components")
-    for bc in post.build.components:
-        # A quantity > 1 (only ever meaningful for RAM/Storage — every other
-        # category is implicitly 1x) gets an "(xN)" badge appended directly
-        # to the category label, with the line's own price reflecting the
-        # real total for that many units (unit price × quantity), not just
-        # one unit's price — e.g. "Storage (x3): WD Black SN850X 2TB
-        # ($477.00)" for 3 units at $159.00 each.
-        label = f"{bc.category} (x{bc.quantity})" if bc.quantity > 1 else bc.category
-        total_price = bc.component.price_usd * bc.quantity
-        currency = st.session_state.get("selected_currency", "USD")
-        st.write(f"- **{label}**: {bc.component.name} ({format_currency(total_price, currency)})")
+    st.markdown("#### Hardware Blueprint")
+    _render_hardware_blueprint(post.build.components)
 
     cols = st.columns(2)
     if cols[0].button("🍴 Fork / Customize", key="fork_build", use_container_width=True):
@@ -339,8 +501,18 @@ def render() -> None:
     for post in filtered_posts:
         with st.container(border=True):
             st.markdown(
+                f'<div style="display:flex; align-items:center; gap:6px; margin-bottom:2px;">'
+                f"{theme.avatar_html(post.user.full_name, size_px=20)}"
+                f'<span class="uncapped-muted">u/{html.escape(post.user.full_name)} '
+                f"• {time_ago(post.created_at)}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
                 sanitize_markdown(f"### {post.title} | {format_currency(post.build.total_cost, currency)}")
             )
+            if post.flair:
+                st.markdown(theme.pulse_badge(post.flair, "flair"), unsafe_allow_html=True)
             st.caption(_post_subtitle(post.build, post.created_at))
             if st.button("View", key=f"view_post_{post.id}"):
                 st.session_state["selected_post_id"] = post.id

@@ -218,6 +218,12 @@ class CommunityPost(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     author_notes: Mapped[str | None] = mapped_column(Text)
+    # Optional post flair (spec.md §3.7/§7.6.1) — today the only real value is
+    # "Rate My Build" (Build Studio's dedicated feedback-request flow, distinct
+    # from a plain "Also publish to Community" save); NULL for every other
+    # post, including ones shared before this column existed (additive
+    # migration, db/database.py::_ensure_community_posts_flair_column).
+    flair: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
     )
@@ -243,6 +249,17 @@ class CommunityComment(Base):
     )
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Threaded replies (spec.md §3.7/§7.6): NULL for a top-level comment, otherwise
+    # the id of the comment this one is a direct reply to. Self-referential FK on the
+    # same table — CASCADE so deleting a parent comment (no UI for this today, but
+    # the constraint should still hold) takes its replies with it rather than
+    # orphaning them. `db.repositories.community_repo.get_comments` still returns a
+    # FLAT list ordered by created_at ASC (unchanged) — building the reply tree from
+    # that flat list is a presentation concern, done in `ui/views/community.py`, not
+    # here (db/ owns no business/presentation logic, db/CLAUDE.md).
+    parent_comment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("community_comments.id", ondelete="CASCADE"), nullable=True
+    )
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.current_timestamp()
     )
@@ -250,7 +267,10 @@ class CommunityComment(Base):
     post: Mapped["CommunityPost"] = relationship(back_populates="comments")
     user: Mapped["User"] = relationship(back_populates="community_comments")
 
-    __table_args__ = (Index("idx_comments_post_created", "post_id", "created_at"),)
+    __table_args__ = (
+        Index("idx_comments_post_created", "post_id", "created_at"),
+        Index("idx_comments_parent", "parent_comment_id"),
+    )
 
 
 class DraftBuild(Base):

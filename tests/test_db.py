@@ -263,6 +263,100 @@ def test_community_post_and_comment_crud(temp_db):
     assert comments[0].content == "Nice build!"
 
 
+def test_community_post_flair(temp_db):
+    """`flair` (spec.md §3.6/§7.4.1) defaults to None for a normal share and
+    is stored verbatim when passed -- the "Rate My Build" Build Studio flow
+    is the only real caller of this today, but the column itself is a plain
+    optional string, not an enum."""
+    run_seed()
+    user = users_repo.create_user("flair1", "hash", "flair1@example.com", "Flair One")
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=user.id, name="Flair Build", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+
+    plain_post = community_repo.create_post(build.id, user.id, "Plain share")
+    assert plain_post.flair is None
+
+    rated_post = community_repo.create_post(build.id, user.id, "[Spec Check] my rig", flair="Rate My Build")
+    assert rated_post.flair == "Rate My Build"
+    assert community_repo.get_post(rated_post.id).flair == "Rate My Build"
+
+
+def test_community_threaded_comments(temp_db):
+    """A reply (parent_comment_id set) is a real, distinct row from a
+    top-level comment, and get_comments still returns a FLAT list ordered
+    oldest-first regardless of threading -- building the reply tree is a
+    ui/ presentation concern (db/CLAUDE.md), not this function's job."""
+    run_seed()
+    user = users_repo.create_user("dave", "hash", "dave@example.com", "Dave Row")
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=user.id, name="Threaded Build", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    post = community_repo.create_post(build.id, user.id, "Threading test")
+
+    top_level = community_repo.add_comment(post.id, user.id, "First comment")
+    assert top_level.parent_comment_id is None
+
+    reply = community_repo.add_comment(post.id, user.id, "A reply", parent_comment_id=top_level.id)
+    assert reply.parent_comment_id == top_level.id
+
+    reply_to_reply = community_repo.add_comment(post.id, user.id, "Nested reply", parent_comment_id=reply.id)
+    assert reply_to_reply.parent_comment_id == reply.id
+
+    comments = community_repo.get_comments(post.id)
+    assert len(comments) == 3
+    assert [c.content for c in comments] == ["First comment", "A reply", "Nested reply"]
+
+
+def test_community_get_feed_sorted_chronologically(temp_db):
+    """get_feed() ranks posts strictly by created_at DESC (newest first) --
+    the upvote/downvote mechanism and any score-based ranking were removed
+    entirely (spec.md §7.6), so this is now the ONLY ordering rule, not one
+    of two modes. created_at is set explicitly (rather than relying on two
+    real-time inserts, which could tie under SQLite's whole-second
+    CURRENT_TIMESTAMP resolution) so the ordering assertion is deterministic."""
+    import datetime as dt
+
+    from sqlalchemy import update
+
+    from db.models import CommunityPost
+
+    run_seed()
+    author = users_repo.create_user("henry", "hash", "henry@example.com", "Henry Row")
+    cpu = components_repo.get_by_category("CPU")[0]
+
+    def _make_post(name: str) -> int:
+        build = builds_repo.create_build(
+            user_id=author.id, name=name, creation_mode="Free",
+            components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+            total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+        )
+        return community_repo.create_post(build.id, author.id, name).id
+
+    first_post_id = _make_post("First Post")
+    second_post_id = _make_post("Second Post")
+
+    with database.session_scope() as session:
+        session.execute(
+            update(CommunityPost).where(CommunityPost.id == first_post_id)
+            .values(created_at=dt.datetime(2020, 1, 1))
+        )
+        session.execute(
+            update(CommunityPost).where(CommunityPost.id == second_post_id)
+            .values(created_at=dt.datetime(2020, 1, 2))
+        )
+
+    feed = community_repo.get_feed()
+    ranked_ids = [p.id for p in feed]
+    assert ranked_ids.index(second_post_id) < ranked_ids.index(first_post_id)
+
+
 # ---------------------------------------------------------------------------
 # drafts_repo
 # ---------------------------------------------------------------------------

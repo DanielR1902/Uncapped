@@ -232,7 +232,9 @@ import streamlit as st
 from auth.session import current_user
 from db.models import COMPONENT_CATEGORIES
 from db.repositories import builds_repo, community_repo, components_repo, drafts_repo
+from engine import solvers
 from engine.compatibility import evaluate_build
+from engine.scoring import live_bottleneck_and_synergy
 from llm.advisory import get_build_advisory
 from llm.concierge import get_concierge_response
 from ui import state
@@ -417,7 +419,21 @@ def _current_build_context() -> dict | None:
     instructed to quote instead — this is what finally lets a bare "what's
     my current total?" question be answered correctly without the model
     ever summing/converting anything itself (see SYSTEM_PROMPT's CURRENT
-    BUILD TOTAL-COST QUESTIONS intent)."""
+    BUILD TOTAL-COST QUESTIONS intent).
+
+    `compatibility_issues`/`bottleneck` (spec.md §6.7 intents 11/12, "Fix
+    Warnings"/"Optimize Bottleneck") are the SAME real, deterministic data
+    `create_build.py`'s own HUD shows — `engine.compatibility.evaluate_build`
+    and, for bottleneck, `build_draft_analysis` (the LLM/heuristic
+    synergy/bottleneck read already computed for a complete build) when
+    present, else the same `engine.scoring.live_bottleneck_and_synergy`
+    estimate the HUD falls back to for an incomplete one — never a second,
+    independently-computed copy of either. `bottleneck["direction"]` is
+    normalized to the SAME `"CPU-bound"|"GPU-bound"|"Balanced"` vocabulary
+    either source uses (`build_draft_analysis`'s own `limiting_component` is
+    `"CPU"|"GPU"|"None"` instead, so `"None"` maps to `"Balanced"` and
+    `"CPU"/"GPU"` gets `"-bound"` appended) so the SYSTEM_PROMPT only ever
+    has to reason about one shape regardless of which source produced it."""
     build_draft = st.session_state.get("build_draft")
     if not build_draft:
         return None
@@ -426,6 +442,20 @@ def _current_build_context() -> dict | None:
         return None
     currency = _active_currency()
     quantities = build_draft.get("quantities", {})
+
+    report = evaluate_build(build_state, quantities)
+
+    analysis = st.session_state.get("build_draft_analysis")
+    if analysis:
+        limiting = analysis["bottleneck"]["limiting_component"]
+        bottleneck = {
+            "percentage": analysis["bottleneck"]["bottleneck_percentage"],
+            "direction": "Balanced" if limiting == "None" else f"{limiting}-bound",
+        }
+    else:
+        live = live_bottleneck_and_synergy(build_state)
+        bottleneck = {"percentage": live[1], "direction": live[2]} if live is not None else None
+
     return {
         "mode": build_draft.get("creation_mode"),
         "budget_ceiling": build_draft.get("budget_ceiling"),
@@ -440,6 +470,8 @@ def _current_build_context() -> dict | None:
         },
         "quantities": quantities,
         "formatted_total": format_currency(state.build_total_cost(build_state, quantities), currency),
+        "compatibility_issues": report.issues,
+        "bottleneck": bottleneck,
     }
 
 
@@ -502,11 +534,27 @@ def _default_saved_build_name() -> str:
 
 def _apply_concierge_action(action: dict | None) -> float | None:
     """Applies a `load_build`/`modify_build`/`navigate`/`save_build`/
-    `publish_build`/`open_community_build` action immediately — no
-    confirmation step for any of them (see this module's docstring for why
-    `save_build`/`publish_build`'s real database writes are still safe to
-    fire immediately here). `open_community_build` performs no database
+    `publish_build`/`open_community_build`/`fix_warnings`/
+    `optimize_bottleneck` action immediately — no confirmation step for any
+    of them (see this module's docstring for why `save_build`/
+    `publish_build`'s real database writes are still safe to fire
+    immediately here). `open_community_build` performs no database
     write at all — it only deep-links to an already-shared post.
+
+    `fix_warnings` (spec.md §6.7 intent 11) and `optimize_bottleneck`
+    (intent 12) both mutate the active `build_draft` exactly like
+    `modify_build` does (same `state.set_component`/`build_draft_analysis`
+    invalidation/`page = "create_build"` shape, same authoritative real-total
+    return), but neither ever lets the LLM choose the replacement part:
+    `fix_warnings` applies `engine.solvers.resolve_compatibility_issues`'s
+    own deterministic, catalog-grounded patch; `optimize_bottleneck` applies
+    `llm.advisory.get_build_advisory`'s own already-zero-hallucination-
+    validated `within_budget.swaps` — this project's own architecture rule
+    that compatibility (and, here, the deterministic engine's compute-
+    balance read) is never LLM-gated (root CLAUDE.md) applies just as much
+    to a Concierge-triggered fix as to a manual one. Both are no-ops
+    (return `None`, no session-state write) when there's no active draft, or
+    (for `optimize_bottleneck`) fewer than 2 components picked yet.
 
     Returns the authoritative real total cost (`ui.state.build_total_cost`)
     of the resulting build when a `load_build`/`modify_build` action
@@ -873,6 +921,75 @@ def _apply_concierge_action(action: dict | None) -> float | None:
             return None
         return state.build_total_cost(final_build_state, build_draft.get("quantities", {}))
 
+    if action_type == "fix_warnings":
+        build_draft = st.session_state.get("build_draft")
+        if not build_draft:
+            return None
+        build_state = state.resolve_build_state(build_draft)
+        if not build_state:
+            return None
+        quantities = build_draft.get("quantities", {})
+        # The only deterministic, catalog-grounded resolver for this — never
+        # an LLM-chosen part (spec.md §6.7 intent 11, engine/CLAUDE.md's own
+        # "compatibility is never LLM-gated" rule). A no-op patch (already
+        # compatible, or nothing in the catalog can resolve it) still falls
+        # through to the same real-total return below, matching every other
+        # no-op guard in this function.
+        patch = solvers.resolve_compatibility_issues(build_state, quantities)
+        for category, component_id in patch.items():
+            component = components_repo.get_by_id(component_id)
+            if component is not None:
+                state.set_component(build_draft, category, component)
+
+        st.session_state["build_draft"] = build_draft
+        st.session_state["page"] = "create_build"
+        st.session_state["build_draft_analysis"] = None
+
+        final_build_state = state.resolve_build_state(build_draft)
+        if not final_build_state:
+            return None
+        return state.build_total_cost(final_build_state, build_draft.get("quantities", {}))
+
+    if action_type == "optimize_bottleneck":
+        build_draft = st.session_state.get("build_draft")
+        if not build_draft:
+            return None
+        build_state = state.resolve_build_state(build_draft)
+        if len(build_state) < 2:
+            return None
+        mode = build_draft.get("creation_mode") or "Free"
+        quantities = build_draft.get("quantities", {})
+        current_budget_or_cost = build_draft.get("budget_ceiling") if mode == "Budget" else None
+        if not current_budget_or_cost:
+            current_budget_or_cost = state.build_total_cost(build_state, quantities)
+
+        # Reuses llm.advisory's OWN already-zero-hallucination-validated
+        # optimization swaps (Free mode's own stated objective is exactly
+        # "bottleneck mitigation and CPU/GPU platform balance",
+        # llm/CLAUDE.md) rather than inventing a second, competing
+        # bottleneck-mitigation algorithm here — the same "one real
+        # implementation, never a second copy" discipline `_current_build_
+        # context`'s own bottleneck reading already follows.
+        advisory = get_build_advisory(
+            build_state, mode, current_budget_or_cost,
+            profile=build_draft.get("workload_profile"),
+            bottleneck_info=(st.session_state.get("build_draft_analysis") or {}).get("bottleneck"),
+            quantities=quantities,
+        )
+        for swap in advisory["within_budget"]["swaps"]:
+            component = components_repo.get_by_id(swap["replace_with_id"])
+            if component is not None:
+                state.set_component(build_draft, swap["category"], component)
+
+        st.session_state["build_draft"] = build_draft
+        st.session_state["page"] = "create_build"
+        st.session_state["build_draft_analysis"] = None
+
+        final_build_state = state.resolve_build_state(build_draft)
+        if not final_build_state:
+            return None
+        return state.build_total_cost(final_build_state, build_draft.get("quantities", {}))
+
     return None
 
 
@@ -995,6 +1112,30 @@ def render_concierge_widget() -> None:
             reply_content = result["reply"]
             if real_total is not None:
                 reply_content = f"{reply_content}\n\n**Total: {format_currency(real_total, target_currency)}**"
+            # AUTHORITATIVE FIX-STATUS LINE (spec.md §6.7 intents 11/12): the
+            # model's own `reply` never claims a specific swap happened
+            # (SYSTEM_PROMPT says so explicitly, since it doesn't know which
+            # part the deterministic resolver picked) — this appends the
+            # REAL, freshly-recomputed post-fix state, the same
+            # "never trust what the model typed, restate the Python-computed
+            # truth" discipline the Total line above already follows.
+            applied_action_type = (result.get("action") or {}).get("type")
+            if applied_action_type in ("fix_warnings", "optimize_bottleneck"):
+                build_draft = st.session_state.get("build_draft")
+                build_state = state.resolve_build_state(build_draft) if build_draft else {}
+                if applied_action_type == "fix_warnings":
+                    remaining = evaluate_build(build_state, (build_draft or {}).get("quantities", {})).issues
+                    status = (
+                        "0 compatibility warnings remaining."
+                        if not remaining
+                        else f"{len(remaining)} warning(s) still remaining: {remaining[0]}"
+                    )
+                else:
+                    live = live_bottleneck_and_synergy(build_state) if len(build_state) >= 2 else None
+                    status = (
+                        f"Bottleneck now {live[1]:.0f}% ({live[2]})." if live is not None else "Bottleneck unavailable."
+                    )
+                reply_content = f"{reply_content}\n\n**{status}**"
             st.session_state["concierge_messages"].append(
                 {"role": "assistant", "content": sanitize_markdown(reply_content)}
             )

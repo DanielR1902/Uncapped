@@ -2047,6 +2047,56 @@ def test_save_build_studio_source_is_still_the_default(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# fix_warnings / optimize_bottleneck (spec.md §6.7 intents 11/12) — both are
+# pure pass-throughs like navigate/publish_build: no LLM-asserted catalog id
+# or category to zero-hallucination-check, since the actual fix/rebalancing
+# is resolved entirely by the caller (ui/components/chat_assistant.py) via
+# engine.solvers.resolve_compatibility_issues / llm.advisory.get_build_
+# advisory, never a part choice this module's own response carries.
+# ---------------------------------------------------------------------------
+def test_fix_warnings_action_passes_through(monkeypatch):
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Resolving the compatibility issues now.",
+        "action": {"type": "fix_warnings"},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    build_context = dict(CURRENT_BUILD_CONTEXT)
+    build_context["compatibility_issues"] = ["Cooler too tall: 159mm vs. case clearance of 150mm."]
+    build_context["bottleneck"] = {"percentage": 8.0, "direction": "Balanced"}
+
+    result = concierge.get_concierge_response(
+        "fix the warnings in my build", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY,
+        current_build_context=build_context,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {"type": "fix_warnings", "explanation": ""}
+
+
+def test_optimize_bottleneck_action_passes_through(monkeypatch):
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Rebalancing your CPU/GPU pairing now.",
+        "action": {"type": "optimize_bottleneck"},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    build_context = dict(CURRENT_BUILD_CONTEXT)
+    build_context["compatibility_issues"] = []
+    build_context["bottleneck"] = {"percentage": 22.0, "direction": "GPU-bound"}
+
+    result = concierge.get_concierge_response(
+        "optimize the bottleneck", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY,
+        current_build_context=build_context,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {"type": "optimize_bottleneck", "explanation": ""}
+
+
+# ---------------------------------------------------------------------------
 # Unexpected failures: full traceback logged, never crashes
 # ---------------------------------------------------------------------------
 def test_unexpected_exception_falls_back_and_logs_traceback(monkeypatch, capsys):

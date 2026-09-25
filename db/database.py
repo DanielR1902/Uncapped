@@ -96,10 +96,53 @@ def _ensure_builds_workload_tier_column() -> None:
             conn.commit()
 
 
+def _ensure_community_comments_parent_comment_id_column() -> None:
+    """Same additive-only, idempotent shape as `_ensure_builds_workload_tier_column`
+    above (see that function's docstring and db/CLAUDE.md for the established
+    pattern this follows exactly): `CommunityComment.parent_comment_id` (spec.md
+    §3.7/§7.6, threaded replies) was added after this project's `community_comments`
+    table already existed in some environments."""
+    engine = get_engine()
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.connect() as conn:
+        table_exists = conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='community_comments'"
+        ).fetchone()
+        if table_exists is None:
+            return
+        existing_columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(community_comments)")}
+        if "parent_comment_id" not in existing_columns:
+            conn.exec_driver_sql("ALTER TABLE community_comments ADD COLUMN parent_comment_id INTEGER")
+            conn.commit()
+
+
+def _ensure_community_posts_flair_column() -> None:
+    """Same additive-only, idempotent shape as `_ensure_builds_workload_tier_column`
+    above: `CommunityPost.flair` (spec.md §3.7/§7.6.1, the "Rate My Build" post
+    type) was added after this project's `community_posts` table already
+    existed in some environments."""
+    engine = get_engine()
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.connect() as conn:
+        table_exists = conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='community_posts'"
+        ).fetchone()
+        if table_exists is None:
+            return
+        existing_columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(community_posts)")}
+        if "flair" not in existing_columns:
+            conn.exec_driver_sql("ALTER TABLE community_posts ADD COLUMN flair TEXT")
+            conn.commit()
+
+
 def init_db() -> None:
     """Create all tables that don't already exist."""
     Base.metadata.create_all(get_engine())
     _ensure_builds_workload_tier_column()
+    _ensure_community_comments_parent_comment_id_column()
+    _ensure_community_posts_flair_column()
 
 
 def reset_db() -> None:

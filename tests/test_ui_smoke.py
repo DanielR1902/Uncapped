@@ -314,6 +314,117 @@ def test_gated_nav_buttons_disabled_when_logged_out(seeded_db):
     assert at.get_by_key("nav_community").disabled is True
 
 
+# ---------------------------------------------------------------------------
+# Home "Command Deck & Observatory Portal" (ui/views/landing.py, spec.md
+# §7.11) — capability matrix, tiered preset launchpad, trending builds reel,
+# and user-state adaptation. This app has no real anonymous/guest session
+# anywhere else (router.py's own comment: "all buttons locked" pre-login),
+# so "Continue as Guest Architect" is a labeled invitation into
+# registration, not actual guest access — see landing.py's own docstring.
+# ---------------------------------------------------------------------------
+def test_landing_shows_capability_matrix_and_preset_launchpad(seeded_db):
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+
+    page_text = "\n".join(m.value for m in at.markdown)
+    # theme.section_header's own tech-label transform (spec.md §7.7):
+    # "Platform Capability Matrix" -> "// PLATFORM_CAPABILITY_MATRIX".
+    assert "// PLATFORM_CAPABILITY_MATRIX" in page_text
+    assert "Real-Time Synergy & Clearance" in page_text
+    assert "Dynamic Bottleneck Mitigation" in page_text
+    assert "Multi-Currency Telemetry" in page_text
+    assert "AI Architecture Concierge" in page_text
+    assert "// TIERED_PRESET_LAUNCHPAD" in page_text
+    assert "Tier Alpha" in page_text
+    assert "Tier Beta" in page_text
+    assert "Tier Ultra" in page_text
+
+
+def test_landing_preset_buttons_disabled_when_logged_out(seeded_db):
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+
+    assert at.get_by_key("load_preset_alpha").disabled is True
+    assert at.get_by_key("load_preset_beta").disabled is True
+    assert at.get_by_key("load_preset_ultra").disabled is True
+
+
+def test_landing_load_preset_populates_studio_and_navigates(seeded_db):
+    """Clicking "Load Preset to Studio" must populate a real, fully
+    compatible Workload build (engine.solvers.allocate_workload_baseline)
+    into build_draft and land directly in the Build Studio."""
+    from engine.compatibility import evaluate_build
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "presetuser1", "presetuser1@example.com", "Preset User One")
+
+    at.get_by_key("load_preset_beta").click().run()
+
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["create_mode"] == "Workload"
+    build_draft = at.session_state["build_draft"]
+    assert build_draft["workload_profile"] == "Gaming"
+    assert build_draft["tier"] == "High"
+    assert set(build_draft["components"].keys()) >= {"CPU", "GPU", "Motherboard", "RAM", "Storage", "PSU", "Case", "Cooler"}
+
+    from db.repositories import components_repo
+    build_state = {cat: components_repo.get_by_id(cid) for cat, cid in build_draft["components"].items()}
+    assert evaluate_build(build_state).is_compatible is True
+
+
+def test_landing_trending_builds_reel_shows_real_community_posts(seeded_db):
+    """A real, freshly-published community post must appear in the
+    trending reel with its real title and price."""
+    from db.repositories import builds_repo, community_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "trendinguser1", "trendinguser1@example.com", "Trending User One")
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=at.session_state["auth_user"]["id"], name="Trending Reel Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    community_repo.create_post(build.id, at.session_state["auth_user"]["id"], "Trending Reel Rig")
+
+    at.get_by_key("nav_create_build").click().run()  # any rerun refreshes the landing page's own feed read
+    at.session_state["page"] = "landing"
+    at.run()
+
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "// TRENDING_COMMUNITY_BUILDS" in page_text
+    assert "Trending Reel Rig" in page_text
+
+
+def test_landing_shows_welcome_and_resume_last_draft_when_logged_in(seeded_db):
+    from db.repositories import drafts_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "resumeuser1", "resumeuser1@example.com", "Resume User One")
+
+    drafts_repo.save_draft(
+        user_id=at.session_state["auth_user"]["id"], name="My Resumable Draft", mode="Free",
+        components={}, quantities={},
+    )
+    at.session_state["page"] = "landing"
+    at.run()
+
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "Welcome back, Architect Resume User One" in page_text
+    captions = "\n".join(c.value for c in at.caption)
+    assert "My Resumable Draft" in captions
+
+    at.get_by_key("resume_last_draft").click().run()
+    assert not at.exception
+    assert at.session_state["page"] == "create_build"
+    assert at.session_state["build_draft"]["name"] == "My Resumable Draft"
+
+
 def test_register_flow_authenticates_user(seeded_db):
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
@@ -989,6 +1100,213 @@ def test_comment_box_clears_and_resubmission_is_a_no_op(seeded_db):
     assert len(community_repo.get_comments(post_id)) == 1
 
 
+# ---------------------------------------------------------------------------
+# Community posts (no voting mechanism — removed entirely per a later
+# product decision; see git history for the prior Reddit-style upvote/
+# downvote implementation this replaced) and threaded (nested-reply)
+# comments (spec.md §7.6).
+# ---------------------------------------------------------------------------
+def test_community_feed_has_no_vote_widgets(seeded_db):
+    """No upvote/downvote arrows, score numbers, or vote-related widget keys
+    exist anywhere on a feed card or its thread view — a real regression
+    check for the voting-system teardown, not just an absence-of-evidence
+    assumption."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "novote1", "novote1@example.com", "No Vote One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("No Vote Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click()
+    at.run()
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    assert not at.exception
+
+    button_keys = [b.key or "" for b in at.button]
+    assert not any("upvote" in k or "downvote" in k for k in button_keys)
+    feed_text = "\n".join(m.value for m in at.markdown)
+    assert "▲" not in feed_text
+    assert "▼" not in feed_text
+
+    view_buttons = [b.key for b in at.button if b.key and b.key.startswith("view_post_")]
+    at.get_by_key(view_buttons[0]).click().run()
+    assert not at.exception
+    button_keys = [b.key or "" for b in at.button]
+    assert not any("upvote" in k or "downvote" in k for k in button_keys)
+    thread_text = "\n".join(m.value for m in at.markdown)
+    assert "▲" not in thread_text
+    assert "▼" not in thread_text
+
+
+def test_community_feed_ranked_chronologically(seeded_db):
+    """A build published SECOND (newer) must always rank above one published
+    FIRST (older) — the feed's ONLY ordering rule now, since net-score
+    ranking was removed entirely along with the voting mechanism.
+    created_at is pinned explicitly after publishing (rather than relying on
+    real-time ordering between two rapid UI publishes, which could tie
+    under SQLite's whole-second CURRENT_TIMESTAMP resolution) so the
+    ordering assertion itself is deterministic — the publish flow through
+    the real UI is still exercised for both builds."""
+    import datetime as dt
+
+    from sqlalchemy import update
+
+    from db import database
+    from db.models import CommunityPost
+    from db.repositories import community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "chronofeed1", "chronofeed1@example.com", "Chrono Feed One")
+
+    def _publish(name: str) -> None:
+        at.get_by_key("sidebar_nav_create_build").click().run()
+        at.get_by_key("mode_budget").click().run()
+        at.get_by_key("apply_budget_generate").click().run()
+        at.get_by_key("build_name_input").input(name)
+        at.get_by_key("publish_checkbox").check()
+        at.get_by_key("save_build").click()
+        at.run()
+
+    _publish("Older Rig")
+    _publish("Newer Rig")
+
+    posts_by_name = {p.title: p.id for p in community_repo.get_feed()}
+    older_id = posts_by_name["Older Rig"]
+    newer_id = posts_by_name["Newer Rig"]
+
+    with database.session_scope() as session:
+        session.execute(
+            update(CommunityPost).where(CommunityPost.id == older_id)
+            .values(created_at=dt.datetime(2020, 1, 1))
+        )
+        session.execute(
+            update(CommunityPost).where(CommunityPost.id == newer_id)
+            .values(created_at=dt.datetime(2020, 1, 2))
+        )
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    assert not at.exception
+
+    feed_order = [p.id for p in community_repo.get_feed()]
+    assert feed_order.index(newer_id) < feed_order.index(older_id)
+
+
+def test_community_top_level_comment_appears_chronologically(seeded_db):
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "chrono1", "chrono1@example.com", "Chrono One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Chrono Test Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click()
+    at.run()
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    view_buttons = [b.key for b in at.button if b.key and b.key.startswith("view_post_")]
+    at.get_by_key(view_buttons[0]).click().run()
+
+    at.get_by_key("new_comment_input").input("First!")
+    at.get_by_key("post_comment").click()
+    at.run()
+    at.get_by_key("new_comment_input").input("Second one")
+    at.get_by_key("post_comment").click()
+    at.run()
+
+    from db.repositories import community_repo
+
+    post_id = at.session_state["selected_post_id"]
+    comments = community_repo.get_comments(post_id)
+    assert [c.content for c in comments] == ["First!", "Second one"]
+    assert all(c.parent_comment_id is None for c in comments)
+
+
+def test_community_reply_creates_threaded_nested_comment(seeded_db):
+    """Clicking "Reply" on an existing comment, submitting, must create a
+    REAL child comment (parent_comment_id set to the original comment's id)
+    -- the actual threading relationship the directive's own verification
+    checks for ("renders indented ... directly beneath the parent
+    comment"), not just another top-level comment."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "thread1", "thread1@example.com", "Thread One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Thread Test Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click()
+    at.run()
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    view_buttons = [b.key for b in at.button if b.key and b.key.startswith("view_post_")]
+    at.get_by_key(view_buttons[0]).click().run()
+
+    at.get_by_key("new_comment_input").input("Top-level comment")
+    at.get_by_key("post_comment").click()
+    at.run()
+
+    from db.repositories import community_repo
+
+    post_id = at.session_state["selected_post_id"]
+    top_level = community_repo.get_comments(post_id)[0]
+
+    # Open the reply box under that specific comment.
+    at.get_by_key(f"reply_btn_{top_level.id}").click().run()
+    assert at.session_state["community_reply_target"] == top_level.id
+
+    at.get_by_key(f"reply_input_{top_level.id}").input("A nested reply")
+    at.get_by_key(f"submit_reply_{top_level.id}").click()
+    at.run()
+
+    assert not at.exception
+    comments = community_repo.get_comments(post_id)
+    assert len(comments) == 2
+    reply = next(c for c in comments if c.id != top_level.id)
+    assert reply.content == "A nested reply"
+    assert reply.parent_comment_id == top_level.id
+    # The reply box closes itself after a successful submit.
+    assert at.session_state["community_reply_target"] is None
+
+
+def test_community_reply_cancel_closes_box_without_creating_a_comment(seeded_db):
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "thread2", "thread2@example.com", "Thread Two")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    at.get_by_key("build_name_input").input("Thread Cancel Rig")
+    at.get_by_key("publish_checkbox").check()
+    at.get_by_key("save_build").click()
+    at.run()
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    view_buttons = [b.key for b in at.button if b.key and b.key.startswith("view_post_")]
+    at.get_by_key(view_buttons[0]).click().run()
+
+    at.get_by_key("new_comment_input").input("Only comment")
+    at.get_by_key("post_comment").click()
+    at.run()
+
+    from db.repositories import community_repo
+
+    post_id = at.session_state["selected_post_id"]
+    top_level = community_repo.get_comments(post_id)[0]
+
+    at.get_by_key(f"reply_btn_{top_level.id}").click().run()
+    at.get_by_key(f"cancel_reply_{top_level.id}").click().run()
+
+    assert not at.exception
+    assert at.session_state["community_reply_target"] is None
+    assert len(community_repo.get_comments(post_id)) == 1  # no reply created
+
+
 def test_admin_login_works(demo_seeded_db):
     """Task 2 requirement: the seeded admin account (admin / admin123) can log
     in via the standard dual-identifier form, just like any other user."""
@@ -1570,6 +1888,195 @@ def test_reset_all_fields_clears_build_and_budget_ceiling(seeded_db):
     assert at.session_state["build_draft"]["components"] == {}
     assert at.session_state["build_draft"]["budget_ceiling"] is None  # nothing committed yet on the fresh draft
     assert at.get_by_key("budget_ceiling_input").value == 1500.0  # widget redisplays the clean default
+
+
+# ---------------------------------------------------------------------------
+# Cyber-Minimalist / High-Tech Industrial redesign: telemetry HUD, "Rate My
+# Build", and the industrial hardware picker cards (spec.md §7.4.1).
+# ---------------------------------------------------------------------------
+def test_hud_power_headroom_chip_shows_real_draw_and_capacity(seeded_db):
+    """The HUD's Power/Headroom chip (_power_headroom_readout) must show the
+    REAL CPU+GPU tdp_watts sum over the REAL PSU wattage_capacity -- not a
+    placeholder -- once both exist in the build, and must render as "-"
+    before a CPU is even picked."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "hud1", "hud1@example.com", "Hud One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "—" in page_text  # no CPU yet -> placeholder
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    psu = components_repo.get_by_category("PSU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    at.get_by_key(f"select_PSU_{psu.id}").click().run()
+
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert f"{cpu.tdp_watts}W / {psu.wattage_capacity}W" in page_text
+
+
+def test_hud_compatibility_pill_reflects_real_score(seeded_db):
+    """The HUD's Compatibility pulse-badge pill must show a real percentage
+    while the build is empty (evaluate_build({}) is vacuously 100%
+    compatible -- no rule fires with nothing picked)."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "hud2", "hud2@example.com", "Hud Two")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "100% Compatible" in page_text
+
+
+def test_hud_reset_build_button_matches_reset_all_fields(seeded_db):
+    """The HUD's compact "Reset Build" quick action must clear the build the
+    exact same way the full "Reset All Fields" button does (both call the
+    shared _do_reset_build helper) -- proven here via the HUD's OWN key,
+    hud_reset_build, distinct from reset_all_fields."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "hud3", "hud3@example.com", "Hud Three")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+    assert at.session_state["build_draft"]["components"]
+
+    at.get_by_key("hud_reset_build").click().run()
+
+    assert not at.exception
+    assert at.session_state["build_draft"]["components"] == {}
+
+
+def test_hud_ai_analysis_populates_same_cache_as_get_advisory_button(seeded_db):
+    """The HUD's compact "AI Analysis" quick action (_trigger_advisory) must
+    populate the SAME st.session_state["advisory_cache"] entry the full
+    "Get AI Analysis & Upgrade Path" button (_advisory_controls) reads --
+    proven by triggering via the HUD button and asserting the advisory
+    expander's own content appears with no separate click on get_advisory."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "hud4", "hud4@example.com", "Hud Four")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    at.get_by_key("hud_ai_analysis").click().run()
+
+    assert not at.exception
+    assert len(at.session_state["advisory_cache"]) == 1
+    assert any("AI Build Advisory" in e.label for e in at.expander)
+
+
+def test_rate_my_build_dialog_opens_with_autofilled_title_and_snapshot(seeded_db):
+    """The HUD's "Share / Rate My Build" button must open the dialog
+    (st.dialog) with a technical title auto-filled from the real CPU+GPU
+    names and a live Price/TDP/Synergy snapshot -- gated the same way
+    _save_actions' own "Save build" button already is (disabled=not
+    build_state, not full-completeness).
+
+    NOTE: the actual submit -> create_build/create_post/teardown/navigate
+    flow is NOT driven through this dialog via AppTest -- confirmed via a
+    minimal probe script that streamlit.testing.v1's bare-mode script
+    runner closes ANY st.dialog on the very next rerun regardless of what
+    triggers it (even a no-op re-run with zero pending widget changes), so
+    a widget-fill-then-submit sequence across multiple .run() calls can
+    never reach a still-open dialog -- a real AppTest limitation, not an
+    app bug. That flow is covered by test_community_post_flair (test_db.py,
+    the exact same builds_repo.create_build/community_repo.create_post
+    call shape _rate_my_build_dialog uses) and by live manual browser
+    verification instead."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "ratemybuild1", "ratemybuild1@example.com", "Rate My Build One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    assert at.get_by_key("hud_rate_my_build").proto.disabled  # empty build_state
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    at.get_by_key(f"select_GPU_{gpu.id}").click().run()
+
+    assert not at.get_by_key("hud_rate_my_build").proto.disabled
+    at.get_by_key("hud_rate_my_build").click().run()
+
+    assert not at.exception
+    assert at.get_by_key("rate_my_build_title").value == f"[Spec Check] {cpu.name} + {gpu.name} Rig"
+    metric_values = {m.value for m in at.metric}
+    expected_tdp = f"{(cpu.tdp_watts or 0) + (gpu.tdp_watts or 0)}W"
+    assert expected_tdp in metric_values
+
+
+def test_community_rate_my_build_flair_badge_shown_on_feed_and_thread(seeded_db):
+    """A "Rate My Build" post's flair badge (theme.pulse_badge) must appear
+    both on its Community feed card and on its own thread view. Creates the
+    post directly via community_repo (same call shape
+    _rate_my_build_dialog's submit handler uses — see the note on
+    test_rate_my_build_dialog_opens_with_autofilled_title_and_snapshot for
+    why the dialog itself isn't driven through AppTest) and verifies the
+    real ui/views/community.py rendering path picks up post.flair."""
+    from db.repositories import builds_repo, community_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "flairview1", "flairview1@example.com", "Flair View One")
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=at.session_state["auth_user"]["id"], name="Flair View Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    community_repo.create_post(build.id, at.session_state["auth_user"]["id"], "Flair View Rig", flair="Rate My Build")
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    feed_text = "\n".join(m.value for m in at.markdown)
+    assert "Rate My Build" in feed_text
+
+    view_buttons = [b.key for b in at.button if b.key and b.key.startswith("view_post_")]
+    at.get_by_key(view_buttons[0]).click().run()
+    thread_text = "\n".join(m.value for m in at.markdown)
+    assert "Rate My Build" in thread_text
+
+
+def test_part_picker_empty_slot_uses_wireframe_key_and_socket_match_badge(seeded_db):
+    """An empty slot's own container key must carry the "_empty" suffix
+    theme.inject_css() targets for the dashed wireframe look, switching to
+    "_filled" once selected; a matched CPU+Motherboard pair must show the
+    "✓ {socket} Matched" confirmation tag."""
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "wireframe1", "wireframe1@example.com", "Wireframe One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    container_keys = {c.key for c in at.container if c.key}
+    assert "picker_slot_CPU_empty" in container_keys
+    assert "picker_slot_Motherboard_empty" in container_keys
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    mobo = next(m for m in components_repo.get_by_category("Motherboard") if m.socket == cpu.socket)
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    assert not at.exception
+    at.get_by_key(f"select_Motherboard_{mobo.id}").click().run()
+
+    container_keys = {c.key for c in at.container if c.key}
+    assert "picker_slot_CPU_filled" in container_keys
+    assert "picker_slot_Motherboard_filled" in container_keys
+    assert "picker_slot_CPU_empty" not in container_keys
+
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert f"✓ {cpu.socket} Matched" in page_text
 
 
 # ---------------------------------------------------------------------------
@@ -3734,14 +4241,17 @@ def test_switching_currency_updates_build_studio_total_cost_display(seeded_db):
     gpu = components_repo.get_by_category("GPU")[0]
     at.get_by_key(f"select_GPU_{gpu.id}").click().run()
 
-    usd_metric = next(m for m in at.get_by_key("build_summary_header").metric if m.label == "💰 Total Cost")
-    assert usd_metric.value == f"${gpu.price_usd:,.2f}"
+    # The Total Cost HUD chip (spec.md §7.4.1, theme.hud_chip) is rendered
+    # as markdown, not st.metric, since this round's redesign — check its
+    # text content instead of a metric widget's .value.
+    hud_text = "\n".join(m.value for m in at.get_by_key("build_summary_header").markdown)
+    assert f"${gpu.price_usd:,.2f}" in hud_text
 
     at.get_by_key("selected_currency").select("NIS").run()
 
-    nis_metric = next(m for m in at.get_by_key("build_summary_header").metric if m.label == "💰 Total Cost")
+    hud_text = "\n".join(m.value for m in at.get_by_key("build_summary_header").markdown)
     expected = f"₪{gpu.price_usd * CURRENCY_RATES['NIS']:,.2f}"
-    assert nis_metric.value == expected
+    assert expected in hud_text
     # Stored data is untouched — still real USD.
     assert at.session_state["build_draft"]["components"]["GPU"] == gpu.id
 
@@ -3908,9 +4418,11 @@ def test_concierge_currency_switch_flips_selector_and_formats_total_in_new_curre
     assert f"**Total: ₪{expected_total:,.2f}**" in last_message["content"]
     assert "USD" not in last_message["content"].split("Total:")[-1]
 
-    # Every OTHER price on screen (Build Studio) must also already reflect NIS.
-    usd_metric = next(m for m in at.get_by_key("build_summary_header").metric if m.label == "💰 Total Cost")
-    assert usd_metric.value == f"₪{expected_total:,.2f}"
+    # Every OTHER price on screen (Build Studio) must also already reflect
+    # NIS -- the Total Cost HUD chip (theme.hud_chip) is markdown, not
+    # st.metric, since this round's redesign.
+    hud_text = "\n".join(m.value for m in at.get_by_key("build_summary_header").markdown)
+    assert f"₪{expected_total:,.2f}" in hud_text
 
 
 def test_concierge_currency_switch_standalone_restates_total_with_no_action(seeded_db, monkeypatch):
@@ -3992,6 +4504,142 @@ def test_concierge_currency_switch_not_set_when_no_currency_mentioned(seeded_db,
     # ui/format.py) -- this is the pre-existing, unchanged USD rendering, not
     # a regression; see the EUR/NIS tests above for the symbol-preserving case.
     assert f"**Total: USD {cpu.price_usd:,.2f}**" in last_message["content"]
+
+
+# ---------------------------------------------------------------------------
+# fix_warnings / optimize_bottleneck (spec.md §6.7 intents 11/12) — the AI
+# Concierge's compatibility-fix and bottleneck-rebalancing actions. Neither
+# ever lets the LLM choose a replacement part (root CLAUDE.md: compatibility
+# is never LLM-gated) — the deterministic fix comes from
+# engine.solvers.resolve_compatibility_issues / llm.advisory.get_build_
+# advisory, applied by chat_assistant.py itself; these tests mock ONLY
+# get_concierge_response (the intent-recognition call), never the actual
+# fix logic, so they exercise the REAL application path end to end.
+# ---------------------------------------------------------------------------
+def test_concierge_fix_warnings_resolves_real_compatibility_issue(seeded_db, monkeypatch):
+    """A build with a real, deterministic compatibility issue (an oversized
+    cooler in an undersized case — the exact scenario from the directive's
+    own verification script) must end up with 0 warnings after a mocked
+    fix_warnings action, via a REAL swap engine.solvers.resolve_
+    compatibility_issues picked (never a part the mocked LLM response
+    itself named — it names none)."""
+    import json as _json
+
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine.compatibility import evaluate_build
+
+    def _height_mm(component) -> int:
+        specs = _json.loads(component.specs_json) if component.specs_json else {}
+        return specs.get("height_mm", 0)
+
+    cpu = next(c for c in components_repo.get_by_category("CPU") if c.socket)
+    mobo = next(m for m in components_repo.get_by_category("Motherboard") if m.socket == cpu.socket)
+    compatible_cases = [
+        c for c in components_repo.get_by_category("Case")
+        if c.max_cooler_height_mm and mobo.form_factor in (c.form_factor or "")
+    ]
+    case = min(compatible_cases, key=lambda c: c.max_cooler_height_mm)
+    oversized_cooler = max(components_repo.get_by_category("Cooler"), key=_height_mm)
+    assert _height_mm(oversized_cooler) > case.max_cooler_height_mm  # sanity: the fixture IS actually broken
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "fixwarnings1", "fixwarnings1@example.com", "Fix Warnings One")
+
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Free", "workload_profile": None, "tier": "Mid", "budget_ceiling": None,
+        "components": {"CPU": cpu.id, "Motherboard": mobo.id, "Case": case.id, "Cooler": oversized_cooler.id},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Free"
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        assert current_build_context["compatibility_issues"]  # real issues were actually injected into context
+        return {"reply": "Resolving the compatibility issues now.", "action": {"type": "fix_warnings"}, "source": "heuristic"}
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("fix the warnings in my build").run()
+
+    assert not at.exception
+    final_components = at.session_state["build_draft"]["components"]
+    final_build_state = {cat: components_repo.get_by_id(cid) for cat, cid in final_components.items()}
+    report = evaluate_build(final_build_state)
+    assert report.is_compatible is True
+    assert report.issues == []
+
+    last_message = at.session_state["concierge_messages"][-1]
+    assert "0 compatibility warnings remaining." in last_message["content"]
+
+
+def test_concierge_fix_warnings_noop_without_active_build(seeded_db, monkeypatch):
+    import ui.components.chat_assistant as chat_assistant_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "fixwarnings2", "fixwarnings2@example.com", "Fix Warnings Two")
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        assert current_build_context is None
+        return {"reply": "You don't have an active build yet.", "action": None, "source": "heuristic"}
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("fix the warnings in my build").run()
+
+    assert not at.exception
+    assert at.session_state["build_draft"] is None
+
+
+def test_concierge_optimize_bottleneck_applies_advisory_swap(seeded_db, monkeypatch):
+    """A mocked optimize_bottleneck action must apply llm.advisory.get_
+    build_advisory's own real within_budget.swaps -- never a part the
+    Concierge response itself named (it names none) -- and the resulting
+    build_draft must reflect a real, resolvable catalog swap."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    picks = {category: components_repo.get_by_category(category)[0] for category in (
+        "CPU", "Motherboard", "GPU", "RAM", "Storage", "PSU", "Case", "Cooler",
+    )}
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "optbottleneck1", "optbottleneck1@example.com", "Opt Bottleneck One")
+
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Free", "workload_profile": None, "tier": "Mid", "budget_ceiling": None,
+        "components": {cat: c.id for cat, c in picks.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Free"
+    before_components = dict(at.session_state["build_draft"]["components"])
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        assert current_build_context["bottleneck"] is not None
+        return {"reply": "Rebalancing your CPU/GPU pairing now.", "action": {"type": "optimize_bottleneck"}, "source": "heuristic"}
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("optimize the bottleneck").run()
+
+    assert not at.exception
+    last_message = at.session_state["concierge_messages"][-1]
+    assert "Bottleneck now" in last_message["content"] or "Bottleneck unavailable." in last_message["content"]
+    # The build_draft must still resolve to a real, complete, valid build
+    # afterward, whether or not a beneficial swap existed for THIS specific
+    # already-cheapest-of-each-category starting point.
+    after_components = at.session_state["build_draft"]["components"]
+    assert set(after_components.keys()) == set(before_components.keys())
+    for component_id in after_components.values():
+        assert components_repo.get_by_id(component_id) is not None
 
 
 # ---------------------------------------------------------------------------

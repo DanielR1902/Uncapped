@@ -13,7 +13,18 @@ from __future__ import annotations
 
 from db.models import Component
 from db.repositories import components_repo
-from engine.compatibility import BuildState, evaluate_build
+from engine.compatibility import (
+    BuildState,
+    check_case_motherboard_form_factor,
+    check_case_psu_form_factor,
+    check_cooler_case_clearance,
+    check_cooler_socket_support,
+    check_cpu_motherboard_socket,
+    check_gpu_case_clearance,
+    check_psu_headroom,
+    check_ram_motherboard_type,
+    evaluate_build,
+)
 
 # GPU/CPU dominate both cost and performance, so they're locked in first —
 # every other category then negotiates around whatever budget is left.
@@ -62,6 +73,122 @@ def get_all_compatible_candidates(build_state: BuildState) -> dict[str, list[Com
     """Same as get_compatible_candidates, for every core category at once —
     convenient for rendering all part-pickers together."""
     return {category: get_compatible_candidates(category, build_state) for category in CATEGORY_ORDER}
+
+
+# For each failing compatibility rule, which category to try swapping first
+# to resolve it (spec.md §6.7 intent 11, "Fix Warnings") — the cheaper/more
+# targeted part first (e.g. Cooler before Case for a clearance issue,
+# matching the directive's own example: "cooler <= 150mm" is the natural
+# fix, not "buy a bigger case"). RAM/Storage capacity issues are deliberately
+# NOT included here — those are a QUANTITY problem, not a wrong-component
+# problem, and silently shrinking a user's requested quantity is a worse
+# surprise than leaving the warning for them to act on directly (the
+# existing modify_build "quantities" patch already covers that, by choice).
+_ISSUE_FIX_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "cpu_motherboard_socket": ("Motherboard", "CPU"),
+    "ram_motherboard_type": ("RAM", "Motherboard"),
+    "cooler_socket_support": ("Cooler",),
+    "case_motherboard_form_factor": ("Case",),
+    "case_psu_form_factor": ("PSU", "Case"),
+    "gpu_case_clearance": ("Case", "GPU"),
+    "cooler_case_clearance": ("Cooler", "Case"),
+    "psu_headroom": ("PSU",),
+}
+
+# The single-rule check function for each entry above — re-run on a
+# hypothetical swap to confirm THAT SPECIFIC rule now passes, rather than
+# requiring the WHOLE build to already be compatible (get_compatible_
+# candidates' own filter is too strict here: with two independent issues
+# present at once, e.g. a bad cooler AND an under-provisioned PSU, no cooler
+# candidate could ever make the WHOLE build compatible until the PSU issue
+# is also fixed — checking one rule at a time lets each issue be resolved
+# independently and progressively).
+_RULE_CHECKS = {
+    "cpu_motherboard_socket": check_cpu_motherboard_socket,
+    "ram_motherboard_type": check_ram_motherboard_type,
+    "cooler_socket_support": check_cooler_socket_support,
+    "case_motherboard_form_factor": check_case_motherboard_form_factor,
+    "case_psu_form_factor": check_case_psu_form_factor,
+    "gpu_case_clearance": check_gpu_case_clearance,
+    "cooler_case_clearance": check_cooler_case_clearance,
+    "psu_headroom": check_psu_headroom,
+}
+
+
+def resolve_compatibility_issues(build_state: BuildState, quantities: dict[str, int] | None = None) -> dict[str, int]:
+    """Best-effort deterministic fix for a build's CURRENT compatibility
+    issues (spec.md §6.7 intent 11, the AI Concierge's "Fix Warnings"/
+    "Resolve Compatibility" action) — never LLM-driven part selection, per
+    this project's own architecture rule that compatibility is never
+    LLM-gated (root CLAUDE.md): the Concierge only recognizes the INTENT,
+    this function does the actual, deterministic, catalog-grounded fix.
+
+    For each currently-failing rule, tries real catalog candidates (cheapest
+    first) for that rule's own priority-ordered categories (`_ISSUE_FIX_
+    CATEGORIES`). A candidate must (a) make THIS SPECIFIC rule's own check
+    function (`_RULE_CHECKS`) pass, AND (b) introduce no NEW failure among
+    rules that were passing BEFORE this function ran — checked via a full
+    `evaluate_build` on the hypothetical swap and comparing its failing-rule
+    set against the ORIGINAL one. (b) is not redundant with (a): confirmed
+    via manual testing that checking only the targeted rule lets a "fix" pick
+    a cooler that resolves a height-clearance issue but happens to not
+    support the CPU's socket — a real instance of exactly the "discard any
+    candidate that introduces a warning" failure mode this function exists
+    to prevent, caught before this function was ever wired into the
+    Concierge. A rule that was ALREADY failing before this swap is allowed
+    to remain failing for now — it gets its own turn later in this same
+    loop, addressed independently.
+
+    Stops at the first real candidate that resolves a given rule, then moves
+    to the next failing rule using the ALREADY-patched build state, so
+    multiple simultaneous issues (e.g. a bad cooler AND an under-provisioned
+    PSU) are each addressed independently rather than one swap accidentally
+    relying on another still-broken part.
+
+    Returns `{category: new_component_id}` for every category actually
+    changed — empty if the build is already fully compatible, or if nothing
+    in the catalog can resolve a given issue this way (e.g. every real
+    Cooler in stock is too tall for the current Case) — never a partial or
+    fabricated "fix" that a fresh `evaluate_build` wouldn't actually confirm.
+    RAM/Storage capacity issues are never touched (see `_ISSUE_FIX_
+    CATEGORIES`'s own docstring)."""
+    working_state = dict(build_state)
+    patch: dict[str, int] = {}
+    report = evaluate_build(working_state, quantities)
+    original_failing = {r.rule for r in report.results if not r.passed}
+
+    for rule in original_failing:
+        check_fn = _RULE_CHECKS.get(rule)
+        if check_fn is None:
+            continue
+        for category in _ISSUE_FIX_CATEGORIES.get(rule, ()):
+            current = working_state.get(category)
+            if current is None:
+                continue
+            candidates = sorted(components_repo.get_by_category(category), key=lambda c: c.price_usd)
+            fixed = False
+            for candidate in candidates:
+                if candidate.id == current.id:
+                    continue
+                hypothetical = dict(working_state)
+                hypothetical[category] = candidate
+                this_rule_result = check_fn(hypothetical)
+                if this_rule_result is None or not this_rule_result.passed:
+                    continue
+                full_report = evaluate_build(hypothetical, quantities)
+                newly_broken = {
+                    r.rule for r in full_report.results if not r.passed and r.rule not in original_failing
+                }
+                if newly_broken:
+                    continue
+                working_state[category] = candidate
+                patch[category] = candidate.id
+                fixed = True
+                break
+            if fixed:
+                break
+
+    return patch
 
 
 def _cheapest_price(category: str, build_state: BuildState) -> float:

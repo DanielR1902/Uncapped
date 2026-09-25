@@ -5,6 +5,8 @@ engine/ is, unlike most of ui/ (which is smoke-tested only per ui/CLAUDE.md).
 """
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 
 from ui.format import (
@@ -15,6 +17,7 @@ from ui.format import (
     convert_to_usd,
     currency_label,
     format_currency,
+    time_ago,
 )
 
 
@@ -76,3 +79,55 @@ def test_convert_to_usd_nis_matches_real_rate():
 
 def test_convert_to_usd_unknown_currency_falls_back_to_usd_rate():
     assert convert_to_usd(50.0, "GBP") == 50.0
+
+
+# ---------------------------------------------------------------------------
+# time_ago (Reddit-style relative timestamps, spec.md §7.6)
+# ---------------------------------------------------------------------------
+def test_time_ago_just_now():
+    now = dt.datetime(2026, 1, 1, 12, 0, 0)
+    assert time_ago(now - dt.timedelta(seconds=30), now=now) == "just now"
+
+
+def test_time_ago_minutes():
+    now = dt.datetime(2026, 1, 1, 12, 0, 0)
+    assert time_ago(now - dt.timedelta(minutes=5), now=now) == "5m ago"
+
+
+def test_time_ago_hours():
+    now = dt.datetime(2026, 1, 1, 12, 0, 0)
+    assert time_ago(now - dt.timedelta(hours=3), now=now) == "3h ago"
+
+
+def test_time_ago_days():
+    now = dt.datetime(2026, 1, 1, 12, 0, 0)
+    assert time_ago(now - dt.timedelta(days=2), now=now) == "2d ago"
+
+
+def test_time_ago_weeks():
+    now = dt.datetime(2026, 1, 1, 12, 0, 0)
+    assert time_ago(now - dt.timedelta(days=14), now=now) == "2w ago"
+
+
+def test_time_ago_months():
+    now = dt.datetime(2026, 1, 1, 12, 0, 0)
+    assert time_ago(now - dt.timedelta(days=90), now=now) == "3mo ago"
+
+
+def test_time_ago_years():
+    now = dt.datetime(2026, 1, 1, 12, 0, 0)
+    assert time_ago(now - dt.timedelta(days=400), now=now) == "1y ago"
+
+
+def test_time_ago_future_timestamp_clamped_to_just_now():
+    """Clock skew (a timestamp slightly ahead of "now") must never show a
+    negative duration."""
+    now = dt.datetime(2026, 1, 1, 12, 0, 0)
+    assert time_ago(now + dt.timedelta(seconds=5), now=now) == "just now"
+
+
+def test_time_ago_defaults_now_to_current_utc_time():
+    """Omitting `now` entirely must not raise and must produce a plausible
+    label for a timestamp from a few seconds ago."""
+    recent = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(seconds=10)
+    assert time_ago(recent) == "just now"

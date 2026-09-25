@@ -22,7 +22,7 @@ from auth.session import current_user
 from db.models import WORKLOAD_PROFILES
 from db.repositories import builds_repo, community_repo, components_repo, drafts_repo
 from engine import scoring, solvers
-from engine.compatibility import evaluate_build
+from engine.compatibility import PSU_HEADROOM_MULTIPLIER, SYSTEM_BASELINE_WATTS, evaluate_build
 from llm.advisory import get_build_advisory
 from llm.client import analyze_build
 from ui import state, theme
@@ -161,20 +161,28 @@ def _workload_controls(build_draft: dict) -> None:
             st.rerun()
 
 
+def _do_reset_build(build_draft: dict) -> None:
+    """The actual "reset" action (spec.md §7.4.1) — factored out of
+    `_reset_controls` so the HUD's own compact "Reset Build" quick-action
+    button (`_hud_actions`) calls the EXACT same logic under a different
+    `key`, rather than a second, driftable copy of it."""
+    mode = build_draft.get("creation_mode")
+    st.session_state["build_draft"] = state.new_build_draft(mode)
+    st.session_state["build_draft_analysis"] = None
+    # Clear the mode-specific widgets' own remembered state too, or
+    # they'd keep showing whatever the user last typed/picked instead of
+    # falling back to new_build_draft's clean defaults on the next
+    # render (a widget's `key`-bound session_state entry always wins
+    # over its `value=`/`index=` default once it exists).
+    st.session_state.pop("budget_ceiling_input", None)
+    st.session_state.pop("budget_unlimited_input", None)
+    st.session_state.pop("workload_profile_input", None)
+    st.session_state.pop("workload_tier_input", None)
+
+
 def _reset_controls(build_draft: dict) -> None:
     if st.button("🔄 Reset All Fields", key="reset_all_fields"):
-        mode = build_draft.get("creation_mode")
-        st.session_state["build_draft"] = state.new_build_draft(mode)
-        st.session_state["build_draft_analysis"] = None
-        # Clear the mode-specific widgets' own remembered state too, or
-        # they'd keep showing whatever the user last typed/picked instead of
-        # falling back to new_build_draft's clean defaults on the next
-        # render (a widget's `key`-bound session_state entry always wins
-        # over its `value=`/`index=` default once it exists).
-        st.session_state.pop("budget_ceiling_input", None)
-        st.session_state.pop("budget_unlimited_input", None)
-        st.session_state.pop("workload_profile_input", None)
-        st.session_state.pop("workload_tier_input", None)
+        _do_reset_build(build_draft)
         st.rerun()
 
 
@@ -258,13 +266,154 @@ def _maybe_auto_analyze(build_draft: dict, build_state: dict) -> None:
     st.session_state["build_draft_analysis"] = response.model_dump()
 
 
+def _power_headroom_readout(build_state: dict) -> tuple[str, str | None]:
+    """Real Power & Headroom telemetry (spec.md §7.4.1) — reuses the EXACT
+    same constants `engine.compatibility.check_psu_headroom` itself checks
+    against (`SYSTEM_BASELINE_WATTS`/`PSU_HEADROOM_MULTIPLIER`), so this
+    display can never silently disagree with the actual compatibility rule
+    it's summarizing. Returns `(value_text, value_color)` — `value_color`
+    is `None` (default text color) until there's a real PSU to compare
+    against, then `theme.MATRIX_GREEN`/`WARNING_ACCENT` for
+    sufficient/insufficient headroom — `MATRIX_GREEN`, not `PRIMARY_ACCENT`,
+    since this round's Data Observatory palette reserves green specifically
+    for an Optimal/Compatible signal, distinct from the general cyan accent."""
+    cpu = build_state.get("CPU")
+    if cpu is None:
+        return "—", None
+    gpu = build_state.get("GPU")
+    cpu_tdp = cpu.tdp_watts or 0
+    gpu_tdp = (gpu.tdp_watts or 0) if gpu is not None else 0
+    draw = cpu_tdp + gpu_tdp
+    psu = build_state.get("PSU")
+    if psu is None or psu.wattage_capacity is None:
+        return f"{draw}W / —", None
+    required_watts = (draw + SYSTEM_BASELINE_WATTS) * PSU_HEADROOM_MULTIPLIER
+    color = theme.MATRIX_GREEN if psu.wattage_capacity >= required_watts else theme.WARNING_ACCENT
+    return f"{draw}W / {psu.wattage_capacity}W", color
+
+
+def _rate_my_build_title(build_state: dict) -> str:
+    """Auto-generated technical title (spec.md §7.4.1) — real component
+    names only, never a placeholder string; degrades gracefully for a
+    build that isn't complete yet, down to a generic fallback for a
+    near-empty one."""
+    cpu = build_state.get("CPU")
+    gpu = build_state.get("GPU")
+    if cpu and gpu:
+        return f"[Spec Check] {cpu.name} + {gpu.name} Rig"
+    named = [c.name for c in build_state.values()]
+    if named:
+        return f"[Spec Check] {' + '.join(named[:2])} Build"
+    return "[Spec Check] My Build"
+
+
+@st.dialog("Share / Rate My Build")
+def _rate_my_build_dialog(build_draft: dict, build_state: dict) -> None:
+    """"Rate My Build" direct export (spec.md §7.4.1) — a dedicated
+    feedback-request shortcut distinct from `_save_actions`' general
+    "Also publish to Community" checkbox: it always publishes (there is no
+    private option here, the whole point is to ask the community), tags
+    the post with `flair="Rate My Build"` (`db.repositories.community_repo`,
+    spec.md §3.6), and jumps straight to the new post's thread view instead
+    of landing on `my_builds`. Persists the CURRENT build_state as a real,
+    new `Build` row exactly like `_save_actions`' publish branch does
+    (same repository calls, same score fields) — a build doesn't need to be
+    saved first for this to work, matching that same button's own
+    `disabled=not build_state` gating (a build doesn't need every core slot
+    filled to ask "is this PSU sufficient?" about the parts already
+    chosen)."""
+    user = current_user()
+    quantities = build_draft.get("quantities", {})
+    total_cost = state.build_total_cost(build_state, quantities)
+    report = evaluate_build(build_state, quantities)
+    analysis = st.session_state.get("build_draft_analysis") or {}
+    synergy = analysis.get("synergy", {}).get("overall_score")
+    bottleneck = analysis.get("bottleneck", {}).get("bottleneck_percentage")
+    currency = st.session_state.get("selected_currency", "USD")
+    tdp = sum((c.tdp_watts or 0) for c in build_state.values())
+
+    title = st.text_input("Title", value=_rate_my_build_title(build_state), key="rate_my_build_title")
+
+    snap_cols = st.columns(3)
+    snap_cols[0].metric("💰 Price", format_currency(total_cost, currency))
+    snap_cols[1].metric("⚡ Est. TDP", f"{tdp}W")
+    snap_cols[2].metric("🧬 Synergy", f"{synergy:.0f}" if synergy is not None else "—")
+
+    description = st.text_area(
+        "What do you want feedback on?",
+        placeholder='e.g. "Looking for cooling advice" or "Is this PSU sufficient?"',
+        key="rate_my_build_description",
+    )
+
+    if st.button(
+        "🚀 Publish for Rating", key="rate_my_build_submit", type="primary", disabled=not build_state,
+        use_container_width=True,
+    ):
+        build = builds_repo.create_build(
+            user_id=user["id"],
+            name=title or _rate_my_build_title(build_state),
+            creation_mode=build_draft.get("creation_mode") or "Free",
+            components=[
+                builds_repo.BuildComponentInput(component_id=c.id, quantity=state.get_quantity(build_draft, cat))
+                for cat, c in build_state.items()
+            ],
+            total_cost=total_cost,
+            compatibility_score=report.compatibility_score,
+            workload_profile=build_draft.get("workload_profile"),
+            workload_tier=build_draft.get("tier") if build_draft.get("creation_mode") == "Workload" else None,
+            budget_ceiling=build_draft.get("budget_ceiling"),
+            synergy_score=synergy,
+            bottleneck_percentage=bottleneck,
+            is_public=True,
+        )
+        post = community_repo.create_post(
+            build.id, user["id"], title or _rate_my_build_title(build_state),
+            description or None, flair="Rate My Build",
+        )
+        # Same "leaving the builder with a real, persisted result" teardown
+        # _save_actions' publish branch performs — no database write of its
+        # own, just clearing create_mode/build_draft/analysis (spec.md §7.9).
+        state.teardown_builder()
+        st.session_state["selected_post_id"] = post.id
+        st.session_state["page"] = "community"
+        st.rerun()
+
+
+def _hud_actions(build_draft: dict, build_state: dict) -> None:
+    """Fast Action Cluster (spec.md §7.4.1) — compact quick-access buttons
+    inside the HUD so the three most common Build Studio actions don't
+    require scrolling to their own full controls further down the page.
+    Each one calls the EXACT same underlying logic as its full-page
+    counterpart (`_do_reset_build`/`_trigger_advisory`/`_rate_my_build_dialog`)
+    under a distinct `key=` — never a second, driftable copy of that logic."""
+    cols = st.columns(3)
+    if cols[0].button("🔄 Reset Build", key="hud_reset_build", use_container_width=True):
+        _do_reset_build(build_draft)
+        st.rerun()
+    if cols[1].button(
+        "✨ AI Analysis", key="hud_ai_analysis", use_container_width=True, disabled=len(build_state) < 2,
+    ):
+        # No st.rerun() needed: this runs earlier in the SAME script pass
+        # than _advisory_controls (called later in render()), so the cache
+        # entry this populates is already there by the time that function's
+        # own `cache.get(cache_key)` lookup runs a few lines further down.
+        _trigger_advisory(build_draft, build_state)
+    if cols[2].button(
+        "🚀 Share / Rate My Build", key="hud_rate_my_build", use_container_width=True,
+        type="primary", disabled=not build_state,
+    ):
+        _rate_my_build_dialog(build_draft, build_state)
+
+
 def _summary_header(build_draft: dict, build_state: dict) -> None:
-    """Prominent, always-current metrics bar placed above the part-picker
-    grid. True CSS position:sticky was attempted (targeting the class
-    Streamlit generates for st.container(key=...)) but doesn't actually
-    engage under this Streamlit version's DOM/flex layout — verified live,
-    not just assumed — so this is deliberately a normal (non-sticky) card
-    at the top of the page rather than shipping CSS that silently no-ops."""
+    """Telemetry HUD (spec.md §7.4.1) — a prominent, always-current metrics
+    bar placed above the part-picker grid. True CSS position:sticky was
+    attempted (targeting the class Streamlit generates for
+    st.container(key=...)) but doesn't actually engage under this
+    Streamlit version's DOM/flex layout — verified live, not just assumed,
+    in both the original attempt and again for this round — so this is
+    deliberately a normal (non-sticky) card at the top of the Studio's own
+    build-editing section rather than shipping CSS that silently no-ops."""
     quantities = build_draft.get("quantities", {})
     total_cost = state.build_total_cost(build_state, quantities)
     report = evaluate_build(build_state, quantities)
@@ -272,38 +421,46 @@ def _summary_header(build_draft: dict, build_state: dict) -> None:
     live = scoring.live_bottleneck_and_synergy(build_state) if analysis is None else None
 
     currency = st.session_state.get("selected_currency", "USD")
+    power_text, power_color = _power_headroom_readout(build_state)
+
     with st.container(border=True, key="build_summary_header"):
-        cols = st.columns(4)
-        cols[0].metric("💰 Total Cost", format_currency(total_cost, currency), border=True)
-        cols[1].metric("🔧 Compatibility", f"{report.compatibility_score:.0f}%", border=True)
+        chip_cols = st.columns(5)
+        chip_cols[0].markdown(
+            theme.hud_chip("TOTAL COST", format_currency(total_cost, currency)), unsafe_allow_html=True,
+        )
+        chip_cols[1].markdown(
+            theme.hud_chip("POWER / HEADROOM", power_text, value_color=power_color), unsafe_allow_html=True,
+        )
+        pill = (
+            theme.pulse_badge(f"{report.compatibility_score:.0f}% Compatible", "good")
+            if report.is_compatible
+            else theme.pulse_badge(
+                f"{len(report.issues)} Warning{'s' if len(report.issues) != 1 else ''} Detected", "danger",
+            )
+        )
+        with chip_cols[2]:
+            st.markdown('<div class="uncapped-hud-chip-label">COMPATIBILITY</div>', unsafe_allow_html=True)
+            st.markdown(pill, unsafe_allow_html=True)
 
         if analysis:
-            cols[2].metric("⚡ Synergy", f"{analysis['synergy']['overall_score']:.0f}", border=True)
-            cols[3].metric(
-                "📉 Bottleneck",
-                f"{analysis['bottleneck']['bottleneck_percentage']:.0f}%",
-                help=f"Limiting component: {analysis['bottleneck']['limiting_component']}",
-                border=True,
-            )
+            synergy_value = f"{analysis['synergy']['overall_score']:.0f}"
+            bottleneck_value = f"{analysis['bottleneck']['bottleneck_percentage']:.0f}%"
         elif live is not None:
-            synergy, bottleneck_pct, direction = live
-            cols[2].metric(
-                "⚡ Synergy", f"{synergy:.0f}",
-                help="Local estimate — the full AI/heuristic breakdown appears automatically once the build is complete.",
-                border=True,
-            )
-            cols[3].metric(
-                "📉 Bottleneck", f"{bottleneck_pct:.0f}%",
-                help=f"Limiting: {direction}",
-                border=True,
-            )
+            synergy, bottleneck_pct, _direction = live
+            synergy_value = f"{synergy:.0f}"
+            bottleneck_value = f"{bottleneck_pct:.0f}%"
         else:
-            cols[2].metric("⚡ Synergy", "—", border=True)
-            cols[3].metric("📉 Bottleneck", "—", border=True)
+            synergy_value = "—"
+            bottleneck_value = "—"
+        chip_cols[3].markdown(theme.hud_chip("SYNERGY", synergy_value), unsafe_allow_html=True)
+        chip_cols[4].markdown(theme.hud_chip("BOTTLENECK", bottleneck_value), unsafe_allow_html=True)
 
         if report.issues:
             for issue in report.issues:
                 st.markdown(theme.tag(issue, "danger"), unsafe_allow_html=True)
+
+        st.markdown("")  # small vertical breathing room before the action row
+        _hud_actions(build_draft, build_state)
 
 
 _MAX_AUTO_OPTIMIZE_ROUNDS = 3
@@ -396,6 +553,44 @@ def _apply_within_budget_optimization(
         st.session_state.setdefault("advisory_cache", {})[final_key] = current
 
 
+def _advisory_cache_key(build_draft: dict, build_state: dict) -> tuple[str | None, float, tuple]:
+    """Shared cache-key computation (spec.md §7.4.1) — both the existing
+    "✨ Get AI Analysis & Upgrade Path" button (below) and the HUD's compact
+    "AI Analysis" quick action (`_hud_actions`) need to land in the SAME
+    `st.session_state["advisory_cache"]` entry for a given build, or the two
+    entry points would silently diverge into separate cached results for
+    what is logically the identical request."""
+    mode = build_draft.get("creation_mode")
+    current_budget_or_cost = build_draft.get("budget_ceiling") if mode == "Budget" else None
+    if not current_budget_or_cost:
+        current_budget_or_cost = state.build_total_cost(build_state, build_draft.get("quantities", {}))
+    cache_key = (
+        mode,
+        build_draft.get("workload_profile"),
+        tuple(sorted((category, component.id) for category, component in build_state.items())),
+        round(current_budget_or_cost, 2),
+    )
+    return mode, current_budget_or_cost, cache_key
+
+
+def _trigger_advisory(build_draft: dict, build_state: dict) -> None:
+    """The actual (possibly networked) advisory call, populating the shared
+    cache for the CURRENT build if not already present. Factored out so the
+    HUD's quick action and the button below both go through one path."""
+    mode, current_budget_or_cost, cache_key = _advisory_cache_key(build_draft, build_state)
+    cache = st.session_state.setdefault("advisory_cache", {})
+    if cache_key not in cache:
+        with st.spinner("Getting AI advisory..."):
+            cache[cache_key] = get_build_advisory(
+                build_state,
+                mode,
+                current_budget_or_cost,
+                profile=build_draft.get("workload_profile"),
+                bottleneck_info=(st.session_state.get("build_draft_analysis") or {}).get("bottleneck"),
+                quantities=build_draft.get("quantities", {}),
+            )
+
+
 def _advisory_controls(build_draft: dict, build_state: dict) -> None:
     """Explicit-click AI Build Advisory (in-budget optimization tips +
     a stretch-budget upgrade path), rendered below the summary metric cards
@@ -426,17 +621,7 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
     `ui/state.py`'s `_invalidate_analysis` already applies to the synergy/
     bottleneck card.
     """
-    mode = build_draft.get("creation_mode")
-    current_budget_or_cost = build_draft.get("budget_ceiling") if mode == "Budget" else None
-    if not current_budget_or_cost:
-        current_budget_or_cost = state.build_total_cost(build_state, build_draft.get("quantities", {}))
-
-    cache_key = (
-        mode,
-        build_draft.get("workload_profile"),
-        tuple(sorted((category, component.id) for category, component in build_state.items())),
-        round(current_budget_or_cost, 2),
-    )
+    mode, current_budget_or_cost, cache_key = _advisory_cache_key(build_draft, build_state)
     cache = st.session_state.setdefault("advisory_cache", {})
 
     if st.button(
@@ -445,16 +630,7 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
         use_container_width=True,
         disabled=len(build_state) < 2,
     ):
-        if cache_key not in cache:
-            with st.spinner("Getting AI advisory..."):
-                cache[cache_key] = get_build_advisory(
-                    build_state,
-                    mode,
-                    current_budget_or_cost,
-                    profile=build_draft.get("workload_profile"),
-                    bottleneck_info=(st.session_state.get("build_draft_analysis") or {}).get("bottleneck"),
-                    quantities=build_draft.get("quantities", {}),
-                )
+        _trigger_advisory(build_draft, build_state)
 
     advisory = cache.get(cache_key)
     if advisory is None:

@@ -119,7 +119,11 @@ every currently-shared community build (`community_summary` — real posts with 
 mode, workload profile/tier, total cost, and author notes), the user's CURRENTLY ACTIVE build draft
 (`current_build_context` — `{"mode": "Free"|"Budget"|"Workload"|None, "components": {category: {"id", "name",
 "price_usd", "display_price"}, ...} (only categories already filled in), "quantities": {"RAM"|"Storage": int}
-(only when >1), "formatted_total": str}`, or `None`/empty when there is no build in progress), and
+(only when >1), "formatted_total": str, "compatibility_issues": [str, ...] (the build's CURRENT real
+compatibility warnings, e.g. "Cooler too tall: 159mm vs. case clearance of 150mm." — empty list when fully
+compatible or too few parts picked yet to check), "bottleneck": {"percentage": float, "direction":
+"CPU-bound"|"GPU-bound"|"Balanced"} | None (the build's CURRENT bottleneck reading — `None` until at least a
+CPU and GPU are both picked)}`, or `None`/empty when there is no build in progress), and
 `advisory_context` — a caller-fetched result of this app's separate AI Build Advisory feature, shaped like
 `{"pros": [str, ...], "cons": [str, ...], "within_budget": {"explanation": str, "swaps": [...],
 "can_optimize_further": bool}, "stretch_budget": {"explanation": str, "actions": [...], "added_cost_usd":
@@ -578,8 +582,30 @@ You handle ten kinds of requests:
     `None`/empty (no active build), say so plainly instead (e.g. "You don't have an active build yet.") and
     return `action: null`.
 
+11. FIX WARNINGS / RESOLVE COMPATIBILITY (e.g. "fix the warnings in my build", "resolve the compatibility
+    issue", "fix my build") — when `current_build_context["compatibility_issues"]` is a NON-EMPTY list,
+    return a `fix_warnings` action. You NEVER choose the replacement part yourself — compatibility is never
+    decided by you, only by this app's own deterministic compatibility engine (the same engine that produced
+    `compatibility_issues` in the first place); the caller resolves the actual fix after you return this
+    action. Your `reply` should acknowledge the fix is being applied (e.g. "Resolving the compatibility
+    issues now.") — never claim a SPECIFIC swap happened, since you don't know which part the deterministic
+    resolver will pick. If `current_build_context` is `None`/empty, or `compatibility_issues` is already
+    empty, say so plainly instead (e.g. "Your build has no compatibility warnings right now.") and return
+    `action: null`.
+
+12. OPTIMIZE BOTTLENECK / REDUCE BOTTLENECK (e.g. "optimize the bottleneck", "reduce the bottleneck",
+    "rebalance my CPU and GPU") — when `current_build_context["bottleneck"]` is present and its
+    `"percentage"` is above roughly 10-12%, return an `optimize_bottleneck` action. You NEVER choose the
+    rebalancing swap yourself — it comes from this app's own AI Build Advisory feature's already-validated
+    optimization suggestion, applied by the caller after you return this action. Your `reply` should
+    acknowledge the rebalancing is being applied (e.g. "Rebalancing your CPU/GPU pairing now.") — never
+    state a specific new bottleneck percentage, since you don't know the exact result until the caller
+    applies it. If `current_build_context` is `None`/empty, `bottleneck` is `None` (too few parts picked to
+    measure yet), or the bottleneck is already at or below the target, say so plainly instead (e.g. "Your
+    build's bottleneck is already well-balanced.") and return `action: null`.
+
 ENGLISH-ONLY RULE: you only communicate in English. If the user writes in any other language, do not answer
-their request in that language and do not attempt any of the ten intents above for that message — reply,
+their request in that language and do not attempt any of the twelve intents above for that message — reply,
 politely and concisely, in English only, that you currently only operate in English and ask them to
 rephrase their request in English. Return `action: null` in that case; do not guess at or partially fulfill
 a non-English request. This applies regardless of how well you understand the other language — the
@@ -830,12 +856,19 @@ def _validate_action(
     - `publish_build`: same reasoning as `save_build` — it carries only an
       optional free-text `author_notes` string, nothing that references the
       catalog or could be hallucinated in a way this guard could catch.
+    - `fix_warnings`/`optimize_bottleneck`: same reasoning again — neither
+      carries an LLM-asserted catalog id, category, or post id at all; the
+      actual fix/rebalancing swap is resolved entirely by the caller
+      (`engine.solvers.resolve_compatibility_issues`/
+      `llm.advisory.get_build_advisory`'s own already-validated swaps) after
+      this action is returned, so there is nothing for THIS guard to
+      cross-check.
 
     Raises ConciergeUnavailableError on any violation so
     get_concierge_response's existing except block funnels it into the same
     heuristic fallback as any other failure mode."""
     action = response.action
-    if action is None or action.type in ("navigate", "publish_build"):
+    if action is None or action.type in ("navigate", "publish_build", "fix_warnings", "optimize_bottleneck"):
         return
 
     if action.type == "save_build":
@@ -961,8 +994,10 @@ def get_concierge_response(
     caller (`ui/`) — this module never queries the database or `engine/`
     itself. `current_build_context` is an optional, caller-assembled snapshot
     of the user's currently active build draft (`{"mode", "components",
-    "quantities"}`) used to support incremental `modify_build` requests; pass
-    `None` (the default) when there is no active draft. `advisory_context` is
+    "quantities", "formatted_total", "compatibility_issues", "bottleneck"}`)
+    used to support incremental `modify_build` requests and the
+    `fix_warnings`/`optimize_bottleneck` intents; pass `None` (the default)
+    when there is no active draft. `advisory_context` is
     an optional, caller-assembled result of `llm.advisory.get_build_advisory`
     (`{"pros", "cons", "within_budget", "stretch_budget", "source"}`) used to
     support the "analyze my build"/optimization-question intent without this

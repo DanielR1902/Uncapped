@@ -2,6 +2,7 @@
 logic — anything that touches engine/db/llm output shape belongs elsewhere."""
 from __future__ import annotations
 
+import datetime as dt
 import re
 
 _CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
@@ -64,6 +65,44 @@ def currency_label(currency: str) -> str:
     """"USD" -> "USD ($)"; "NIS" -> "NIS (₪)" — the sidebar selector's
     display label for a given currency code."""
     return f"{currency} ({CURRENCY_SYMBOLS.get(currency, '$')})"
+
+
+def time_ago(timestamp: dt.datetime, now: dt.datetime | None = None) -> str:
+    """"just now" / "5m ago" / "3h ago" / "2d ago" / "3w ago" / "4mo ago" /
+    "1y ago" — a compact, Reddit-style relative-time label (spec.md §7.6).
+    `now` is only ever passed explicitly by tests (deterministic); real
+    callers omit it and get `datetime.utcnow()` — every timestamp already
+    stored by this app (`Build.created_at`, `CommunityComment.created_at`,
+    etc.) is a naive UTC datetime (SQLite's `CURRENT_TIMESTAMP`, db/models.py),
+    so comparing against a naive UTC "now" is the correct, consistent thing
+    to do here rather than a timezone-aware `now()` that would compare
+    unequal types and raise. A `timestamp` slightly in the future (clock
+    skew) is clamped to "just now" rather than showing a negative duration."""
+    if now is None:
+        # Naive UTC, matching every stored timestamp exactly (SQLite's
+        # CURRENT_TIMESTAMP, db/models.py) — dt.datetime.now(dt.UTC) would be
+        # timezone-AWARE and can't be subtracted from a naive one below.
+        now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    seconds = max(0.0, (now - timestamp).total_seconds())
+    if seconds < 60:
+        return "just now"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    if days < 7:
+        return f"{days}d ago"
+    weeks = days // 7
+    if weeks < 5:
+        return f"{weeks}w ago"
+    months = days // 30
+    if months < 12:
+        return f"{months}mo ago"
+    years = days // 365
+    return f"{years}y ago"
 
 
 def humanize_profile(name: str) -> str:

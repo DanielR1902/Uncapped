@@ -939,3 +939,111 @@ def test_peripheral_surplus_fill_never_exceeds_ceiling_across_limits(seeded_db):
         total_cost = sum(c.price_usd for c in build.values())
         assert total_cost <= ceiling
         assert set(solvers.CATEGORY_ORDER).issubset(build.keys())
+
+
+# ---------------------------------------------------------------------------
+# resolve_compatibility_issues (spec.md §6.7 intent 11, the AI Concierge's
+# "Fix Warnings"/"Resolve Compatibility" action) — deterministic, catalog-
+# grounded fix, never an LLM-chosen part.
+# ---------------------------------------------------------------------------
+def _height_mm(component) -> int:
+    specs = json.loads(component.specs_json) if component.specs_json else {}
+    return specs.get("height_mm", 0)
+
+
+def test_resolve_compatibility_issues_fixes_oversized_cooler(seeded_db):
+    """The directive's own worked example: a cooler taller than the case's
+    clearance gets swapped for a real, cheapest, compatible cooler — the
+    swap must actually resolve to a fully compatible build, not just
+    silently do nothing."""
+    from db.repositories import components_repo
+
+    cpu = next(c for c in components_repo.get_by_category("CPU") if c.socket)
+    mobo = next(m for m in components_repo.get_by_category("Motherboard") if m.socket == cpu.socket)
+    # A case that already accepts this motherboard's form factor -- the ONLY
+    # issue this build should start with is the oversized cooler, isolating
+    # exactly what this test means to check.
+    compatible_cases = [
+        c for c in components_repo.get_by_category("Case")
+        if c.max_cooler_height_mm and mobo.form_factor in (c.form_factor or "")
+    ]
+    case = min(compatible_cases, key=lambda c: c.max_cooler_height_mm)
+    oversized_cooler = max(components_repo.get_by_category("Cooler"), key=_height_mm)
+    assert _height_mm(oversized_cooler) > case.max_cooler_height_mm  # sanity: the fixture IS actually broken
+
+    build_state = {"CPU": cpu, "Motherboard": mobo, "Case": case, "Cooler": oversized_cooler}
+    assert compatibility.evaluate_build(build_state).is_compatible is False
+
+    patch = solvers.resolve_compatibility_issues(build_state)
+
+    assert "Cooler" in patch
+    fixed_state = dict(build_state)
+    for category, component_id in patch.items():
+        fixed_state[category] = components_repo.get_by_id(component_id)
+    assert compatibility.evaluate_build(fixed_state).is_compatible is True
+    assert _height_mm(fixed_state["Cooler"]) <= fixed_state["Case"].max_cooler_height_mm
+
+
+def test_resolve_compatibility_issues_fixes_multiple_simultaneous_issues(seeded_db):
+    """Two INDEPENDENT issues at once (an oversized cooler AND an under-
+    provisioned PSU) must both be resolved -- proves the per-rule check
+    (not a blanket get_compatible_candidates/evaluate_build filter) lets
+    each issue be fixed on its own rather than one swap being blocked by
+    the other, still-broken issue."""
+    from db.repositories import components_repo
+
+    cpu = next(c for c in components_repo.get_by_category("CPU") if c.socket)
+    mobo = next(m for m in components_repo.get_by_category("Motherboard") if m.socket == cpu.socket)
+    compatible_cases = [
+        c for c in components_repo.get_by_category("Case")
+        if c.max_cooler_height_mm and mobo.form_factor in (c.form_factor or "")
+    ]
+    case = min(compatible_cases, key=lambda c: c.max_cooler_height_mm)
+    oversized_cooler = max(components_repo.get_by_category("Cooler"), key=_height_mm)
+    gpu = max(components_repo.get_by_category("GPU"), key=lambda g: g.tdp_watts or 0)
+    # The smallest real PSU in the catalog, so psu_headroom fails against this GPU's real draw.
+    weak_psu = min(components_repo.get_by_category("PSU"), key=lambda p: p.wattage_capacity or 0)
+
+    build_state = {"CPU": cpu, "Motherboard": mobo, "Case": case, "Cooler": oversized_cooler, "GPU": gpu, "PSU": weak_psu}
+    report = compatibility.evaluate_build(build_state)
+    failing_before = {r.rule for r in report.results if not r.passed}
+    assert "cooler_case_clearance" in failing_before
+    assert "psu_headroom" in failing_before
+
+    patch = solvers.resolve_compatibility_issues(build_state)
+
+    fixed_state = dict(build_state)
+    for category, component_id in patch.items():
+        fixed_state[category] = components_repo.get_by_id(component_id)
+    assert compatibility.evaluate_build(fixed_state).is_compatible is True
+
+
+def test_resolve_compatibility_issues_no_op_when_already_compatible(seeded_db):
+    build = solvers.initialize_budget_build(2000.0)
+    assert compatibility.evaluate_build(build).is_compatible is True
+
+    assert solvers.resolve_compatibility_issues(build) == {}
+
+
+def test_resolve_compatibility_issues_never_touches_ram_or_storage_quantity_issues(seeded_db):
+    """RAM/Storage capacity issues are a QUANTITY problem, not a wrong-
+    component problem -- resolve_compatibility_issues must never silently
+    shrink a user's requested quantity (see its own docstring for why)."""
+    from db.repositories import components_repo
+
+    def _ram_slots(mobo) -> int:
+        specs = json.loads(mobo.specs_json) if mobo.specs_json else {}
+        return specs.get("ram_slots") or 2
+
+    mobo = next(m for m in components_repo.get_by_category("Motherboard") if _ram_slots(m) >= 2)
+    cpu = next(c for c in components_repo.get_by_category("CPU") if c.socket == mobo.socket)
+    ram = next(r for r in components_repo.get_by_category("RAM") if r.ram_type == mobo.ram_type)
+
+    build_state = {"CPU": cpu, "Motherboard": mobo, "RAM": ram}
+    # Request more RAM kits than the motherboard has slots for.
+    quantities = {"RAM": _ram_slots(mobo) + 10}
+    report = compatibility.evaluate_build(build_state, quantities)
+    assert any(r.rule == "ram_capacity" and not r.passed for r in report.results)
+
+    patch = solvers.resolve_compatibility_issues(build_state, quantities)
+    assert "RAM" not in patch

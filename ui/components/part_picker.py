@@ -14,8 +14,18 @@ from db.models import Component
 from engine import scoring
 from engine.compatibility import BuildState, evaluate_build, resolve_quantity_limit
 from engine.solvers import CATEGORY_ORDER, cheapest_fill_cost
+from ui import theme
 from ui.format import format_currency
 from ui.state import resolve_effective_quantity_limit
+
+# The one real pairwise socket-match check worth surfacing as an inline
+# "AM5 Matched"-style badge (spec.md §7.4.1) — every candidate this picker
+# ever offers is already solver/engine-filtered to be compatible (see
+# `_candidates_for` in ui/views/create_build.py), so this is a confirmation
+# of an already-guaranteed fact, not a new check; CPU<->Motherboard socket
+# is the one pairing users actually think of as "the socket," unlike e.g.
+# GPU/Case clearance which is a length check, not a named connector.
+_SOCKET_MATCH_PAIRS = {"CPU": "Motherboard", "Motherboard": "CPU"}
 
 # UI-only conservative display cap used ONLY when engine.compatibility's
 # resolve_quantity_limit returns (None, ...) — i.e. no real motherboard/
@@ -159,7 +169,14 @@ def render_part_picker(
     if budget_ceiling is not None:
         spent_elsewhere = sum(c.price_usd for cat, c in build_state.items() if cat != category)
 
-    with st.container(border=True):
+    # Industrial dashed-wireframe empty state vs. solid glass-panel filled
+    # state (spec.md §7.4.1) — the key's own "_empty"/"_filled" suffix is
+    # what ui/theme.py's inject_css() CSS actually targets (the same
+    # key-suffix-as-CSS-hook technique _render_vote_widget already uses for
+    # upvote/downvote coloring), since Streamlit's own `border=True` gives
+    # every container the same solid look regardless of state.
+    slot_key = f"picker_slot_{category}" + ("_filled" if current is not None else "_empty")
+    with st.container(border=True, key=slot_key):
         header_cols = st.columns([3, 1.6, 0.6])
         with header_cols[0]:
             st.markdown(f"{icon} **{category}**")
@@ -175,6 +192,11 @@ def render_part_picker(
                 specs_line = " · ".join(_key_specs(current))
                 if specs_line:
                     st.caption(specs_line)
+
+                paired_category = _SOCKET_MATCH_PAIRS.get(category)
+                paired_component = build_state.get(paired_category) if paired_category else None
+                if current.socket and paired_component is not None and paired_component.socket == current.socket:
+                    st.markdown(theme.tag(f"✓ {current.socket} Matched", "success"), unsafe_allow_html=True)
                 if category in _QUANTITY_CATEGORIES and on_quantity_change is not None:
                     # Combined physical + budget bound: resolve_effective_quantity_limit
                     # (ui/state.py) folds engine.compatibility.resolve_quantity_limit's
@@ -260,7 +282,7 @@ def render_part_picker(
                 st.caption("Not selected yet")
 
         with header_cols[1]:
-            popover_label = f"Change {category}" if current is not None else f"Choose {category}"
+            popover_label = f"Change {category}" if current is not None else f"+ Select {category}"
             with st.popover(popover_label, use_container_width=True):
                 st.caption(
                     f"Sorted by {sort_criteria} · {len(ordered)} option{'s' if len(ordered) != 1 else ''}"

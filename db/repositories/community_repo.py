@@ -13,9 +13,13 @@ _POST_EAGER = (
 )
 
 
-def create_post(build_id: int, user_id: int, title: str, author_notes: str | None = None) -> CommunityPost:
+def create_post(
+    build_id: int, user_id: int, title: str, author_notes: str | None = None, flair: str | None = None
+) -> CommunityPost:
     with session_scope() as session:
-        post = CommunityPost(build_id=build_id, user_id=user_id, title=title, author_notes=author_notes)
+        post = CommunityPost(
+            build_id=build_id, user_id=user_id, title=title, author_notes=author_notes, flair=flair
+        )
         session.add(post)
         session.flush()
         post = session.execute(
@@ -36,8 +40,12 @@ def get_post(post_id: int) -> CommunityPost | None:
 
 
 def get_feed() -> list[CommunityPost]:
+    """Strictly chronological, newest first — no vote/score ranking (the
+    upvote/downvote mechanism, `community_votes`, and `.net_score` were
+    removed entirely per a later product decision; see git history for the
+    prior Reddit-style implementation this replaced)."""
     with session_scope() as session:
-        rows = (
+        posts = list(
             session.execute(
                 select(CommunityPost).options(*_POST_EAGER).order_by(CommunityPost.created_at.desc())
             )
@@ -45,12 +53,20 @@ def get_feed() -> list[CommunityPost]:
             .all()
         )
         session.expunge_all()
-        return list(rows)
+        return posts
 
 
-def add_comment(post_id: int, user_id: int, content: str) -> CommunityComment:
+def add_comment(post_id: int, user_id: int, content: str, parent_comment_id: int | None = None) -> CommunityComment:
+    """`parent_comment_id` (optional, defaults to `None` — a top-level comment)
+    is the id of the comment this one directly replies to (spec.md §3.7/§7.6,
+    threaded discussions). Never validated against `post_id` here (trusted
+    caller data — `ui/views/community.py` only ever offers a Reply control on
+    a comment it already fetched for THIS post) the same "caller already has
+    real, trusted ids" precedent as every other repository function here."""
     with session_scope() as session:
-        comment = CommunityComment(post_id=post_id, user_id=user_id, content=content)
+        comment = CommunityComment(
+            post_id=post_id, user_id=user_id, content=content, parent_comment_id=parent_comment_id
+        )
         session.add(comment)
         session.flush()
         session.refresh(comment)
@@ -59,6 +75,12 @@ def add_comment(post_id: int, user_id: int, content: str) -> CommunityComment:
 
 
 def get_comments(post_id: int) -> list[CommunityComment]:
+    """A FLAT list ordered by `created_at` ascending (oldest first) — unchanged
+    shape regardless of `parent_comment_id`, so existing callers/tests keep
+    working. Building the reply tree (grouping by `parent_comment_id`,
+    indentation depth) from this flat, already-chronological list is a
+    presentation concern handled entirely in `ui/views/community.py`, not
+    here (db/ owns no business/presentation logic, db/CLAUDE.md)."""
     with session_scope() as session:
         rows = (
             session.execute(
