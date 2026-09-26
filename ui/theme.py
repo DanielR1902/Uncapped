@@ -248,6 +248,24 @@ def inject_css() -> None:
             border-radius: 6px !important;
             box-shadow: 0 0 15px rgba(0, 242, 254, 0.05), inset 0 0 15px rgba(0, 242, 254, 0.02) !important;
         }}
+        /* Unified comment-thread container (spec.md §7.6, community.py's
+        _comments_section) — one whole root-comment-plus-all-nested-replies
+        subtree wrapped in a SINGLE `st.container(key=f"comment_thread_{id}",
+        border=True)` rather than a per-reply connector line. A class-
+        substring selector (the same "_empty" suffix technique part_picker.py
+        already uses for a different keyed-container variant) overrides the
+        generic glass-panel rule above with a more subtle, dedicated look for
+        this ONE container type specifically. */
+        [data-testid="stVerticalBlock"][class*="st-key-comment_thread_"] {{
+            background: rgba(13, 22, 38, 0.45) !important;
+            border: 1px solid rgba(0, 240, 255, 0.18) !important;
+            border-radius: 8px !important;
+            padding: 14px 18px !important;
+            margin-bottom: 16px !important;
+            box-shadow: none !important;
+            backdrop-filter: none !important;
+            -webkit-backdrop-filter: none !important;
+        }}
 
         /* Real st.metric widgets this app still uses (build_card.py's Cost/
         Compatibility/Synergy/Bottleneck cards, the Rate My Build dialog's
@@ -290,7 +308,7 @@ def inject_css() -> None:
         subsequently-rendered native Streamlit widgets — this class only styles
         the static text content, never anything interactive. */
         .uncapped-comment-reply {{
-            border-left: 2px solid rgba(255,255,255,0.15);
+            border-left: 1px dashed rgba(255,255,255,0.15);
             padding-left: 12px;
             margin-bottom: 0.5rem;
         }}

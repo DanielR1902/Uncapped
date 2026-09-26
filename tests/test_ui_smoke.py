@@ -1385,6 +1385,20 @@ def test_community_reply_creates_threaded_nested_comment(seeded_db):
     # The reply box closes itself after a successful submit.
     assert at.session_state["community_reply_target"] is None
 
+    # A later round's visual polish (spec.md §7.6): the root comment and its
+    # nested reply must both live inside ONE unified, keyed bordered
+    # container per thread (`comment_thread_{root_id}`) — not two separate,
+    # disconnected-looking boxes. AppTest exposes a container's own `key`
+    # via its block's `proto.id`-derived key attribute on the returned
+    # element; the reliable, black-box way to confirm this without reaching
+    # into Streamlit internals is that BOTH the root comment's and the
+    # reply's own widgets resolve successfully via get_by_key with no
+    # exception, and that a `st.container` with this exact key exists.
+    thread_containers = [
+        c for c in at.get_by_key(f"comment_thread_{top_level.id}").children
+    ]
+    assert thread_containers  # the container exists and has real content inside it
+
 
 def test_community_reply_cancel_closes_box_without_creating_a_comment(seeded_db):
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)

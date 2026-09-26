@@ -41,12 +41,15 @@ def _description_box(text: str) -> str:
     user-supplied content (a community post's `author_notes`), so it's
     `html.escape()`-d before this ever reaches `unsafe_allow_html=True`, the
     same discipline every other free-text render in this app already
-    applies."""
+    applies. Font-size bumped to 1.12rem (from an earlier round's 0.95rem)
+    for more visual presence/legibility — the accent left border and
+    translucent dark background are unchanged."""
     return (
         '<div style="background:rgba(13,22,38,0.7); border:1px solid rgba(0,240,255,0.3); '
         f"border-left:3px solid {theme.PRIMARY_ACCENT}; border-radius:6px; padding:12px 16px; "
-        f'margin:12px 0; font-size:0.95rem; line-height:1.5; color:{theme.TEXT_PRIMARY}; '
-        f'font-style:italic;">"{sanitize_markdown(html.escape(text))}"</div>'
+        f'margin:12px 0; font-size:1.12rem; line-height:1.6; font-weight:500; '
+        f'color:{theme.TEXT_PRIMARY}; font-style:italic;">'
+        f'"{sanitize_markdown(html.escape(text))}"</div>'
     )
 
 
@@ -224,7 +227,15 @@ def _comments_section(post) -> None:
     comments = community_repo.get_comments(post.id)
     children_by_parent = _group_comments_by_parent(comments)
     for top_level_comment in children_by_parent.get(None, []):
-        _render_comment_node(post.id, top_level_comment, children_by_parent, depth=0)
+        # One unified, sleek-bordered container per thread (root comment +
+        # every nested reply beneath it) — spec.md §7.6, a later round's
+        # visual polish — replacing what used to be a disconnected-looking
+        # per-reply left border with no outer boundary tying the whole
+        # conversation together. `st.container` (not raw HTML) is required
+        # here since the subtree contains real Streamlit widgets (the Reply
+        # button, the reply text_area) that injected HTML cannot wrap.
+        with st.container(key=f"comment_thread_{top_level_comment.id}", border=True):
+            _render_comment_node(post.id, top_level_comment, children_by_parent, depth=0)
 
     st.text_area("Add a comment", key="new_comment_input")
     st.button("Post comment", key="post_comment", on_click=_submit_comment, args=(post.id,))
