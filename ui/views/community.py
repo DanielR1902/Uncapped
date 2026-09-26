@@ -34,6 +34,22 @@ from ui.format import format_currency, humanize_profile, sanitize_markdown, time
 _MAX_VISUAL_REPLY_DEPTH = 6
 
 
+def _description_box(text: str) -> str:
+    """The bordered, cyan-accented description container shared by the feed
+    card and the thread view (spec.md §7.6) — a quoted, italicized author
+    note, visually distinct from the surrounding metadata. `text` is real
+    user-supplied content (a community post's `author_notes`), so it's
+    `html.escape()`-d before this ever reaches `unsafe_allow_html=True`, the
+    same discipline every other free-text render in this app already
+    applies."""
+    return (
+        '<div style="background:rgba(13,22,38,0.7); border:1px solid rgba(0,240,255,0.3); '
+        f"border-left:3px solid {theme.PRIMARY_ACCENT}; border-radius:6px; padding:12px 16px; "
+        f'margin:12px 0; font-size:0.95rem; line-height:1.5; color:{theme.TEXT_PRIMARY}; '
+        f'font-style:italic;">"{sanitize_markdown(html.escape(text))}"</div>'
+    )
+
+
 def _post_subtitle(build, created_at) -> str:
     if (
         build.creation_mode == "Workload"
@@ -277,7 +293,7 @@ def _thread_view(post) -> None:
     if post.flair:
         st.markdown(theme.flair_badge(post.flair), unsafe_allow_html=True)
     if post.author_notes:
-        st.markdown(post.author_notes)
+        st.markdown(_description_box(post.author_notes), unsafe_allow_html=True)
 
     render_build_card(post.build)
 
@@ -514,6 +530,26 @@ def render() -> None:
             if post.flair:
                 st.markdown(theme.flair_badge(post.flair), unsafe_allow_html=True)
             st.caption(_post_subtitle(post.build, post.created_at))
+            if post.author_notes:
+                st.markdown(_description_box(post.author_notes), unsafe_allow_html=True)
+            stat_cols = st.columns(3)
+            with stat_cols[0]:
+                st.markdown(
+                    theme.hud_chip("COMPATIBILITY", f"{post.build.compatibility_score:.0f}%"),
+                    unsafe_allow_html=True,
+                )
+            with stat_cols[1]:
+                bottleneck_display = (
+                    f"{post.build.bottleneck_percentage:.0f}%"
+                    if post.build.bottleneck_percentage is not None
+                    else "—"
+                )
+                st.markdown(theme.hud_chip("BOTTLENECK", bottleneck_display), unsafe_allow_html=True)
+            with stat_cols[2]:
+                synergy_display = (
+                    f"{post.build.synergy_score:.0f}" if post.build.synergy_score is not None else "—"
+                )
+                st.markdown(theme.hud_chip("SYNERGY", synergy_display), unsafe_allow_html=True)
             if st.button("View", key=f"view_post_{post.id}"):
                 st.session_state["selected_post_id"] = post.id
                 st.rerun()

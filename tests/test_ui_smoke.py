@@ -498,8 +498,14 @@ def test_landing_shows_welcome_and_resume_last_draft_when_logged_in(seeded_db):
     at.session_state["page"] = "landing"
     at.run()
 
+    # The welcome header is now a styled HTML fragment (cyan-highlighted
+    # "Architect {name}" span, spec.md §7.11) rather than a single plain-text
+    # markdown string, so "Welcome back, Architect X" no longer appears as
+    # one contiguous substring in the raw markdown SOURCE (an HTML tag sits
+    # between "back," and "Architect") — check both real pieces separately.
     page_text = "\n".join(m.value for m in at.markdown)
-    assert "Welcome back, Architect Resume User One" in page_text
+    assert "Welcome back," in page_text
+    assert "Architect Resume User One" in page_text
     captions = "\n".join(c.value for c in at.caption)
     assert "My Resumable Draft" in captions
 
@@ -507,6 +513,25 @@ def test_landing_shows_welcome_and_resume_last_draft_when_logged_in(seeded_db):
     assert not at.exception
     assert at.session_state["page"] == "create_build"
     assert at.session_state["build_draft"]["name"] == "My Resumable Draft"
+
+
+def test_landing_welcome_header_highlights_architect_name_in_cyan(seeded_db):
+    """The restyled welcome header (spec.md §7.11) renders 'Architect
+    {name}' inside its own inline-styled span using theme.PRIMARY_ACCENT —
+    not just plain text — so the username visibly stands out from the base
+    white 'Welcome back,' text."""
+    from ui import theme
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "cyanuser1", "cyanuser1@example.com", "Cyan User One")
+    at.session_state["page"] = "landing"
+    at.run()
+
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert f'color:{theme.PRIMARY_ACCENT}' in page_text
+    assert "Architect Cyan User One" in page_text
+    assert "font-weight:700" in page_text
 
 
 def test_register_flow_authenticates_user(seeded_db):
@@ -884,6 +909,9 @@ def test_community_description_saved_and_displayed(seeded_db):
 
     assert not at.exception
     assert any(note in m.value for m in at.markdown)
+    # The restyled description box (spec.md §7.6) wraps the note in a
+    # cyan-left-bordered, italic container — not just a bare st.markdown call.
+    assert any("border-left:3px solid" in m.value and note in m.value for m in at.markdown)
 
 
 def test_community_thread_view_shows_quantity_badge_for_multi_unit_storage(seeded_db):

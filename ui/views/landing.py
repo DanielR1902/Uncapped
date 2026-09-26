@@ -11,6 +11,7 @@ buttons are locked.
 """
 from __future__ import annotations
 
+import html
 import json
 
 import streamlit as st
@@ -75,19 +76,30 @@ def _hero(authenticated: bool) -> None:
     )
     st.title("Uncapped")
     st.markdown(
-        theme.pulse_badge("SYSTEM ONLINE • SPEC ENGINE v2.6 • ZERO BOTTLENECK AUDIT", "good"),
+        '<div style="display:flex; justify-content:center;">'
+        '<span class="uncapped-pulse-badge" style="border-color:'
+        f'{theme.PRIMARY_ACCENT}55; font-size:0.95rem; font-weight:700; letter-spacing:0.08em; '
+        f'color:{theme.PRIMARY_ACCENT};">'
+        f'<span class="uncapped-pulse-dot" style="background:{theme.PRIMARY_ACCENT}; '
+        f'box-shadow:0 0 6px {theme.PRIMARY_ACCENT};"></span>'
+        "SYSTEM OPERATIONAL</span></div>",
         unsafe_allow_html=True,
     )
     st.caption(
         "AI-assisted, spec-driven PC build platform — compatibility, budget, "
         "and synergy, solved for you."
     )
-    st.markdown(
-        "Uncapped takes the guesswork out of building a PC. Pick a budget, a "
-        "workload, or go fully custom — every part list is checked for "
-        "compatibility in real time, scored for synergy, and analyzed for "
-        "bottlenecks before you spend a cent."
-    )
+    with st.expander("ℹ️ SYSTEM CAPABILITIES & ARCHITECTURE OVERVIEW", expanded=True):
+        st.markdown(
+            "- **Zero-Bottleneck Configuration:** Real-time hardware compatibility matrix, power "
+            "load auditing, and dynamic bottleneck detection.\n"
+            "- **Deterministic Budget Engine:** Holistic allocation across core flagships and all "
+            "7 unified peripherals, matching 88%-98% of your ceiling.\n"
+            "- **Intelligent AI Concierge:** Autonomous component rebalancing, multi-intent batch "
+            "changes, and conversational tuning.\n"
+            "- **Community Rig Exchange:** Seamless one-click publishing, telemetry sharing, and "
+            "interactive public build feedback."
+        )
 
     cols = st.columns(3)
     if cols[0].button(
@@ -182,7 +194,14 @@ def _trending_builds_reel(authenticated: bool) -> None:
 def _user_state_panel(authenticated: bool) -> None:
     if authenticated:
         user = current_user()
-        st.markdown(f"#### Welcome back, Architect {sanitize_markdown(user['full_name'])}")
+        st.markdown(
+            '<div style="text-align:center; padding:12px 0;">'
+            '<span style="font-size:1.35rem; font-weight:700; letter-spacing:0.05em; color:#FFFFFF;">'
+            f"Welcome back, "
+            f'<span style="color:{theme.PRIMARY_ACCENT};">Architect {html.escape(user["full_name"])}</span>'
+            "</span></div>",
+            unsafe_allow_html=True,
+        )
         recent_drafts = drafts_repo.get_user_drafts(user["id"])
         if recent_drafts:
             latest = recent_drafts[0]
