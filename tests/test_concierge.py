@@ -478,7 +478,10 @@ def test_modify_build_action_with_new_categories_passes_through(monkeypatch):
     )
 
     assert result["source"] == "llm"
-    assert result["action"] == payload["action"]
+    # model_dump() fills in remove_categories' default ([]), which wasn't in
+    # the raw mocked payload — compare against the raw action with that
+    # default applied rather than the literal dict.
+    assert result["action"] == dict(payload["action"], remove_categories=[])
 
 
 def test_modify_build_action_with_object_shaped_components_is_coerced_to_plain_ids(monkeypatch):
@@ -529,6 +532,112 @@ def test_coerce_component_id_shapes_leaves_already_correct_ids_untouched():
     raw = {"reply": "ok", "action": {"type": "modify_build", "components": {"RAM": 6}, "quantities": {}}}
     coerced = concierge._coerce_component_id_shapes(raw)
     assert coerced["action"]["components"] == {"RAM": 6}
+
+
+# ---------------------------------------------------------------------------
+# remove_categories: root-cause fix for "remove the soundcard/opticaldrive/
+# networkcard" silently degrading to the generic heuristic fallback (a real,
+# confirmed bug — components has no way to express "clear this category",
+# and a live call was caught trying components: {"SoundCard": None, ...},
+# which Pydantic rejects outright).
+# ---------------------------------------------------------------------------
+def test_concierge_response_parses_remove_categories_field():
+    payload = {
+        "reply": "Removed the sound card, optical drive, and network card.",
+        "action": {
+            "type": "modify_build",
+            "components": {},
+            "quantities": {},
+            "remove_categories": ["SoundCard", "OpticalDrive", "NetworkCard"],
+        },
+    }
+    response = ConciergeResponse.model_validate(payload)
+    assert response.action.remove_categories == ["SoundCard", "OpticalDrive", "NetworkCard"]
+
+
+def test_coerce_component_id_shapes_moves_none_valued_components_into_remove_categories():
+    """A real, confirmed live failure: the model tried to signal a removal
+    via `components: {"SoundCard": None}` (the only way it knew, before
+    remove_categories existed) — this fails Pydantic's `dict[str, int]`
+    outright. The coercion moves any None-valued entry into
+    remove_categories BEFORE validation, the same defensive-correction
+    precedent as the object-shaped-components coercion above, so a request
+    combining an old-style None removal with new-style real changes still
+    applies instead of silently degrading."""
+    raw = {
+        "reply": "ok",
+        "action": {
+            "type": "modify_build",
+            "components": {"SoundCard": None, "OpticalDrive": None, "Storage": 7},
+            "quantities": {"Storage": 2},
+        },
+    }
+    coerced = concierge._coerce_component_id_shapes(raw)
+    assert coerced["action"]["components"] == {"Storage": 7}
+    assert sorted(coerced["action"]["remove_categories"]) == ["OpticalDrive", "SoundCard"]
+
+
+def test_coerce_component_id_shapes_merges_none_valued_with_existing_remove_categories():
+    raw = {
+        "reply": "ok",
+        "action": {
+            "type": "modify_build",
+            "components": {"SoundCard": None},
+            "quantities": {},
+            "remove_categories": ["NetworkCard"],
+        },
+    }
+    coerced = concierge._coerce_component_id_shapes(raw)
+    assert sorted(coerced["action"]["remove_categories"]) == ["NetworkCard", "SoundCard"]
+
+
+def test_remove_categories_with_real_categories_applies_and_passes_through(monkeypatch):
+    """The full live-reproduction scenario: removing several peripherals AND
+    changing Storage/RAM components+quantities in ONE modify_build action —
+    must pass validation and reach the caller with source == 'llm', never
+    degrade to the generic 'having trouble reaching the AI assistant'
+    fallback."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Removed the sound card, optical drive, and network card. Adjusted storage and RAM.",
+        "action": {
+            "type": "modify_build",
+            "components": {"Storage": 7, "RAM": 6},
+            "quantities": {"Storage": 2, "RAM": 2},
+            "remove_categories": ["SoundCard", "OpticalDrive", "NetworkCard"],
+            "explanation": "Removed peripherals and adjusted storage/RAM.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "remove the soundcard, opticaldrive, networkcard. also lower the storage to 2 components "
+        "of 2TB each and the ram to 2 components of 2x16 each",
+        [], CATALOG_SUMMARY, COMMUNITY_SUMMARY, current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+    assert result["source"] == "llm"
+    assert result["action"]["remove_categories"] == ["SoundCard", "OpticalDrive", "NetworkCard"]
+    assert result["action"]["components"] == {"Storage": 7, "RAM": 6}
+
+
+def test_remove_categories_with_hallucinated_category_falls_back_to_heuristic(monkeypatch):
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Removed the flux capacitor.",
+        "action": {
+            "type": "modify_build",
+            "components": {},
+            "quantities": {},
+            "remove_categories": ["FluxCapacitor"],
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "remove the flux capacitor",
+        [], CATALOG_SUMMARY, COMMUNITY_SUMMARY, current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+    assert result["source"] == "heuristic"
 
 
 def test_coerce_component_id_shapes_handles_missing_or_non_dict_action():
@@ -1740,6 +1849,78 @@ def test_save_build_action_requires_no_extra_validation_and_passes_validate_acti
     assert result["action"]["type"] == "save_build"
     assert result["action"]["name"] == "My Rig"
     assert result["action"]["destination"] == "build"
+
+
+# ---------------------------------------------------------------------------
+# Intent 14: rebalance budget (downgrade X, use the money to upgrade Y/Z)
+# ---------------------------------------------------------------------------
+def test_concierge_response_parses_rebalance_budget_action():
+    payload = {
+        "reply": "Downgrading the monitor to fund a better CPU and GPU.",
+        "action": {
+            "type": "rebalance_budget",
+            "downgrade_category": "Monitor",
+            "upgrade_categories": ["CPU", "GPU"],
+            "explanation": "Freeing up monitor budget for core performance.",
+        },
+    }
+    response = ConciergeResponse.model_validate(payload)
+    assert response.action is not None
+    assert response.action.type == "rebalance_budget"
+    assert response.action.downgrade_category == "Monitor"
+    assert response.action.upgrade_categories == ["CPU", "GPU"]
+
+
+def test_rebalance_budget_action_with_real_categories_passes_through(monkeypatch):
+    """A real core/peripheral category name for both downgrade_category and
+    every upgrade_categories entry must NOT be rejected by _validate_action
+    — this action carries category NAMES, not catalog ids, but is still a
+    real, confirmed hallucination surface (an invented category) worth
+    guarding, unlike the pure pass-through actions."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Downgrading the monitor to fund a better CPU.",
+        "action": {
+            "type": "rebalance_budget",
+            "downgrade_category": "Monitor",
+            "upgrade_categories": ["CPU"],
+            "explanation": "Freeing up monitor budget.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "downgrade the screen a bit and use the money to upgrade the cpu",
+        [], CATALOG_SUMMARY, COMMUNITY_SUMMARY, current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+    assert result["source"] == "llm"
+    assert result["action"]["type"] == "rebalance_budget"
+    assert result["action"]["downgrade_category"] == "Monitor"
+    assert result["action"]["upgrade_categories"] == ["CPU"]
+
+
+def test_rebalance_budget_action_with_hallucinated_category_falls_back_to_heuristic(monkeypatch):
+    """An invented category name (not a real core or peripheral category)
+    must be rejected by _validate_action and fall to the heuristic path —
+    the same zero-hallucination discipline every other action-carrying
+    category/id gets, extended here from catalog ids to category names."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Downgrading the flux capacitor to fund a better CPU.",
+        "action": {
+            "type": "rebalance_budget",
+            "downgrade_category": "FluxCapacitor",
+            "upgrade_categories": ["CPU"],
+            "explanation": "Not a real category.",
+        },
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "downgrade the flux capacitor and upgrade the cpu",
+        [], CATALOG_SUMMARY, COMMUNITY_SUMMARY, current_build_context=CURRENT_BUILD_CONTEXT,
+    )
+    assert result["source"] == "heuristic"
 
 
 # ---------------------------------------------------------------------------

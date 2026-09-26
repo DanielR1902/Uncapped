@@ -50,6 +50,7 @@ from typing import Any
 import httpx
 from pydantic import ValidationError as PydanticValidationError
 
+from engine.solvers import CATEGORY_ORDER, PERIPHERAL_CATEGORIES
 from llm.schemas import ConciergeResponse
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -315,6 +316,22 @@ You handle thirteen kinds of requests:
    are re-checked by a compatibility engine. If `current_build_context` is `None`/empty (no active build), a
    "modify my build" request has nothing to modify — say so plainly in `reply` and return `action: null`,
    don't invent a `modify_build` against nothing.
+
+   REMOVING A CATEGORY ENTIRELY (e.g. "remove the sound card", "clear the optical drive", "take out the
+   network card and headset", "remove the soundcard, opticaldrive, networkcard") — a real, confirmed failure
+   mode this fixes: `components` can ONLY ever map a category to a real catalog id, NEVER to `null`/`None` —
+   there was no way at all to express a removal before `remove_categories` existed, and trying to signal one
+   via `components: {"SoundCard": null}` fails validation outright and silently degrades the whole response to
+   the generic "having trouble reaching the AI assistant" fallback, for a request that should have worked.
+   List every category to clear in `remove_categories` (e.g. `["SoundCard", "OpticalDrive", "NetworkCard"]`) —
+   NEVER put a category being removed into `components` at all, not even with a `null`/placeholder value. A
+   single message may freely combine removals, additions/swaps (`components`), and quantity changes
+   (`quantities`) in one `modify_build` action, exactly like this round's own verification case: "remove the
+   soundcard, opticaldrive, networkcard. also lower the storage to 2 components of 2TB each and the ram to 2
+   components of 2x16 each" is ONE `modify_build` action with `remove_categories: ["SoundCard", "OpticalDrive",
+   "NetworkCard"]`, `components` naming the real 2TB Storage id and the real 2x16GB RAM kit id, and
+   `quantities: {"Storage": 2, "RAM": 2}` (the TOTAL desired count in each category, per the rule above — "2
+   components of 2TB each" means quantity 2, not 1).
 
    COMPLETING/FINISHING AN EXISTING BUILD (still THIS intent, never intent 3): a request to "complete this
    build" / "finish this build" / "fill in the rest of the parts" / "fill in the remaining parts of this
@@ -741,17 +758,35 @@ You handle thirteen kinds of requests:
 
 13. USE REMAINING BUDGET (e.g. "is there any upgrade possible within my budget?", "how much can you add
     without going over budget?", "upgrade what you can with the remaining budget", "can I upgrade anything
-    with the leftover budget?", "you have 13000 NIS, upgrade it accordingly") — a request specifically about
-    spending budget headroom on upgrades, different from intent 6's generic "how can I optimize?"
-    (informational-only) in that it wants an upgrade ACTUALLY APPLIED. Applies in EITHER of two cases:
+    with the leftover budget?", "you have 13000 NIS, upgrade it accordingly", "you have 1864.68 EUR leeway,
+    use them to upgrade parts where possible") — a request specifically about spending budget headroom on
+    upgrades, different from intent 6's generic "how can I optimize?" (informational-only) in that it wants
+    an upgrade ACTUALLY APPLIED. Applies in EITHER of two cases:
     `current_build_context["mode"] == "Budget"` with a real numeric `budget_ceiling` already set (the ordinary
-    case — no new figure need be stated), OR the message ITSELF states a fresh budget/ceiling figure for the
-    active build even though it's currently Free/Workload mode or has no ceiling yet (e.g. "you have 13000
-    NIS, upgrade it accordingly" against a plain Free-mode build) — in this second case, set `budget_cap_usd`
-    (below) to that figure and the caller converts/keeps the build in Budget mode under it going forward. If
-    NEITHER applies (no active build, still Free/Workload mode AND no figure stated this message), there is no
-    "remaining budget" to reason about — treat the request as intent 6 instead. When it does apply, return
+    case), OR the message ITSELF states a fresh budget/ceiling figure for the active build even though it's
+    currently Free/Workload mode or has no ceiling yet (e.g. "you have 13000 NIS, upgrade it accordingly"
+    against a plain Free-mode build) — in this second case ONLY, set `budget_cap_usd` (below) to that figure
+    and the caller converts/keeps the build in Budget mode under it going forward. If NEITHER applies (no
+    active build, still Free/Workload mode AND no figure stated this message), there is no "remaining budget"
+    to reason about — treat the request as intent 6 instead. When it does apply, return
     `{"type": "use_remaining_budget", "budget_cap_usd": <float>|null, "explanation": "<string>"}`.
+
+    `budget_cap_usd` MUST STAY `null` WHENEVER A REAL `budget_ceiling` ALREADY EXISTS (a real, confirmed bug
+    this closes): a live call was caught treating "you have 1864.68 EUR leeway, use them to upgrade" — sent
+    against a build ALREADY in Budget mode with its own real €4,000 ceiling — as a fresh ceiling STATEMENT,
+    setting `budget_cap_usd` to 1864.68 and thereby OVERWRITING the real €4,000 ceiling down to barely more
+    than the build's own current cost — which made `remaining_headroom` (ceiling minus current total)
+    negative or near-zero on the very next check, so the spend-down loop broke immediately with
+    `Delta: +€0.00`, the exact opposite of what "you have leeway" asked for. The word "leeway"/"remaining"/
+    "left (over)"/"still have" describes HEADROOM UNDER THE EXISTING ceiling, never a replacement for it —
+    when `current_build_context` already carries a real `budget_ceiling` (the ordinary case above), a number
+    stated alongside that wording is NEVER the new `budget_cap_usd`; leave it `null` and let the caller
+    compute the real remaining headroom itself, in Python, from the EXISTING ceiling — exactly the same
+    "never trust the LLM's own budget arithmetic" discipline the DETERMINISTIC ARITHMETIC rule below already
+    demands for every other number in this flow. The fresh-ceiling branch above (setting `budget_cap_usd`
+    to a stated figure) applies ONLY when no real ceiling exists yet at all (Free/Workload mode, or Budget
+    mode with `budget_ceiling` still unset) — never as a way to describe additional room under one that's
+    already there.
 
     BUDGET CURRENCY CONVERSION (the exact same rule as intent 3's own — a narrow, deliberate exception to
     "never do currency math yourself"): when a fresh figure IS stated in this message, determine which
@@ -788,8 +823,37 @@ You handle thirteen kinds of requests:
     is already effectively maxed out, say so plainly instead (e.g. "Your build already uses your budget
     efficiently — there's no further upgrade that fits within your ceiling.") and return `action: null`.
 
+14. REBALANCE BUDGET (e.g. "downgrade the screen a bit and use the money to upgrade the cpu and gpu", "step
+    down the monitor and put the savings into a better GPU", "sell the RAM upgrade to fund a bigger SSD") — a
+    request naming ONE category to downgrade and one or more DIFFERENT categories to fund with the freed
+    money, DISTINCT from intent 4's plain incremental modification (which never involves trading one
+    category's budget for another's) and from intent 13's "use remaining budget" (which never names a
+    category to downgrade). A REAL, CONFIRMED FAILURE MODE THIS FIXES: a live call either refused this
+    combined request outright, or applied it wildly inconsistently — downgrading the named category while
+    leaving the named upgrade categories completely untouched, or downgrading far more than any upgrade
+    recouped — because the model was trusted to invent which exact part to downgrade to, which exact parts
+    to upgrade to, AND the price arithmetic connecting them, all at once. This is now STRUCTURALLY
+    impossible: your ONLY job here is CATEGORY RECOGNITION, never a specific part or price.
+
+    CATEGORY SYNONYMS (recognize by MEANING, never demand an exact model name): "screen"/"display" ->
+    `"Monitor"`; "graphics card"/"video card" -> `"GPU"`; "processor" -> `"CPU"`; ordinary category names
+    (RAM, Storage, Case, Cooler, PSU, Motherboard, Keyboard, Mouse, Headset) are recognized as themselves.
+    Requires an active build (`current_build_context` non-empty) with the NAMED downgrade category actually
+    selected — if there's no active build, or the named downgrade category isn't currently part of it, say so
+    plainly and return `action: null` rather than guessing.
+
+    Return `{"type": "rebalance_budget", "downgrade_category": "<real category name>", "upgrade_categories":
+    ["<real category name>", ...], "explanation": "<string>"}`. The caller (`engine.solvers.rebalance_budget`,
+    via `ui/components/chat_assistant.py`) deterministically steps the downgrade category down one real tier
+    (the priciest real compatible option still cheaper than the current pick), computes the exact real freed
+    cash, and spends it — plus any budget headroom that already existed — upgrading each named category, in
+    the order given, to the priciest real compatible option that still fits, never exceeding the ceiling. You
+    never state a specific part, price, or delta in `reply` — the caller appends the real before -> after
+    telemetry line (bottleneck/synergy/cost delta), the exact same authoritative-line discipline intent 13
+    already follows.
+
 ENGLISH-ONLY RULE: you only communicate in English. If the user writes in any other language, do not answer
-their request in that language and do not attempt any of the thirteen intents above for that message — reply,
+their request in that language and do not attempt any of the fourteen intents above for that message — reply,
 politely and concisely, in English only, that you currently only operate in English and ask them to
 rephrase their request in English. Return `action: null` in that case; do not guess at or partially fulfill
 a non-English request. This applies regardless of how well you understand the other language — the
@@ -1073,6 +1137,15 @@ def _validate_action(
     ):
         return
 
+    if action.type == "rebalance_budget":
+        valid_categories = set(CATEGORY_ORDER) | set(PERIPHERAL_CATEGORIES)
+        for category in (action.downgrade_category, *action.upgrade_categories):
+            if category not in valid_categories:
+                raise ConciergeUnavailableError(
+                    f"Concierge rebalance_budget action references an unknown category: {category!r}"
+                )
+        return
+
     if action.type == "save_build":
         if action.source == "community":
             valid_post_ids = {
@@ -1138,6 +1211,13 @@ def _validate_action(
                     f"Concierge modify_build action references a quantity for non-quantity-eligible "
                     f"category {category!r}"
                 )
+        valid_categories = set(CATEGORY_ORDER) | set(PERIPHERAL_CATEGORIES)
+        for category in action.remove_categories:
+            if category not in valid_categories:
+                raise ConciergeUnavailableError(
+                    f"Concierge modify_build action references an unknown remove_categories entry: "
+                    f"{category!r}"
+                )
 
 
 def _coerce_component_id_shapes(raw: dict) -> dict:
@@ -1172,6 +1252,29 @@ def _coerce_component_id_shapes(raw: dict) -> dict:
         category: value["id"] if isinstance(value, dict) and isinstance(value.get("id"), int) else value
         for category, value in components.items()
     }
+    # A second, related defensive coercion (same "Python corrects what the
+    # LLM sometimes gets wrong" precedent as above): `components` can only
+    # ever map a category to a real int id — it has no way to express
+    # "remove this category," and `remove_categories` (the real field for
+    # that, spec.md §6.7 intent 4) is a much newer addition the model may
+    # still occasionally forget under the STRICT BREVITY RULE's pressure to
+    # answer fast, reverting to the more "obvious"-seeming `None`/`null`
+    # instead. Move any `None`-valued entry out of `components` (which would
+    # otherwise fail Pydantic's `dict[str, int]` type and silently fall back
+    # to the generic heuristic reply for a request that should have worked)
+    # into `remove_categories` before validation, rather than relying on
+    # prompt wording alone to prevent it.
+    none_valued = [category for category, value in action["components"].items() if value is None]
+    if none_valued:
+        action["components"] = {
+            category: value for category, value in action["components"].items() if value is not None
+        }
+        existing_removals = action.get("remove_categories")
+        merged_removals = list(existing_removals) if isinstance(existing_removals, list) else []
+        for category in none_valued:
+            if category not in merged_removals:
+                merged_removals.append(category)
+        action["remove_categories"] = merged_removals
     return raw
 
 
@@ -1296,7 +1399,7 @@ def get_concierge_response(
     Never raises. Returns
     {"reply": str,
      "action": {"type": "load_build", "components": {category: component_id}, "explanation": str}
-              | {"type": "modify_build", "components": {category: component_id}, "quantities": {category: int}, "explanation": str}
+              | {"type": "modify_build", "components": {category: component_id}, "quantities": {category: int}, "remove_categories": [category, ...], "explanation": str}
               | {"type": "navigate", "navigate_to": "landing" | "create_build" | "my_builds" | "community" | "drafts", "reset_mode": bool}
               | {"type": "save_build", "name": str, "destination": "draft" | "build", "publish_immediately": bool, "author_notes": str | None, "flair": "Rate My Build" | "Looking for Help" | None, "explanation": str}
               | {"type": "publish_build", "author_notes": str | None, "flair": "Rate My Build" | "Looking for Help"}
@@ -1325,7 +1428,16 @@ def get_concierge_response(
         raw = _coerce_component_id_shapes(raw)
         response = ConciergeResponse.model_validate(raw)
         _validate_action(response, catalog_summary, community_summary, drafts_summary, previous_builds_summary)
-    except (ConciergeUnavailableError, PydanticValidationError):
+    except (ConciergeUnavailableError, PydanticValidationError) as exc:
+        # An ANTICIPATED failure mode (missing config, network error, a
+        # response that fails schema validation) — still logs its own
+        # message to stderr (not a full traceback like the genuinely
+        # unexpected case below) so a real, recurring validation mismatch
+        # is diagnosable rather than silently invisible behind the generic
+        # heuristic reply; a live, confirmed case was previously completely
+        # silent here (a `PydanticValidationError` from the model trying
+        # `components: {"SoundCard": null}` — see remove_categories above).
+        print(f"Concierge falling back to heuristic: {exc}", file=sys.stderr)
         return _heuristic_response()
     except Exception:
         # A genuinely UNEXPECTED failure (a real bug, not one of the

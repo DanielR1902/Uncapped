@@ -46,8 +46,17 @@ CATEGORY_ORDER: tuple[str, ...] = (
 
 # Optional add-on categories with no deterministic compatibility rules beyond
 # being optional (spec.md §5.1) — eligible for opt-in surplus-budget auto-fill
-# in initialize_budget_build (see _fill_peripherals_with_surplus).
-PERIPHERAL_CATEGORIES: tuple[str, ...] = ("NetworkCard", "SoundCard", "OpticalDrive")
+# in initialize_budget_build (see _fill_peripherals_with_surplus). Unified
+# (a later round's deliberate decision, reversing the prior "desk peripherals
+# are manual-pick-only, never auto-filled" split): desk/setup peripherals
+# (Monitor/Keyboard/Mouse/Headset) are listed first, ahead of the internal
+# expansion-slot categories, since a monitor/keyboard/mouse/headset matters
+# more to an actual finished setup than a WiFi/sound card/optical drive —
+# `_fill_peripherals_with_surplus` walks this tuple in order, so this list's
+# order IS the real spend priority, not just documentation.
+PERIPHERAL_CATEGORIES: tuple[str, ...] = (
+    "Monitor", "Keyboard", "Mouse", "Headset", "NetworkCard", "SoundCard", "OpticalDrive",
+)
 
 
 def filter_compatible(candidates: list[Component], build_state: BuildState, category: str) -> list[Component]:
@@ -189,6 +198,75 @@ def resolve_compatibility_issues(build_state: BuildState, quantities: dict[str, 
                 break
 
     return patch
+
+
+def rebalance_budget(
+    build_state: BuildState,
+    downgrade_category: str,
+    upgrade_categories: list[str],
+    ceiling: float,
+) -> BuildState:
+    """Deterministic engine behind the AI Concierge's "downgrade X and use
+    the money to upgrade Y/Z" request (spec.md §6.7 intent 14) — never
+    LLM-driven part selection, per this project's own architecture rule that
+    budget arithmetic is never LLM-gated (root CLAUDE.md, the same precedent
+    `resolve_compatibility_issues` above and `llm.advisory`'s stretch-budget
+    validation already established): the Concierge only recognizes WHICH
+    categories are involved, this function does the actual price arithmetic
+    and part selection.
+
+    Two deterministic passes, never mutating the input:
+    1. `downgrade_category` steps down exactly ONE real tier — the priciest
+       real compatible option that's still cheaper than the current pick
+       (never the cheapest possible one; "downgrade a bit," not "gut it").
+       A no-op if `downgrade_category` isn't currently selected, or already
+       the cheapest compatible option in its category.
+    2. Each of `upgrade_categories`, in the given order, is stepped up to the
+       single PRICIEST real compatible option that still fits the ceiling —
+       computed fresh before each category (so an earlier upgrade's own
+       spend is already reflected), using the SAME real-price/real-
+       compatibility data every other engine function in this module reads,
+       never a fabricated number. A category already at its priciest
+       compatible option, or with no affordable pricier option at all, is
+       simply left untouched — never forced, never exceeding the ceiling.
+
+    `downgrade_category` is skipped if it also appears in `upgrade_categories`
+    (never both downgraded and upgraded in the same call). Returns a NEW
+    dict — the caller decides how/whether to commit it."""
+    result = dict(build_state)
+
+    current = result.get(downgrade_category)
+    if current is not None:
+        others = {c: v for c, v in result.items() if c != downgrade_category}
+        candidates = get_compatible_candidates(downgrade_category, others)
+        cheaper = sorted(
+            (c for c in candidates if c.id != current.id and c.price_usd < current.price_usd),
+            key=lambda c: c.price_usd,
+        )
+        if cheaper:
+            result[downgrade_category] = cheaper[-1]  # priciest of the cheaper options = one real tier down
+
+    for category in upgrade_categories:
+        if category == downgrade_category:
+            continue
+        current_total = sum(c.price_usd for c in result.values())
+        headroom = ceiling - current_total
+        if headroom <= 0:
+            continue
+        existing = result.get(category)
+        floor_price = existing.price_usd if existing is not None else 0.0
+        others = {c: v for c, v in result.items() if c != category}
+        candidates = get_compatible_candidates(category, others)
+        affordable_upgrades = [
+            c for c in candidates
+            if (existing is None or c.id != existing.id)
+            and c.price_usd > floor_price
+            and c.price_usd - floor_price <= headroom
+        ]
+        if affordable_upgrades:
+            result[category] = max(affordable_upgrades, key=lambda c: c.price_usd)
+
+    return result
 
 
 def _cheapest_price(category: str, build_state: BuildState) -> float:
@@ -500,9 +578,12 @@ def _fill_peripherals_with_surplus(core_build: BuildState, ceiling: float) -> Bu
     """Phase 2 of Budget-mode generation, opt-in via
     `initialize_budget_build(..., fill_peripherals_with_surplus=True)`: after
     the 8 core categories are filled and within ceiling, spend whatever's
-    left over on optional peripherals. NetworkCard/SoundCard/OpticalDrive
-    have no deterministic compatibility rules (spec.md §5.1) — they're
-    always compatible with everything — so this only needs a price check,
+    left over on optional peripherals — all 7 unified categories (Monitor/
+    Keyboard/Mouse/Headset/NetworkCard/SoundCard/OpticalDrive, a later
+    round's merge of what used to be two separate manual-only/auto-fill
+    groups). None of the 7 have deterministic compatibility rules (spec.md
+    §5.1) — they're always compatible with everything — so this only needs
+    a price check,
     not a compatibility filter, though it still runs candidates through
     `get_compatible_candidates` for consistency and in case a future rule
     ever does constrain a peripheral. Tries each peripheral category in

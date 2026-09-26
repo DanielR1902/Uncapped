@@ -89,6 +89,29 @@ def _register(at: AppTest, username: str, email: str, full_name: str, password: 
     return at
 
 
+def _ceiling_above_catalog_true_max(margin: float = 2000.0) -> float:
+    """A budget ceiling GUARANTEED above the catalog's own true maximum
+    possible full-build cost (core categories + all unified peripherals,
+    every category's single priciest real option, summed) — computed live
+    against whatever the catalog actually contains, rather than a hardcoded
+    literal. This exact class of test (anything relying on genuine,
+    un-saturated headroom surviving `_spend_up_remaining_headroom`/
+    `_fill_peripherals_with_surplus`) has already needed its hardcoded
+    ceiling bumped THREE times across three separate catalog-enrichment
+    rounds (the spend-up pass's own fix, then 4TB/8TB storage, then
+    unifying all 7 peripherals into the surplus-fill) — a live-computed
+    floor makes this test immune to a fourth, rather than reactively
+    patching a magic number again next time the catalog grows."""
+    from db.repositories import components_repo
+    from engine import solvers
+
+    theoretical_max = sum(
+        max(c.price_usd for c in components_repo.get_by_category(cat))
+        for cat in solvers.CATEGORY_ORDER + solvers.PERIPHERAL_CATEGORIES
+    )
+    return theoretical_max + margin
+
+
 # ---------------------------------------------------------------------------
 # ui/state.py — pure data helpers (no Streamlit runtime needed)
 # ---------------------------------------------------------------------------
@@ -1719,19 +1742,22 @@ def test_apply_stretch_upgrade_locks_per_build(seeded_db, monkeypatch):
 
     Ceiling chosen ABOVE the catalog's own true maximum possible full-build
     cost (peripherals included), not just distinct from other tests'
-    ceilings: the RAM/Storage quantity stepper is budget-aware
-    (`ui.state.resolve_effective_quantity_limit`), and this stretch action
-    deliberately pushes RAM quantity to 2. `engine.solvers`'s
+    ceilings, via `_ceiling_above_catalog_true_max()` (see its own docstring
+    — a live-computed floor rather than a hardcoded literal, since that
+    literal has already needed bumping three times across three separate
+    catalog-enrichment rounds): the RAM/Storage quantity stepper is
+    budget-aware (`ui.state.resolve_effective_quantity_limit`), and this
+    stretch action deliberately pushes RAM quantity to 2. `engine.solvers`'s
     `_spend_up_remaining_headroom` pass now converges an ACHIEVABLE ceiling
     to ~99.9%+ utilization by design (a real, confirmed under-utilization
-    bug fix — see `engine/CLAUDE.md`), so a lower, achievable ceiling like
-    the $2000 this test used to use would now leave no real budget-effective
-    headroom for that 2nd RAM kit, and the part-picker's own pre-clamp
-    (correctly, generically) would immediately clamp the just-applied
-    quantity back down to 1 on the very next render — a real product
-    interaction, but not what this test is exercising. A ceiling above the
-    catalog's true max can never be fully spent by any solver, guaranteeing
-    real headroom regardless of how good the convergence algorithm gets."""
+    bug fix — see `engine/CLAUDE.md`), so a lower, achievable ceiling would
+    leave no real budget-effective headroom for that 2nd RAM kit, and the
+    part-picker's own pre-clamp (correctly, generically) would immediately
+    clamp the just-applied quantity back down to 1 on the very next render
+    — a real product interaction, but not what this test is exercising. A
+    ceiling above the catalog's true max can never be fully spent by any
+    solver, guaranteeing real headroom regardless of how good the
+    convergence algorithm gets."""
     import ui.views.create_build as create_build_module
 
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
@@ -1739,7 +1765,7 @@ def test_apply_stretch_upgrade_locks_per_build(seeded_db, monkeypatch):
     _register(at, "apply3", "apply3@example.com", "Apply Three")
     at.get_by_key("nav_create_build").click().run()
     at.get_by_key("mode_budget").click().run()
-    at.get_by_key("budget_ceiling_input").set_value(5750.0).run()
+    at.get_by_key("budget_ceiling_input").set_value(_ceiling_above_catalog_true_max()).run()
     at.get_by_key("apply_budget_generate").click().run()
 
     def _set_quantity_stretch_advisory(
@@ -1787,14 +1813,19 @@ def test_apply_stretch_set_quantity_action_updates_quantity(seeded_db, monkeypat
     catalog lookup meant for swaps.
 
     Ceiling chosen ABOVE the catalog's own true maximum possible full-build
-    cost, not just distinct from other tests' ceilings — see
-    test_apply_stretch_upgrade_locks_per_build's docstring: the RAM/Storage
-    quantity stepper is budget-aware, and `_spend_up_remaining_headroom`
-    converges an ACHIEVABLE ceiling to ~99.9%+ by design, so a tight (or, as
-    of this catalog's 4TB/8TB NVMe additions, no-longer-safely-above-max
-    $5000) ceiling would let its own pre-clamp immediately re-clamp this
-    test's just-applied qty=2 back down to 1 on the next render, which isn't
-    what this test is about."""
+    cost, not just distinct from other tests' ceilings — via
+    `_ceiling_above_catalog_true_max()` (see test_apply_stretch_upgrade_locks_per_build's
+    docstring for why a live-computed floor replaced a hardcoded literal
+    here): the RAM/Storage quantity stepper is budget-aware, and
+    `_spend_up_remaining_headroom` converges an ACHIEVABLE ceiling to
+    ~99.9%+ by design, so a tight (or no-longer-safely-above-max, as this
+    catalog keeps growing) ceiling would let its own pre-clamp immediately
+    re-clamp this test's just-applied qty=2 back down to 1 on the next
+    render, which isn't what this test is about. A distinct `margin` from
+    the OTHER stretch test's call keeps the two tests' ceilings numerically
+    distinct too, so their advisory cache keys can't collide (see that
+    test's docstring for why that matters given the shared-default
+    `stretch_applied_keys` set)."""
     import ui.views.create_build as create_build_module
 
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
@@ -1802,10 +1833,7 @@ def test_apply_stretch_set_quantity_action_updates_quantity(seeded_db, monkeypat
     _register(at, "apply5", "apply5@example.com", "Apply Five")
     at.get_by_key("nav_create_build").click().run()
     at.get_by_key("mode_budget").click().run()
-    # Distinct ceiling so this cache key can't collide with another test's
-    # default-$1500 budget build (see test_apply_stretch_upgrade_locks_per_build's
-    # docstring for why that matters given the shared-default stretch_applied_keys set).
-    at.get_by_key("budget_ceiling_input").set_value(6500.0).run()
+    at.get_by_key("budget_ceiling_input").set_value(_ceiling_above_catalog_true_max(margin=2500.0)).run()
     at.get_by_key("apply_budget_generate").click().run()
 
     def _set_quantity_stretch_advisory(
@@ -3515,16 +3543,98 @@ def test_concierge_modify_build_patches_without_disturbing_other_categories(seed
     assert components["OpticalDrive"] == optical_drive.id
 
     # Independent proof the Concierge-driven peripheral picks actually render
-    # in create_build.py's "Optional peripherals" expander with zero glue
-    # code: that expander's render_part_picker calls are generic over
-    # PERIPHERAL_CATEGORIES/build_state regardless of how a component got
-    # into build_draft, so a filled NetworkCard/OpticalDrive slot must show
-    # the same "cleared via ✕" button (key=f"clear_{category}") a manually
-    # picked slot would — its mere presence (get_by_key raises if the widget
-    # wasn't rendered at all) confirms the expander picked up the LLM-added
-    # peripherals on this same render, with no create_build.py changes needed.
+    # in create_build.py's unified "Optional Peripherals & Battlestation
+    # Setup" section with zero glue code: that section's render_part_picker
+    # calls are generic over PERIPHERAL_CATEGORIES/build_state regardless of
+    # how a component got into build_draft, so a filled NetworkCard/
+    # OpticalDrive slot must show the same "cleared via ✕" button
+    # (key=f"clear_{category}") a manually picked slot would — its mere
+    # presence (get_by_key raises if the widget wasn't rendered at all)
+    # confirms the section picked up the LLM-added peripherals on this same
+    # render, with no create_build.py changes needed.
     assert at.get_by_key("clear_NetworkCard") is not None
     assert at.get_by_key("clear_OpticalDrive") is not None
+
+
+def test_concierge_modify_build_removes_categories_and_changes_others_in_one_action(seeded_db, monkeypatch):
+    """Root-cause regression test for a real, confirmed bug: a request to
+    remove several peripherals (which previously had NO way to be expressed
+    — components only ever maps a category to a real id, never null/None —
+    a live call trying components: {"SoundCard": None, ...} failed Pydantic
+    validation outright and silently degraded the WHOLE response to the
+    generic "having trouble reaching the AI assistant" fallback) combined
+    with real Storage/RAM component + quantity changes in ONE modify_build
+    action must apply the removals, the swaps, AND the quantities —
+    never crash, never partially apply."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "concierge6", "concierge6@example.com", "Concierge Six")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_free").click().run()
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+    at.get_by_key(f"select_CPU_{cpu.id}").click().run()
+    at.get_by_key(f"select_GPU_{gpu.id}").click().run()
+
+    network_card = components_repo.get_by_category("NetworkCard")[0]
+    sound_card = components_repo.get_by_category("SoundCard")[0]
+    optical_drive = components_repo.get_by_category("OpticalDrive")[0]
+    at.get_by_key(f"select_NetworkCard_{network_card.id}").click().run()
+    at.get_by_key(f"select_SoundCard_{sound_card.id}").click().run()
+    at.get_by_key(f"select_OpticalDrive_{optical_drive.id}").click().run()
+
+    storage_2tb = next(
+        c for c in components_repo.get_by_category("Storage")
+        if c.interface == "NVMe" and c.capacity_gb == 2000
+    )
+    ram_2x16 = next(
+        c for c in components_repo.get_by_category("RAM")
+        if "2x16GB" in c.name
+    )
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Removed the sound card, optical drive, and network card. Adjusted storage and RAM.",
+            "action": {
+                "type": "modify_build",
+                "components": {"Storage": storage_2tb.id, "RAM": ram_2x16.id},
+                "quantities": {"Storage": 2, "RAM": 2},
+                "remove_categories": ["SoundCard", "OpticalDrive", "NetworkCard"],
+                "explanation": "Removed peripherals, adjusted storage/RAM.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at.get_by_key("concierge_chat_input").set_value(
+        "remove the soundcard, opticaldrive, networkcard. also lower the storage to 2 components "
+        "of 2TB each and the ram to 2 components of 2x16 each"
+    ).run()
+
+    assert not at.exception
+    draft = at.session_state["build_draft"]
+    components = draft["components"]
+    assert "SoundCard" not in components
+    assert "OpticalDrive" not in components
+    assert "NetworkCard" not in components
+    assert components["CPU"] == cpu.id  # untouched
+    assert components["GPU"] == gpu.id  # untouched
+    assert components["Storage"] == storage_2tb.id
+    assert components["RAM"] == ram_2x16.id
+    assert draft["quantities"].get("Storage") == 2
+    assert draft["quantities"].get("RAM") == 2
+
+    # Never the generic fallback reply — the action actually applied.
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "having trouble reaching the AI assistant" not in last_message
 
 
 def test_concierge_modify_build_quantity_request_is_clamped_to_real_limit(seeded_db, monkeypatch):

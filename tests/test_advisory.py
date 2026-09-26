@@ -84,6 +84,31 @@ def _valid_payload_with_swaps(build_state: dict) -> dict:
     return payload
 
 
+def _valid_payload_with_stretch_swap(build_state: dict) -> dict:
+    """A VALID_ADVISORY_PAYLOAD variant whose stretch_budget.actions carries
+    a real, genuinely pricier CPU swap with a matching real added_cost_usd —
+    for tests that just want an ordinary successful LLM pass-through
+    (source == "llm") without exercising the empty-stretch-actions
+    false-negative cross-check (get_build_advisory now substitutes the
+    deterministic heuristic's own real stretch suggestion whenever the LLM's
+    own actions list is empty AND a real one exists — correct behavior for
+    the bug that closes, but a plain empty-actions stub no longer keeps
+    these tests decoupled from make_build_state()'s own real CPU headroom
+    the way it used to)."""
+    payload = json.loads(json.dumps(VALID_ADVISORY_PAYLOAD))
+    cpu_candidates = solvers.get_compatible_candidates("CPU", build_state)
+    pricier = min(
+        (c for c in cpu_candidates if c.price_usd > build_state["CPU"].price_usd), key=lambda c: c.price_usd,
+    )
+    delta = pricier.price_usd - build_state["CPU"].price_usd
+    payload["stretch_budget"] = {
+        "explanation": f"Upgrade CPU to {pricier.name}.",
+        "actions": [{"action": "swap", "category": "CPU", "replace_with_id": pricier.id}],
+        "added_cost_usd": delta,
+    }
+    return payload
+
+
 def _fake_openrouter_response(payload: dict, status_code: int = 200) -> httpx.Response:
     body = {"choices": [{"message": {"content": json.dumps(payload)}}]}
     return httpx.Response(status_code, json=body, request=httpx.Request("POST", advisory.OPENROUTER_URL))
@@ -146,38 +171,41 @@ def test_build_advisory_response_requires_all_four_keys(missing_key):
 # ---------------------------------------------------------------------------
 def test_get_build_advisory_success(seeded_db, monkeypatch):
     _set_env(monkeypatch)
-
-    def fake_post(url, timeout=None, headers=None, json=None):
-        return _fake_openrouter_response(VALID_ADVISORY_PAYLOAD)
-
-    monkeypatch.setattr(advisory.httpx, "post", fake_post)
-
     build_state = make_build_state()
+    # A real, valid stretch swap (not the base fixture's empty actions) so
+    # the false-negative cross-check (get_build_advisory substitutes the
+    # heuristic's own real stretch suggestion whenever the LLM's own actions
+    # list is empty AND a real one exists) doesn't fire here — this test
+    # wants an ordinary llm pass-through, not that cross-check's own path.
+    payload = _valid_payload_with_stretch_swap(build_state)
+
+    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
     result = advisory.get_build_advisory(build_state, mode="Budget", current_budget_or_cost=1500.0)
 
-    assert result == {
-        "pros": VALID_ADVISORY_PAYLOAD["pros"],
-        "cons": VALID_ADVISORY_PAYLOAD["cons"],
-        "within_budget": VALID_ADVISORY_PAYLOAD["within_budget"],
-        "stretch_budget": VALID_ADVISORY_PAYLOAD["stretch_budget"],
-        "source": "llm",
-    }
+    assert result["source"] == "llm"
+    assert result["pros"] == payload["pros"]
+    assert result["cons"] == payload["cons"]
+    assert result["within_budget"] == payload["within_budget"]
+    assert result["stretch_budget"]["actions"] == payload["stretch_budget"]["actions"]
+    assert result["stretch_budget"]["added_cost_usd"] == payload["stretch_budget"]["added_cost_usd"]
 
 
 def test_get_build_advisory_success_sets_source_llm_even_if_absent(seeded_db, monkeypatch):
     _set_env(monkeypatch)
+    build_state = make_build_state()
+    stretch_payload = _valid_payload_with_stretch_swap(build_state)["stretch_budget"]
     payload_without_source = {
         "pros": ["strength"],
         "cons": ["limitation"],
         "within_budget": {"explanation": "tip", "swaps": [], "can_optimize_further": False},
-        "stretch_budget": {"explanation": "upgrade", "actions": [], "added_cost_usd": 0.0},
+        "stretch_budget": stretch_payload,
     }
 
     monkeypatch.setattr(
         advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload_without_source)
     )
 
-    build_state = make_build_state()
     result = advisory.get_build_advisory(build_state, mode="Free", current_budget_or_cost=950.0)
     assert result["source"] == "llm"
 
@@ -324,9 +352,13 @@ def test_get_build_advisory_falls_back_on_missing_key(seeded_db, monkeypatch):
 # ---------------------------------------------------------------------------
 def test_budget_mode_with_ceiling_works_without_error(seeded_db, monkeypatch):
     _set_env(monkeypatch)
-    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(VALID_ADVISORY_PAYLOAD))
+    build_state = make_build_state()
+    monkeypatch.setattr(
+        advisory.httpx, "post",
+        lambda *a, **k: _fake_openrouter_response(_valid_payload_with_stretch_swap(build_state)),
+    )
 
-    result = advisory.get_build_advisory(make_build_state(), mode="Budget", current_budget_or_cost=1500.0)
+    result = advisory.get_build_advisory(build_state, mode="Budget", current_budget_or_cost=1500.0)
     assert result["source"] == "llm"
 
 
@@ -349,7 +381,10 @@ def test_free_mode_with_current_cost_works_without_error(seeded_db, monkeypatch)
     _set_env(monkeypatch)
     build_state = make_build_state()
     current_cost = sum(c.price_usd for c in build_state.values())
-    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(VALID_ADVISORY_PAYLOAD))
+    monkeypatch.setattr(
+        advisory.httpx, "post",
+        lambda *a, **k: _fake_openrouter_response(_valid_payload_with_stretch_swap(build_state)),
+    )
 
     result = advisory.get_build_advisory(build_state, mode="Free", current_budget_or_cost=current_cost)
     assert result["source"] == "llm"
@@ -402,15 +437,15 @@ def test_workload_mode_payload_includes_profile_and_zero_remaining_budget(seeded
     the workload_profile the caller supplied must reach the LLM payload
     verbatim so the model can apply the Workload-mode objective."""
     _set_env(monkeypatch)
+    build_state = make_build_state()
     captured_payload = {}
 
     def fake_post(url, timeout=None, headers=None, json=None):
         captured_payload.update(json)
-        return _fake_openrouter_response(VALID_ADVISORY_PAYLOAD)
+        return _fake_openrouter_response(_valid_payload_with_stretch_swap(build_state))
 
     monkeypatch.setattr(advisory.httpx, "post", fake_post)
 
-    build_state = make_build_state()
     current_cost = sum(c.price_usd for c in build_state.values())
     result = advisory.get_build_advisory(
         build_state, mode="Workload", current_budget_or_cost=current_cost, profile="Gaming"
@@ -463,11 +498,13 @@ def test_budget_mode_at_ceiling_has_zero_remaining_budget(seeded_db, monkeypatch
     payload = advisory._build_request_payload(build_state, "Budget", total_cost, None, resolved_info)
     assert payload["remaining_budget"] == 0.0
 
-    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(VALID_ADVISORY_PAYLOAD))
+    monkeypatch.setattr(
+        advisory.httpx, "post",
+        lambda *a, **k: _fake_openrouter_response(_valid_payload_with_stretch_swap(build_state)),
+    )
     result = advisory.get_build_advisory(build_state, mode="Budget", current_budget_or_cost=total_cost)
     assert result["source"] == "llm"
     assert result["within_budget"] == VALID_ADVISORY_PAYLOAD["within_budget"]
-    assert result["stretch_budget"] == VALID_ADVISORY_PAYLOAD["stretch_budget"]
 
 
 def test_heuristic_workload_mode_mentions_profile_by_name(seeded_db, monkeypatch):
@@ -553,6 +590,10 @@ def test_get_build_advisory_accepts_real_swap_ids(seeded_db, monkeypatch):
     _set_env(monkeypatch)
     build_state = make_build_state()
     good_payload = _valid_payload_with_swaps(build_state)
+    # Also give stretch_budget a real action (not the base fixture's empty
+    # one) so the false-negative cross-check doesn't substitute the
+    # heuristic's own suggestion here — this test is about within_budget.swaps.
+    good_payload["stretch_budget"] = _valid_payload_with_stretch_swap(build_state)["stretch_budget"]
 
     monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(good_payload))
     result = advisory.get_build_advisory(build_state, mode="Budget", current_budget_or_cost=1500.0)

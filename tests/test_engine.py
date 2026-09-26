@@ -453,12 +453,21 @@ def test_budget_solver_never_exceeds_catalogs_true_maximum_possible_cost(seeded_
     reached by any algorithm -- not a solver defect, a hard data ceiling.
     This is the exact scenario a live "6000 EUR" report turned out to be:
     the catalog's real maximum is well under that figure, so ~65% utilization
-    was already the correct, maximum-possible answer, not under-spending."""
+    was already the correct, maximum-possible answer, not under-spending.
+
+    theoretical_max includes CATEGORY_ORDER (the 8 core slots) AND
+    PERIPHERAL_CATEGORIES (now all 7 unified categories, a later round's
+    merge) since fill_peripherals_with_surplus=True lets the solver spend on
+    both -- a core-only bound would be a real, confirmed false failure here
+    once the peripheral catalog got rich enough to matter (verified: this
+    test failed with `7227.0 <= 5182.0` when it summed core categories only,
+    not because the solver overspent, but because the bound itself excluded
+    money the solver is legitimately allowed to spend)."""
     from db.repositories import components_repo
 
     theoretical_max = sum(
         max(c.price_usd for c in components_repo.get_by_category(cat))
-        for cat in solvers.CATEGORY_ORDER
+        for cat in solvers.CATEGORY_ORDER + solvers.PERIPHERAL_CATEGORIES
     )
     ceiling = theoretical_max * 2  # deliberately unreachable
     build = solvers.initialize_budget_build(ceiling, fill_peripherals_with_surplus=True)
@@ -483,6 +492,58 @@ def test_budget_solver_spend_up_pass_never_touches_a_caller_pinned_category(seed
     )
     assert build["GPU"].id == cheapest_gpu.id
     assert sum(c.price_usd for c in build.values()) <= ceiling
+
+
+def test_rebalance_budget_downgrades_one_tier_and_funds_named_upgrades(seeded_db):
+    """engine.solvers.rebalance_budget (spec.md §6.7 intent 14): downgrading
+    a named category one real tier down, then spending the freed cash (plus
+    any existing headroom) upgrading named categories to the priciest real
+    option that still fits — the deterministic engine behind the AI
+    Concierge's "downgrade X and use the money to upgrade Y" request, a real,
+    confirmed gap where the model was previously trusted to invent this
+    arithmetic itself and did so unreliably."""
+    from db.repositories import components_repo
+
+    monitors = sorted(components_repo.get_by_category("Monitor"), key=lambda c: c.price_usd)
+    assert len(monitors) >= 2, "fixture catalog must have at least 2 real Monitor tiers"
+    priciest_monitor = monitors[-1]
+    one_tier_down = monitors[-2]
+
+    build = solvers.initialize_budget_build(2000.0, fill_peripherals_with_surplus=True)
+    build["Monitor"] = priciest_monitor
+    ceiling = sum(c.price_usd for c in build.values()) + 50.0  # some real headroom too
+
+    original_cpu = build["CPU"]
+    result = solvers.rebalance_budget(build, "Monitor", ["CPU"], ceiling)
+
+    assert result["Monitor"].id == one_tier_down.id
+    assert result["Monitor"].price_usd < priciest_monitor.price_usd
+    assert sum(c.price_usd for c in result.values()) <= ceiling
+    # CPU should have moved (a real, compatible, pricier option existed and
+    # fit within the freed cash + existing headroom) -- not a strict
+    # requirement in every catalog shape, but true for this one.
+    assert result["CPU"].price_usd >= original_cpu.price_usd
+    # Every other category is untouched.
+    for category in solvers.CATEGORY_ORDER:
+        if category != "CPU":
+            assert result[category].id == build[category].id
+
+
+def test_rebalance_budget_never_exceeds_ceiling_and_never_touches_unnamed_categories(seeded_db):
+    from db.repositories import components_repo
+
+    monitors = sorted(components_repo.get_by_category("Monitor"), key=lambda c: c.price_usd)
+    build = solvers.initialize_budget_build(1500.0, fill_peripherals_with_surplus=True)
+    build["Monitor"] = monitors[-1]
+    tight_ceiling = sum(c.price_usd for c in build.values())  # zero extra headroom
+
+    result = solvers.rebalance_budget(build, "Monitor", ["GPU", "RAM"], tight_ceiling)
+    assert sum(c.price_usd for c in result.values()) <= tight_ceiling
+    for category in solvers.CATEGORY_ORDER + solvers.PERIPHERAL_CATEGORIES:
+        if category not in ("Monitor", "GPU", "RAM"):
+            assert result.get(category, None) == build.get(category, None) or (
+                category not in build and category not in result
+            )
 
 
 def test_budget_solver_degrades_gracefully_on_unrealistic_ceiling(seeded_db):

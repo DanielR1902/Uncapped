@@ -33,13 +33,16 @@ from ui.components.part_picker import render_part_picker
 from ui.format import format_currency, humanize_profile, sanitize_markdown
 
 CORE_CATEGORIES = solvers.CATEGORY_ORDER
+# Unified peripherals (spec.md §7.4 — a later round's deliberate merge of
+# what used to be two separate sections/lists: desk/setup peripherals
+# Monitor/Keyboard/Mouse/Headset were manual-pick-only and excluded from
+# engine.solvers entirely; they're now part of the SAME PERIPHERAL_CATEGORIES
+# the Budget solver's surplus-fill (`fill_peripherals_with_surplus`) and
+# `allocate_workload_baseline(..., include_peripherals=True)` already walk,
+# so a budget/workload build (Studio button OR the AI Concierge's own
+# `initialize_budget_build` call) can now spend real headroom on them too —
+# none of the 7 have deterministic compatibility rules either way.
 PERIPHERAL_CATEGORIES = solvers.PERIPHERAL_CATEGORIES
-# Desk/setup peripherals (spec.md §7.4) — no PC-internal compatibility
-# constraints at all (no socket/slot/wattage interaction with the rest of
-# the build), so these are never touched by engine.solvers (not part of
-# PERIPHERAL_CATEGORIES/the Budget solver's surplus-fill) and are rendered
-# in their own distinct UI section, manual-pick-only in every creation mode.
-DESK_PERIPHERAL_CATEGORIES = ("Monitor", "Keyboard", "Mouse", "Headset")
 TIERS = ("Entry", "Mid", "High", "Enthusiast")
 
 _MODE_CARDS = (
@@ -217,25 +220,11 @@ def _part_pickers(build_draft: dict, build_state: dict) -> None:
                 quantities=build_draft.get("quantities", {}),
             )
 
-    with st.expander("Optional peripherals (Network Card, Sound Card, Optical Drive)"):
-        periph_cols = st.columns(3)
-        for index, category in enumerate(PERIPHERAL_CATEGORIES):
-            candidates = components_repo.get_by_category(category)
-            with periph_cols[index % 3]:
-                render_part_picker(
-                    category,
-                    build_state,
-                    candidates,
-                    on_select=lambda component, cat=category: state.set_component(build_draft, cat, component),
-                    on_remove=lambda cat=category: state.remove_component(build_draft, cat),
-                    budget_ceiling=build_draft.get("budget_ceiling"),
-                )
-
-    st.markdown("#### 🎧 Optional Peripherals & Setup")
-    desk_periph_cols = st.columns(2)
-    for index, category in enumerate(DESK_PERIPHERAL_CATEGORIES):
+    st.markdown("#### 🎧 Optional Peripherals & Battlestation Setup")
+    periph_cols = st.columns(2)
+    for index, category in enumerate(PERIPHERAL_CATEGORIES):
         candidates = components_repo.get_by_category(category)
-        with desk_periph_cols[index % 2]:
+        with periph_cols[index % 2]:
             render_part_picker(
                 category,
                 build_state,

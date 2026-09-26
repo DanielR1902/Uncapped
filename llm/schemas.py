@@ -256,15 +256,31 @@ class ConciergeModifyBuildAction(BaseModel):
     the caller (ui/) re-validates the real achievable quantity via
     engine.compatibility.resolve_quantity_limit /
     ui.state.resolve_effective_quantity_limit before applying, exactly like
-    the manual quantity stepper already does. Both dicts may be empty (e.g.
-    a components-only or quantities-only patch) but not both empty AND no
-    navigate_to — that combination means nothing was actually asked to change,
-    which should just be a plain conversational reply with action: null
-    instead of a no-op action."""
+    the manual quantity stepper already does. All three of `components`/
+    `quantities`/`remove_categories` may be empty (e.g. a components-only,
+    quantities-only, or removal-only patch) but not all empty AND no
+    navigate_to — that combination means nothing was actually asked to
+    change, which should just be a plain conversational reply with
+    action: null instead of a no-op action.
+
+    `remove_categories` (e.g. "remove the soundcard and network card") is a
+    real, confirmed gap this closes: before this field existed, there was NO
+    way to express "clear this category entirely" — `components` only ever
+    maps a category to a real catalog id, never `null`/`None`, so a live call
+    asked to remove several peripherals was caught trying exactly that
+    (`{"SoundCard": None, "OpticalDrive": None, ...}`), which Pydantic
+    correctly rejects (an `int` field can't hold `None`), silently falling
+    back to the generic "having trouble reaching the AI assistant" reply —
+    not a crash, but indistinguishable from one to the user, for a request
+    that should have worked. A category named in BOTH `components` and
+    `remove_categories` is a contradiction the caller resolves by preferring
+    the removal (clearing wins) — the model should never do this on purpose,
+    but the caller doesn't trust that either."""
 
     type: Literal["modify_build"] = "modify_build"
     components: dict[str, int] = {}
     quantities: dict[str, int] = {}
+    remove_categories: list[str] = []
     # Optional — see ConciergeLoadBuildAction's identical field for why: no
     # functional consumer in ui/, and a real, confirmed regression where the
     # STRICT BREVITY RULE led the model to sometimes omit it, failing
@@ -585,6 +601,41 @@ class ConciergeUseRemainingBudgetAction(BaseModel):
     explanation: str = ""
 
 
+class ConciergeRebalanceBudgetAction(BaseModel):
+    """The user's explicit request to fund an upgrade by downgrading a
+    DIFFERENT, named category first (e.g. "downgrade the screen a bit and
+    use the money to upgrade the cpu and gpu", "step down the monitor and
+    put the savings into a better GPU") — a real, confirmed gap this closes:
+    a live call was caught either refusing this combined request outright or
+    (more often) applying it wildly inconsistently — sometimes leaving the
+    named upgrade categories completely untouched despite a real downgrade
+    freeing up real money, sometimes downgrading far more than any upgrade
+    recouped — because the model was trusted to invent BOTH which specific
+    part to downgrade to AND which specific parts to upgrade to AND the
+    exact price arithmetic connecting them, all at once, in one JSON
+    response. This action reverses that: the model's ONLY job is category
+    RECOGNITION (which category is being downgraded, which are being
+    upgraded — including common synonyms: "screen"/"display" -> "Monitor",
+    "graphics card"/"video card" -> "GPU", "processor" -> "CPU" — never
+    demanding the user name an exact model). `engine.solvers.
+    rebalance_budget` then deterministically steps `downgrade_category` down
+    one real tier (the priciest real compatible option still cheaper than
+    the current pick), computes the real freed cash, and spends it — plus
+    any budget headroom that already existed — upgrading each of
+    `upgrade_categories`, in the given order, to the priciest real
+    compatible option that still fits, never exceeding the ceiling. Requires
+    an active build; if `downgrade_category`/`upgrade_categories` name
+    anything not a real core (`engine.solvers.CATEGORY_ORDER`) or peripheral
+    (`engine.solvers.PERIPHERAL_CATEGORIES`) category, or the named
+    downgrade category isn't currently selected, `_validate_action` rejects
+    it (falls back to a plain informational reply) rather than guessing."""
+
+    type: Literal["rebalance_budget"] = "rebalance_budget"
+    downgrade_category: str
+    upgrade_categories: list[str]
+    explanation: str = ""
+
+
 class ConciergeResponse(BaseModel):
     """Response shape for the Concierge chat feature (see llm/concierge.py).
     `reply` is always present (conversational answer to the user's message).
@@ -660,6 +711,7 @@ class ConciergeResponse(BaseModel):
         | ConciergeFixWarningsAction
         | ConciergeOptimizeBottleneckAction
         | ConciergeUseRemainingBudgetAction
+        | ConciergeRebalanceBudgetAction
         | None
     ) = None
     currency_switch: Literal["USD", "EUR", "NIS"] | None = None

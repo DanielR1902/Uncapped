@@ -104,7 +104,16 @@ PEAKED-CATEGORY FALLTHROUGH RULE (applies to "stretch_budget" in every mode): If
 (e.g. CPU) has peaked in socket/tier compatibility — no pricier compatible option exists for it —
 evaluate GPU upgrades, increasing RAM quantity via a `set_quantity` action (up to the motherboard's
 real DIMM slot count from catalog data), or increasing/upgrading Storage capacity, before concluding no
-stretch upgrade exists.
+stretch upgrade exists. If EVERY core category (CPU/GPU/RAM/Storage/Motherboard/PSU/Case/Cooler) has
+genuinely peaked too, evaluate the PERIPHERAL categories in `catalog_alternatives` next — Monitor,
+Keyboard, Mouse, Headset, NetworkCard, SoundCard, OpticalDrive — before concluding no stretch upgrade
+exists anywhere: real budget headroom spent on a better monitor or an added peripheral is still a real,
+worthwhile stretch upgrade, not a fallback of last resort to be skipped. A peripheral entry with
+`"current": null` means it isn't selected yet at all — propose a `swap` action naming one of its real
+`pricier_alternatives` ids anyway; this both ADDS that peripheral to the build and IS the stretch
+upgrade, with `added_cost_usd` equal to that part's own full real price (there is no existing price to
+subtract, since nothing was there before). Only after core categories AND every peripheral have been
+checked and found to have no headroom left should you say no stretch upgrade exists.
 
 A `set_quantity` action looks like this: {"action": "set_quantity", "category": "RAM", "quantity": 2} —
 use it to propose adding another kit/drive of the SAME already-selected part rather than swapping to a
@@ -185,13 +194,24 @@ def _catalog_alternatives(build_state: BuildState) -> dict[str, dict]:
     """For each core category currently filled, the current pick plus its
     immediate cheaper/pricier compatible neighbors by price — grounds the
     prompt in real parts instead of letting the model hallucinate plausible-
-    sounding fake ones. Peripherals (outside solvers.CATEGORY_ORDER) are
-    skipped: they have no deterministic compatibility rules to differentiate
-    alternatives by (see engine/solvers.py), so a price-neighbor summary for
-    them wouldn't be meaningful."""
+    sounding fake ones.
+
+    Peripheral categories (solvers.PERIPHERAL_CATEGORIES — Monitor/Keyboard/
+    Mouse/Headset/NetworkCard/SoundCard/OpticalDrive) are included too (a
+    real, confirmed gap this closes: they used to be skipped entirely on the
+    theory that "no compatibility rules differentiate them" made a price-
+    neighbor summary meaningless — true for compatibility, irrelevant for a
+    STRETCH-BUDGET upgrade recommendation, which is exactly a price-neighbor
+    question). Unlike core categories, a peripheral may be entirely
+    unselected — real budget headroom can still exist there even after every
+    core category has peaked, which is exactly the case this closes. An
+    unselected peripheral gets `"current": None` and its `"pricier_
+    alternatives"` are simply its top real candidates by price (there's no
+    existing pick to compare against), so the model can propose adding one
+    for the first time, not just upgrading an existing pick."""
     alternatives: dict[str, dict] = {}
     for category, current in build_state.items():
-        if category not in solvers.CATEGORY_ORDER:
+        if category not in solvers.CATEGORY_ORDER and category not in solvers.PERIPHERAL_CATEGORIES:
             continue
         candidates = solvers.get_compatible_candidates(category, build_state)
         peers = [c for c in candidates if c.id != current.id]
@@ -205,6 +225,20 @@ def _catalog_alternatives(build_state: BuildState) -> dict[str, dict]:
             "current": _component_summary(current),
             "cheaper_alternatives": [_component_summary(c) for c in cheaper],
             "pricier_alternatives": [_component_summary(c) for c in pricier],
+        }
+    for category in solvers.PERIPHERAL_CATEGORIES:
+        if category in build_state:
+            continue  # already covered by the loop above
+        candidates = sorted(
+            solvers.get_compatible_candidates(category, build_state),
+            key=lambda c: c.price_usd,
+        )
+        if not candidates:
+            continue
+        alternatives[category] = {
+            "current": None,
+            "cheaper_alternatives": [],
+            "pricier_alternatives": [_component_summary(c) for c in candidates[-_NEIGHBORS_PER_DIRECTION:]],
         }
     return alternatives
 
@@ -426,6 +460,42 @@ def _try_swap_upgrade(build_state: BuildState, category: str) -> tuple[Component
     return current, upgrade, upgrade.price_usd - current.price_usd
 
 
+def _try_peripheral_upgrade_or_add(build_state: BuildState, category: str) -> tuple[Component, Component, float] | None:
+    """The peripheral analogue of _try_swap_upgrade — a real, confirmed gap
+    this closes: _try_swap_upgrade requires `category` to already be in
+    build_state (true for every CORE category, since a complete build always
+    has all 8), but `solvers.PERIPHERAL_CATEGORIES` (Monitor/Keyboard/Mouse/
+    Headset/NetworkCard/SoundCard/OpticalDrive) are all OPTIONAL — a build can
+    have real, substantial budget headroom left with one genuinely unselected,
+    with nothing in the old bottleneck->GPU->RAM->Storage->Cooler fallthrough
+    chain ever considering "add a peripheral that isn't picked yet" as a real
+    stretch upgrade, even though that's exactly where the remaining money
+    should go once every core category has peaked. If `category` is already
+    selected, behaves like _try_swap_upgrade (cheapest real option pricier
+    than the current pick). If NOT yet selected, "current" is a real $0.0
+    baseline (nothing bought yet) and the upgrade is the single MOST
+    EXPENSIVE real compatible candidate — mirroring engine.solvers.
+    _fill_peripherals_with_surplus's own "spend surplus on the highest tier
+    that fits" philosophy for a first-time peripheral pick, rather than
+    _try_swap_upgrade's "cheapest step up" (there's no existing pick to step
+    up from cheaply here, and a lowball first pick would waste real headroom
+    the exact same way this whole gap already does). Returns None only if
+    the category has no real candidates at all (should not happen for a
+    non-empty catalog category) or, when already selected, no pricier option
+    exists."""
+    current = build_state.get(category)
+    if current is not None:
+        return _try_swap_upgrade(build_state, category)
+    candidates = solvers.get_compatible_candidates(category, build_state)
+    if not candidates:
+        return None
+    priciest = max(candidates, key=lambda c: c.price_usd)
+    placeholder_current = Component(
+        id=-1, category=category, name=f"(no {category} selected)", brand="", price_usd=0.0,
+    )
+    return placeholder_current, priciest, priciest.price_usd
+
+
 def _try_quantity_increment(
     build_state: BuildState, category: str, quantities: dict[str, int]
 ) -> tuple[Component, int, int, float] | None:
@@ -596,10 +666,29 @@ def _heuristic_stretch_budget(
             "added_cost_usd": round(delta, 2),
         }
 
+    # 7. Peripherals (a real, confirmed gap this closes — see
+    # _try_peripheral_upgrade_or_add's own docstring): every core category
+    # above has genuinely peaked, but real budget headroom can still exist
+    # for an unselected or upgradeable Monitor/Keyboard/Mouse/Headset/
+    # NetworkCard/SoundCard/OpticalDrive — checked in PERIPHERAL_CATEGORIES'
+    # own priority order (desk peripherals before internal expansion cards).
+    for peripheral_category in solvers.PERIPHERAL_CATEGORIES:
+        result = _try_peripheral_upgrade_or_add(build_state, peripheral_category)
+        if result is None:
+            continue
+        current, upgrade, delta = result
+        verb = "Upgrade" if current.id != -1 else "Add"
+        explanation = f"{verb} {peripheral_category} to {upgrade.name} (+{delta:,.2f} USD) for extra headroom."
+        return {
+            "explanation": explanation,
+            "actions": [{"action": "swap", "category": peripheral_category, "replace_with_id": upgrade.id}],
+            "added_cost_usd": round(delta, 2),
+        }
+
     explanation = (
         f"{build_state[limiting_category].name} is already the priciest compatible {limiting_category} "
-        "option in the catalog, and GPU, RAM, Storage, and Cooler upgrades were checked too — no "
-        "stretch-budget upgrade is available right now."
+        "option in the catalog, and GPU, RAM, Storage, Cooler, and every peripheral category were "
+        "checked too — no stretch-budget upgrade is available right now."
     )
     return {"explanation": explanation, "actions": [], "added_cost_usd": 0.0}
 
@@ -721,9 +810,22 @@ def _validate_advisory_actions(
     valid_candidates_by_category: dict[str, dict[int, Component]] = {}
 
     def _check_swap(swap: SwapAction) -> None:
-        if swap.category not in build_state or swap.category not in solvers.CATEGORY_ORDER:
+        is_core = swap.category in solvers.CATEGORY_ORDER
+        is_peripheral = swap.category in solvers.PERIPHERAL_CATEGORIES
+        if not is_core and not is_peripheral:
             raise AdvisoryUnavailableError(
-                f"Advisory swap references an unknown/non-core category: {swap.category!r}"
+                f"Advisory swap references an unknown category: {swap.category!r}"
+            )
+        # A CORE category is always present in a complete build — absence
+        # means a hallucinated category, not a real gap to fill. A PERIPHERAL
+        # category is legitimately optional (spec.md §5.2/§7.4) — a stretch
+        # action may propose adding one for the first time, so its absence
+        # from build_state is expected, not an error (see
+        # _try_peripheral_upgrade_or_add's own docstring for why this matters).
+        if is_core and swap.category not in build_state:
+            raise AdvisoryUnavailableError(
+                f"Advisory swap references a core category missing from the current build: "
+                f"{swap.category!r}"
             )
         if swap.category not in valid_candidates_by_category:
             candidates = solvers.get_compatible_candidates(swap.category, build_state)
@@ -769,7 +871,11 @@ def _validate_advisory_actions(
             real_added_cost += component.price_usd * (action.quantity - current_qty)
         else:
             _check_swap(action)
-            current_price = build_state[action.category].price_usd
+            # 0.0 baseline for a not-yet-selected peripheral (a real, valid
+            # "first add" — _check_swap already confirmed this is only ever
+            # allowed for a peripheral category, never a core one).
+            existing = build_state.get(action.category)
+            current_price = existing.price_usd if existing is not None else 0.0
             new_price = valid_candidates_by_category[action.category][action.replace_with_id].price_usd
             if new_price <= current_price:
                 raise AdvisoryUnavailableError(
@@ -823,6 +929,34 @@ def get_build_advisory(
         _validate_advisory_actions(build_state, response, quantities)
     except (AdvisoryUnavailableError, PydanticValidationError):
         return _heuristic_advisory(build_state, direction, mode, profile, quantities)
+
+    # FALSE-NEGATIVE CROSS-CHECK (a real, confirmed bug this closes, the
+    # mirror image of the cost/direction enforcement above): a validly-
+    # parsed response with an EMPTY stretch_budget.actions isn't a
+    # hallucination this module can reject — it's a legitimate "no upgrade
+    # needed" verdict, structurally. But a live call was caught returning
+    # exactly that (`Delta: +€0.00`) for a build sitting on real, substantial
+    # headroom (e.g. €1,864.68 of a €4,000+ ceiling unspent) purely because
+    # every CORE category had peaked and the model's own reasoning stopped
+    # there, never considering an unselected/upgradeable peripheral (Monitor/
+    # Keyboard/Mouse/Headset/etc.) as a real stretch option — even with the
+    # PEAKED-CATEGORY FALLTHROUGH RULE telling it to. Since
+    # `_heuristic_stretch_budget` is fully deterministic and, by
+    # construction, only ever proposes a real, catalog-priced, genuinely-
+    # pricier-or-newly-added option, an empty LLM verdict is cross-checked
+    # against it: if the heuristic finds a real action the LLM missed, that
+    # action is authoritative and replaces the LLM's empty one (the
+    # LLM-authored `pros`/`cons`/`within_budget` are kept — only
+    # `stretch_budget` itself is swapped in, and `source` is corrected to
+    # "heuristic" since the part that actually matters here came from
+    # Python, not the model).
+    if not response.stretch_budget.actions:
+        heuristic_stretch = _heuristic_stretch_budget(build_state, direction, mode, profile, quantities)
+        if heuristic_stretch["actions"]:
+            result = response.model_dump()
+            result["stretch_budget"] = heuristic_stretch
+            result["source"] = "heuristic"
+            return result
 
     response.source = "llm"
     return response.model_dump()

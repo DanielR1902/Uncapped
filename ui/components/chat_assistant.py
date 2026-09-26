@@ -1052,6 +1052,21 @@ def _apply_concierge_action(action: dict | None) -> float | None:
                 if component is not None:
                     state.set_component(build_draft, category, component)
 
+            # REMOVE_CATEGORIES (root-cause fix for a real, confirmed
+            # failure: `components` has no way to express "clear this
+            # category," so a request to remove several peripherals in one
+            # message previously made the model try `components: {"Sound
+            # Card": null}`, which fails Pydantic validation outright and
+            # silently degrades the WHOLE response to the generic "having
+            # trouble reaching the AI assistant" fallback — see
+            # llm/schemas.py::ConciergeModifyBuildAction's own docstring).
+            # Applied AFTER `components` above so a category named in BOTH
+            # (a contradiction the model should never produce, but isn't
+            # trusted not to) ends up cleared, not re-filled — "clearing
+            # wins," per that same docstring.
+            for category in action.get("remove_categories", []) or []:
+                state.remove_component(build_draft, category)
+
             requested_quantities = action.get("quantities", {})
             if requested_quantities:
                 build_state = state.resolve_build_state(build_draft)
@@ -1230,20 +1245,31 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         if not build_draft:
             return None
 
-        # BUDGET CEILING RESOLUTION: prefer a fresh figure the user stated
-        # THIS message (action["budget_cap_usd"] — e.g. "you have 13000 NIS,
-        # upgrade it accordingly" against a build that was never in Budget
-        # mode at all) over an already-set one on the draft. Either way, once
-        # resolved, the build is (re)confirmed as Budget mode under that
-        # ceiling going forward — a real, confirmed gap this fixes: a
-        # Free-mode build had no way to engage this multi-tier spend-down
-        # loop at all before, even when the user explicitly stated a budget
-        # to build toward in the same breath as "upgrade it".
+        # BUDGET CEILING RESOLUTION: a fresh figure the user stated THIS
+        # message (action["budget_cap_usd"]) is ONLY ever adopted when NO
+        # real ceiling already exists on the draft (e.g. "you have 13000
+        # NIS, upgrade it accordingly" against a build that was never in
+        # Budget mode at all) — a real, confirmed gap this fixes: a Free-mode
+        # build had no way to engage this multi-tier spend-down loop at all
+        # before, even when the user explicitly stated a budget to build
+        # toward in the same breath as "upgrade it". When a real ceiling
+        # ALREADY exists, `budget_cap_usd` is NEVER trusted to replace it,
+        # authoritatively in Python, no matter what the LLM sent (belt-and-
+        # suspenders alongside llm/concierge.py's own corrected prompt
+        # instruction): a live call was caught setting `budget_cap_usd` to a
+        # user's STATED LEEWAY figure ("you have 1,864.68 EUR leeway, use
+        # them to upgrade") — describing headroom UNDER an existing €4,000
+        # ceiling, not a replacement for it — which overwrote that real
+        # ceiling down to barely more than the build's own current cost,
+        # making the very first `remaining_headroom` check below negative
+        # and breaking the loop immediately with `Delta: +€0.00`, the exact
+        # opposite of what "you have leeway" asked for.
+        existing_ceiling = build_draft.get("budget_ceiling") if build_draft.get("creation_mode") == "Budget" else None
         stated_ceiling = action.get("budget_cap_usd")
-        budget_ceiling = stated_ceiling or build_draft.get("budget_ceiling")
+        budget_ceiling = existing_ceiling or stated_ceiling
         if not budget_ceiling:
             return None
-        if build_draft.get("creation_mode") != "Budget" or stated_ceiling:
+        if build_draft.get("creation_mode") != "Budget":
             build_draft["creation_mode"] = "Budget"
             build_draft["budget_ceiling"] = budget_ceiling
         mode = "Budget"
@@ -1329,6 +1355,44 @@ def _apply_concierge_action(action: dict | None) -> float | None:
             return None
         return state.build_total_cost(final_build_state, build_draft.get("quantities", {}))
 
+    if action_type == "rebalance_budget":
+        # DETERMINISTIC REBALANCE (root-cause fix for "downgrade X and use
+        # the money to upgrade Y/Z" — a real, confirmed failure: the model
+        # was previously trusted to invent both the specific downgrade part
+        # AND the specific upgrade part(s) AND the price arithmetic
+        # connecting them, and did so wildly inconsistently — sometimes
+        # leaving the named upgrade categories untouched despite real freed
+        # cash, sometimes downgrading far more than any upgrade recouped.
+        # The Concierge's only job now is CATEGORY recognition (see
+        # llm/concierge.py intent 14); engine.solvers.rebalance_budget does
+        # the actual, real, catalog-priced downgrade-then-upgrade math.
+        build_draft = st.session_state.get("build_draft")
+        if not build_draft:
+            return None
+        build_state = state.resolve_build_state(build_draft)
+        downgrade_category = action.get("downgrade_category")
+        upgrade_categories = action.get("upgrade_categories") or []
+        if not build_state or not downgrade_category or downgrade_category not in build_state:
+            return None
+        # Free/Workload mode has no real ceiling to respect — treat as
+        # "no budget constraint" (every upgrade candidate fits), the same
+        # philosophy Free mode's own part-picker already applies elsewhere.
+        budget_ceiling = (
+            build_draft.get("budget_ceiling") if build_draft.get("creation_mode") == "Budget" else None
+        )
+        effective_ceiling = budget_ceiling if budget_ceiling else float("inf")
+        new_state = solvers.rebalance_budget(
+            build_state, downgrade_category, upgrade_categories, effective_ceiling,
+        )
+        for category, component in new_state.items():
+            state.set_component(build_draft, category, component)
+        st.session_state["build_draft"] = build_draft
+        st.session_state["build_draft_analysis"] = None
+        final_build_state = state.resolve_build_state(build_draft)
+        if not final_build_state:
+            return None
+        return state.build_total_cost(final_build_state, build_draft.get("quantities", {}))
+
     return None
 
 
@@ -1395,6 +1459,7 @@ def render_concierge_widget() -> None:
                 st.session_state.get("build_draft")
                 if pending_action_type in (
                     "modify_build", "fix_warnings", "optimize_bottleneck", "use_remaining_budget",
+                    "rebalance_budget",
                 )
                 else None
             )
@@ -1542,6 +1607,7 @@ def render_concierge_widget() -> None:
             if (
                 applied_action_type in (
                     "load_build", "modify_build", "fix_warnings", "optimize_bottleneck", "use_remaining_budget",
+                    "rebalance_budget",
                 )
                 and real_total is not None
             ):
