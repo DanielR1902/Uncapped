@@ -2191,6 +2191,76 @@ def test_community_rate_my_build_flair_badge_shown_on_feed_and_thread(seeded_db)
     assert "Rate My Build" in thread_text
 
 
+def test_community_filter_by_tag_shows_posts_matching_selected_flair(seeded_db):
+    """The "Filter by" dimension selector's "Tag" option must filter the feed
+    by `post.flair`, independent of the pre-existing "Build Type" dimension —
+    selecting "Rate My Build" hides "Looking for Help" posts and vice versa."""
+    from db.repositories import builds_repo, community_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "tagfilter1", "tagfilter1@example.com", "Tag Filter One")
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    user_id = at.session_state["auth_user"]["id"]
+    rate_build = builds_repo.create_build(
+        user_id=user_id, name="Rate Tag Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    help_build = builds_repo.create_build(
+        user_id=user_id, name="Help Tag Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    community_repo.create_post(rate_build.id, user_id, "Rate Tag Rig", flair="Rate My Build")
+    community_repo.create_post(help_build.id, user_id, "Help Tag Rig", flair="Looking for Help")
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    assert at.get_by_key("community_filter_dimension").value == "Build Type"  # default, unchanged behavior
+
+    at.get_by_key("community_filter_dimension").select("Tag").run()
+    tag_widget = at.get_by_key("community_tag_filter")
+    assert tag_widget.options == ["All", "Rate My Build", "Looking for Help"]
+
+    tag_widget.select("Rate My Build").run()
+    feed_text = "\n".join(m.value for m in at.markdown)
+    assert "Rate Tag Rig" in feed_text
+    assert "Help Tag Rig" not in feed_text
+
+    at.get_by_key("community_tag_filter").select("Looking for Help").run()
+    feed_text = "\n".join(m.value for m in at.markdown)
+    assert "Help Tag Rig" in feed_text
+    assert "Rate Tag Rig" not in feed_text
+
+
+def test_community_filter_by_tag_empty_result_shows_cyberpunk_message(seeded_db):
+    """A Tag filter selection with zero matching posts shows the dedicated
+    empty-state message, distinct from the "no builds shared yet" state."""
+    from db.repositories import builds_repo, community_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "tagfilter2", "tagfilter2@example.com", "Tag Filter Two")
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    user_id = at.session_state["auth_user"]["id"]
+    build = builds_repo.create_build(
+        user_id=user_id, name="Only Rate Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    community_repo.create_post(build.id, user_id, "Only Rate Rig", flair="Rate My Build")
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    at.get_by_key("community_filter_dimension").select("Tag").run()
+    at.get_by_key("community_tag_filter").select("Looking for Help").run()
+
+    assert not at.exception
+    feed_text = "\n".join(m.value for m in at.markdown)
+    assert "No community rigs found matching this filter." in feed_text
+
+
 def test_previous_builds_publish_form_requires_flair_before_creating_tagged_post(seeded_db):
     """Clicking "Share to Community" on a Previous Builds card must NOT
     publish immediately — it opens an inline form (description + flair);

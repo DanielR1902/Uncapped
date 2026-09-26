@@ -428,6 +428,15 @@ def _apply_pending_community_filters(posts) -> None:
     if not pending:
         return
 
+    # A Concierge filter request only ever carries Build-Type-axis fields
+    # (build_type/max_price/domain/tier) — never a flair/tag request — so
+    # applying one always means the "Build Type" dimension is what the user
+    # wants active. Without forcing this, a request landing while the
+    # "Tag" dimension was selected would write into community_mode_filter
+    # but leave that selectbox un-rendered (dimension-conditional below),
+    # silently no-op'ing the whole request from the user's perspective.
+    st.session_state["community_filter_dimension"] = "Build Type"
+
     build_type = pending.get("build_type")
     if build_type not in ("All", "Budget", "Workload", "Free"):
         build_type = "All"
@@ -477,52 +486,70 @@ def render() -> None:
     # current value on this same render.
     _apply_pending_community_filters(posts)
 
-    mode_filter = st.selectbox(
-        "Filter by Build Type", ["All", "Budget", "Workload", "Free"], key="community_mode_filter"
+    col_dimension, col_value = st.columns(2)
+    filter_dimension = col_dimension.selectbox(
+        "Filter by", ["Build Type", "Tag"], key="community_filter_dimension"
     )
 
+    mode_filter = "All"
+    tag_filter = "All"
     price_ceiling: float | None = None
     domain_filter = "All"
     tier_filter = "All"
 
     currency = st.session_state.get("selected_currency", "USD")
-    if mode_filter == "Budget":
-        price_steps = _budget_price_steps(posts)
-        if price_steps:
-            price_choice = st.selectbox(
-                "Max Price Limit",
-                [None] + price_steps,  # None == "All Prices" — a real USD number otherwise, never a
-                # currency-symbol string to parse back (see _apply_pending_community_filters's docstring)
-                format_func=lambda p: "All Prices" if p is None else format_currency(p, currency),
-                key="community_price_filter",
-            )
-            if price_choice is not None:
-                price_ceiling = float(price_choice)
-    elif mode_filter == "Workload":
-        col_domain, col_tier = st.columns(2)
-        domains = _workload_domains(posts)
-        tiers = _workload_tiers(posts)
-        domain_filter = col_domain.selectbox("Domain", ["All"] + domains, key="community_domain_filter")
-        tier_filter = col_tier.selectbox("Tier", ["All"] + tiers, key="community_tier_filter")
+    if filter_dimension == "Build Type":
+        mode_filter = col_value.selectbox(
+            "Select Build Type", ["All", "Budget", "Workload", "Free"], key="community_mode_filter"
+        )
+        if mode_filter == "Budget":
+            price_steps = _budget_price_steps(posts)
+            if price_steps:
+                price_choice = st.selectbox(
+                    "Max Price Limit",
+                    [None] + price_steps,  # None == "All Prices" — a real USD number otherwise, never a
+                    # currency-symbol string to parse back (see _apply_pending_community_filters's docstring)
+                    format_func=lambda p: "All Prices" if p is None else format_currency(p, currency),
+                    key="community_price_filter",
+                )
+                if price_choice is not None:
+                    price_ceiling = float(price_choice)
+        elif mode_filter == "Workload":
+            col_domain, col_tier = st.columns(2)
+            domains = _workload_domains(posts)
+            tiers = _workload_tiers(posts)
+            domain_filter = col_domain.selectbox("Domain", ["All"] + domains, key="community_domain_filter")
+            tier_filter = col_tier.selectbox("Tier", ["All"] + tiers, key="community_tier_filter")
+    else:
+        tag_filter = col_value.selectbox(
+            "Select Tag", ["All", "Rate My Build", "Looking for Help"], key="community_tag_filter"
+        )
 
     filtered_posts = posts
-    if mode_filter != "All":
-        filtered_posts = [p for p in filtered_posts if p.build.creation_mode == mode_filter]
-    if mode_filter == "Budget" and price_ceiling is not None:
-        filtered_posts = [p for p in filtered_posts if p.build.total_cost <= price_ceiling]
-    if mode_filter == "Workload":
-        if domain_filter != "All":
-            filtered_posts = [
-                p
-                for p in filtered_posts
-                if p.build.workload_profile is not None
-                and humanize_profile(p.build.workload_profile) == domain_filter
-            ]
-        if tier_filter != "All":
-            filtered_posts = [p for p in filtered_posts if p.build.workload_tier == tier_filter]
+    if filter_dimension == "Build Type":
+        if mode_filter != "All":
+            filtered_posts = [p for p in filtered_posts if p.build.creation_mode == mode_filter]
+        if mode_filter == "Budget" and price_ceiling is not None:
+            filtered_posts = [p for p in filtered_posts if p.build.total_cost <= price_ceiling]
+        if mode_filter == "Workload":
+            if domain_filter != "All":
+                filtered_posts = [
+                    p
+                    for p in filtered_posts
+                    if p.build.workload_profile is not None
+                    and humanize_profile(p.build.workload_profile) == domain_filter
+                ]
+            if tier_filter != "All":
+                filtered_posts = [p for p in filtered_posts if p.build.workload_tier == tier_filter]
+    else:
+        if tag_filter != "All":
+            filtered_posts = [p for p in filtered_posts if p.flair == tag_filter]
 
     if not filtered_posts:
-        st.info("No community builds match the selected filters.")
+        st.markdown(
+            theme.pulse_badge("No community rigs found matching this filter.", "warning"),
+            unsafe_allow_html=True,
+        )
         return
 
     for post in filtered_posts:
