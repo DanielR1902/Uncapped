@@ -1717,15 +1717,21 @@ def test_apply_stretch_upgrade_locks_per_build(seeded_db, monkeypatch):
     button) simply stops rendering for the new build — a separate, already
     correct behavior, not a lock bug (see `_advisory_controls`'s docstring).
 
-    Ceiling chosen with generous headroom above the solver's own spend (not
-    just distinct from other tests' ceilings): the RAM/Storage quantity
-    stepper is now budget-aware too (`ui.state.resolve_effective_quantity_limit`),
-    and this stretch action deliberately pushes RAM quantity to 2 — a tight
-    ceiling where the solver already spends ~99% of it would leave no
-    budget-effective headroom for that 2nd unit, and the part-picker's own
-    pre-clamp (correctly, generically) would immediately clamp the
-    just-applied quantity back down to 1 on the very next render, which is
-    a real product interaction but not what this test is exercising."""
+    Ceiling chosen ABOVE the catalog's own true maximum possible full-build
+    cost (peripherals included), not just distinct from other tests'
+    ceilings: the RAM/Storage quantity stepper is budget-aware
+    (`ui.state.resolve_effective_quantity_limit`), and this stretch action
+    deliberately pushes RAM quantity to 2. `engine.solvers`'s
+    `_spend_up_remaining_headroom` pass now converges an ACHIEVABLE ceiling
+    to ~99.9%+ utilization by design (a real, confirmed under-utilization
+    bug fix — see `engine/CLAUDE.md`), so a lower, achievable ceiling like
+    the $2000 this test used to use would now leave no real budget-effective
+    headroom for that 2nd RAM kit, and the part-picker's own pre-clamp
+    (correctly, generically) would immediately clamp the just-applied
+    quantity back down to 1 on the very next render — a real product
+    interaction, but not what this test is exercising. A ceiling above the
+    catalog's true max can never be fully spent by any solver, guaranteeing
+    real headroom regardless of how good the convergence algorithm gets."""
     import ui.views.create_build as create_build_module
 
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
@@ -1733,7 +1739,7 @@ def test_apply_stretch_upgrade_locks_per_build(seeded_db, monkeypatch):
     _register(at, "apply3", "apply3@example.com", "Apply Three")
     at.get_by_key("nav_create_build").click().run()
     at.get_by_key("mode_budget").click().run()
-    at.get_by_key("budget_ceiling_input").set_value(2000.0).run()
+    at.get_by_key("budget_ceiling_input").set_value(5750.0).run()
     at.get_by_key("apply_budget_generate").click().run()
 
     def _set_quantity_stretch_advisory(
@@ -1780,12 +1786,15 @@ def test_apply_stretch_set_quantity_action_updates_quantity(seeded_db, monkeypat
     state.set_quantity, landing in build_draft["quantities"], not attempt a
     catalog lookup meant for swaps.
 
-    Ceiling chosen with generous headroom above the solver's own spend, not
-    just distinct from other tests' ceilings — see
+    Ceiling chosen ABOVE the catalog's own true maximum possible full-build
+    cost, not just distinct from other tests' ceilings — see
     test_apply_stretch_upgrade_locks_per_build's docstring: the RAM/Storage
-    quantity stepper is now budget-aware, and a tight ceiling would let its
-    own pre-clamp immediately re-clamp this test's just-applied qty=2 back
-    down to 1 on the next render, which isn't what this test is about."""
+    quantity stepper is budget-aware, and `_spend_up_remaining_headroom`
+    converges an ACHIEVABLE ceiling to ~99.9%+ by design, so a tight (or, as
+    of this catalog's 4TB/8TB NVMe additions, no-longer-safely-above-max
+    $5000) ceiling would let its own pre-clamp immediately re-clamp this
+    test's just-applied qty=2 back down to 1 on the next render, which isn't
+    what this test is about."""
     import ui.views.create_build as create_build_module
 
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
@@ -1796,7 +1805,7 @@ def test_apply_stretch_set_quantity_action_updates_quantity(seeded_db, monkeypat
     # Distinct ceiling so this cache key can't collide with another test's
     # default-$1500 budget build (see test_apply_stretch_upgrade_locks_per_build's
     # docstring for why that matters given the shared-default stretch_applied_keys set).
-    at.get_by_key("budget_ceiling_input").set_value(5000.0).run()
+    at.get_by_key("budget_ceiling_input").set_value(6500.0).run()
     at.get_by_key("apply_budget_generate").click().run()
 
     def _set_quantity_stretch_advisory(
@@ -2920,6 +2929,49 @@ def test_concierge_load_build_action_applies_immediately_no_confirmation(seeded_
     assert not any(b.key == "concierge_confirm_load" for b in at.button)
 
 
+def test_concierge_load_build_reply_includes_real_bottleneck_synergy_line(seeded_db, monkeypatch):
+    """RIGOROUS TELEMETRY REPLY FORMAT extended to load_build (this round):
+    a fresh build-me response with >=2 components must get a real,
+    Python-computed final Bottleneck/Synergy reading appended -- never
+    trusting whatever the model's own `reply` text might have claimed (the
+    NO TELEMETRY HALLUCINATION RULE, llm/concierge.py SYSTEM_PROMPT)."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine.scoring import live_bottleneck_and_synergy
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    gpu = components_repo.get_by_category("GPU")[0]
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Built a solid CPU/GPU pairing.",
+            "action": {
+                "type": "load_build",
+                "components": {"CPU": cpu.id, "GPU": gpu.id},
+                "explanation": "Picked a solid CPU and GPU.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "loadtelemetry1", "loadtelemetry1@example.com", "Load Telemetry One")
+    at.get_by_key("concierge_chat_input").set_value("Build me a PC").run()
+
+    assert not at.exception
+    build_state = {"CPU": cpu, "GPU": gpu}
+    real_synergy, real_bottleneck, real_direction = live_bottleneck_and_synergy(build_state)
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert f"Bottleneck: {real_bottleneck:.0f}% ({real_direction})" in last_message
+    assert f"Synergy: {real_synergy:.0f}" in last_message
+    assert "Total:" in last_message
+
+
 def test_concierge_load_build_with_budget_cap_uses_deterministic_solver(seeded_db, monkeypatch):
     """HARD CEILING / TARGET-ZONE ENFORCEMENT (Part 2): a load_build action
     carrying `budget_cap_usd` must NOT use the model's own (here, empty)
@@ -3117,6 +3169,77 @@ def test_concierge_use_remaining_budget_spends_headroom_without_exceeding_ceilin
     assert "Total:" in last_message
 
 
+def test_concierge_use_remaining_budget_converts_free_mode_build_under_stated_ceiling(seeded_db, monkeypatch):
+    """"you have 13000 NIS, upgrade it accordingly" against a build that was
+    NEVER in Budget mode at all: the action's own `budget_cap_usd` (a fresh
+    figure stated in that message) must convert the draft to Budget mode
+    under that ceiling and then run the same spend-down loop -- a real,
+    confirmed gap this round's directive described (the build sat at ~8200
+    NIS with real headroom up to a stated 13000 NIS ceiling, but had no way
+    to engage the multi-tier upgrade loop while still Free-mode)."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+
+    picks = {category: components_repo.get_by_category(category)[0] for category in (
+        "CPU", "Motherboard", "GPU", "RAM", "Storage", "PSU", "Case", "Cooler",
+    )}
+    starting_total = sum(c.price_usd for c in picks.values())
+    stated_ceiling_usd = starting_total + 500.0  # real, meaningful headroom
+
+    # `_advisory_context`'s own pre-fetch (triggered because the message
+    # contains "budget" — chat_assistant.py's cheap local keyword gate) fires
+    # BEFORE `_apply_concierge_action` ever runs, while the draft is still
+    # genuinely Free-mode -- that call is unrelated to this test's own loop
+    # and must not be mistaken for it, so only calls make with mode=="Budget"
+    # (i.e., AFTER the conversion this test actually verifies) are counted.
+    call_modes: list[str] = []
+
+    def _fake_advisory(build_state, mode, current_budget_or_cost, **kwargs):
+        call_modes.append(mode)
+        return {
+            "pros": [], "cons": [],
+            "within_budget": {"explanation": "", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {"explanation": "", "actions": [], "added_cost_usd": 0.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_build_advisory", _fake_advisory)
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        assert current_build_context["mode"] == "Free"
+        return {
+            "reply": "Using your remaining budget on the best upgrades that fit.",
+            "action": {"type": "use_remaining_budget", "budget_cap_usd": stated_ceiling_usd},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "freshceiling1", "freshceiling1@example.com", "Fresh Ceiling One")
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Free", "workload_profile": None, "tier": "Mid", "budget_ceiling": None,
+        "components": {cat: c.id for cat, c in picks.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Free"
+
+    at.get_by_key("concierge_chat_input").set_value("you have 13000 NIS, upgrade it accordingly").run()
+
+    assert not at.exception
+    # The multi-tier loop itself must have run at least once, and every call
+    # it made saw the ALREADY-converted "Budget" mode -- never "Free".
+    assert "Budget" in call_modes
+    draft = at.session_state["build_draft"]
+    assert draft["creation_mode"] == "Budget"
+    assert draft["budget_ceiling"] == stated_ceiling_usd
+    assert at.session_state["create_mode"] == "Budget"
+
+
 def test_sidebar_nav_includes_your_posts_and_concierge_expanded_by_default(seeded_db):
     """This round's sidebar restructure (spec.md §7.7/§7.8): "Your Posts" is
     a real nav button between Drafts and Community, and the AI Concierge
@@ -3130,6 +3253,30 @@ def test_sidebar_nav_includes_your_posts_and_concierge_expanded_by_default(seede
     expanders = [e for e in at.expander if "AI Concierge" in (e.label or "")]
     assert len(expanders) == 1
     assert expanders[0].proto.expanded is True
+
+
+def test_sidebar_profile_badge_renders_name_and_handle(seeded_db):
+    """theme.profile_badge (spec.md §7.7/§7.8) replaces the plain bold-name +
+    @handle caption — confirms the real name/username still render (inside
+    the new HTML card) and the role tag is present."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "profilebadge1", "profilebadge1@example.com", "Profile Badge One")
+
+    sidebar_text = "\n".join(m.value for m in at.sidebar.markdown)
+    assert "Profile Badge One" in sidebar_text
+    assert "@profilebadge1" in sidebar_text
+    assert "ARCHITECT" in sidebar_text
+
+
+def test_streamlit_chrome_hidden_via_menu_items_none(seeded_db):
+    """set_page_config's own menu_items=None (app.py) — a real, checkable
+    config value, unlike the CSS hiding rules (ui/theme.py) which have no
+    AppTest-visible signal to assert on directly (verified live in the
+    browser instead)."""
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    assert not at.exception
 
 
 def test_concierge_never_calls_live_llm_without_api_key(seeded_db):
@@ -4109,6 +4256,56 @@ def test_concierge_save_build_fast_track_publish_carries_flair_tag(seeded_db, mo
     assert feed[0].flair == "Looking for Help"
 
 
+def test_concierge_fast_track_publish_confirmation_overrides_wrong_name_from_model(seeded_db, monkeypatch):
+    """The SAME AUTHORITATIVE PUBLISH CONFIRMATION override applies to the
+    ONE-TURN fast-track path (save_build with publish_immediately AND flair
+    both given in the same message) -- the model's own reply text is never
+    trusted for the name here either."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "fasttrackwrong1", "fasttrackwrong1@example.com", "Fast Track Wrong One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            # Deliberately the WRONG name in the model's own reply text.
+            "reply": "Build 'Beast Rig' successfully published to Community under 'Rate My Build'!\n"
+            "Viewable now in Community & Your Posts.",
+            "action": {
+                "type": "save_build",
+                "name": "Cyber Titan 9000",
+                "destination": "build",
+                "publish_immediately": True,
+                "author_notes": None,
+                "flair": "Rate My Build",
+                "explanation": "Fast-track save + publish with a tag.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value(
+        "save this build and publish it as Cyber Titan 9000 tagged rate my build"
+    ).run()
+
+    assert not at.exception
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    assert feed[0].title == "Cyber Titan 9000"
+
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "Cyber Titan 9000" in last_message
+    assert "Beast Rig" not in last_message
+
+
 def test_concierge_publish_build_carries_flair_tag(seeded_db, monkeypatch):
     """The separate, later-turn publish_build action must also carry its
     `flair` through to the real post."""
@@ -4156,6 +4353,71 @@ def test_concierge_publish_build_carries_flair_tag(seeded_db, monkeypatch):
     feed = community_repo.get_feed()
     assert len(feed) == 1
     assert feed[0].flair == "Rate My Build"
+
+
+def test_concierge_publish_build_confirmation_overrides_wrong_name_from_model(seeded_db, monkeypatch):
+    """AUTHORITATIVE PUBLISH CONFIRMATION regression test: a real, confirmed
+    bug had the model's own `reply` echo an UNRELATED example name from deep
+    inside its own SYSTEM_PROMPT ("Beast Rig") instead of the real name the
+    user actually saved under, even though the underlying save/publish
+    itself was correct. The displayed message must always show the REAL
+    name from `concierge_last_saved_build`, never whatever the mocked/real
+    model happened to type -- this test's own mock deliberately returns the
+    WRONG name to prove the override actually overrides, not just happens to
+    agree with a well-behaved mock."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import community_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "wrongname1", "wrongname1@example.com", "Wrong Name One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    def _fake_save_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Saved as 'Cyber Titan 9000'! Would you like to tag this community post as 'Rate My Build' or 'Looking for Help'?",
+            "action": {
+                "type": "save_build", "name": "Cyber Titan 9000", "destination": "build",
+                "explanation": "Saving now.",
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_save_response)
+    at.get_by_key("concierge_chat_input").set_value(
+        "save this build and publish it as Cyber Titan 9000"
+    ).run()
+    assert not at.exception
+
+    def _fake_publish_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        # Deliberately the WRONG name -- exactly the bug this test guards
+        # against -- to prove the caller's own override replaces it.
+        return {
+            "reply": "Build 'Beast Rig' successfully published to Community under 'Rate My Build'!\n"
+            "Viewable now in Community & Your Posts.",
+            "action": {"type": "publish_build", "author_notes": None, "flair": "Rate My Build"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_publish_response)
+    at.get_by_key("concierge_chat_input").set_value("Rate My Build").run()
+
+    assert not at.exception
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    assert feed[0].title == "Cyber Titan 9000"
+
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "Cyber Titan 9000" in last_message
+    assert "Beast Rig" not in last_message
 
 
 def test_concierge_save_build_without_publish_immediately_stays_private(seeded_db, monkeypatch):

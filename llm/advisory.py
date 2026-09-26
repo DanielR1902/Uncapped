@@ -671,7 +671,9 @@ def _real_slot_count(build_state: BuildState, category: str) -> int | None:
     return max_allowed
 
 
-def _validate_advisory_actions(build_state: BuildState, response: BuildAdvisoryResponse) -> None:
+def _validate_advisory_actions(
+    build_state: BuildState, response: BuildAdvisoryResponse, quantities: dict[str, int] | None = None,
+) -> None:
     """Post-parse hallucination guard (authoritative — the SYSTEM_PROMPT rule
     is just a request, this is what actually enforces it).
 
@@ -686,21 +688,47 @@ def _validate_advisory_actions(build_state: BuildState, response: BuildAdvisoryR
     its `quantity` must be a positive int that does not exceed the real
     motherboard slot count for that category (see _real_slot_count).
 
+    STRETCH COST/DIRECTION ENFORCEMENT (a real, confirmed bug this closes):
+    the SYSTEM_PROMPT tells the model every stretch price delta must exactly
+    match a real catalog difference and that a stretch action is always a
+    genuine upgrade — but that was only ever a prompt request, never checked
+    in Python, and a live call was caught doing exactly what that gap
+    allows: proposing a "swap" to the SAME already-selected GPU with a
+    fabricated "+400 USD" delta, then on the next round proposing a swap to
+    a CHEAPER compatible GPU labeled as a further upgrade at another
+    fabricated positive delta. `ui/components/chat_assistant.py`'s
+    `use_remaining_budget` loop trusts `stretch_budget.added_cost_usd` being
+    non-zero to mean "real forward progress" and applies the action
+    unconditionally, so a hallucinated action like this doesn't just misquote
+    a number — it silently makes the build WORSE per available budget
+    (verified live: a "no-op" swap it then downgraded traded real GPU tiers
+    away from the one the deterministic solver had already picked) while
+    leaving real, genuine headroom (a 2nd RAM kit, additional NVMe drives)
+    completely unexplored. Every stretch action's REAL price delta is now
+    recomputed here directly from catalog data (a swap's real delta must be
+    strictly positive — a stretch action can never be a lateral or backward
+    move) and `response.stretch_budget.added_cost_usd` must match the sum of
+    those real deltas (a small float-rounding tolerance aside); any mismatch
+    raises, funneling to the same deterministic heuristic fallback below,
+    whose own `_try_swap_upgrade`/`_try_quantity_increment` already only
+    ever propose a strictly-pricier real option by construction.
+
     Raises AdvisoryUnavailableError on any violation so get_build_advisory's
     existing `except (AdvisoryUnavailableError, PydanticValidationError):`
     block funnels a hallucinated/invalid action into the same heuristic
     fallback as any other failure mode — never a separate code path."""
-    valid_ids_by_category: dict[str, set[int]] = {}
+    quantities = quantities or {}
+    valid_candidates_by_category: dict[str, dict[int, Component]] = {}
 
     def _check_swap(swap: SwapAction) -> None:
         if swap.category not in build_state or swap.category not in solvers.CATEGORY_ORDER:
             raise AdvisoryUnavailableError(
                 f"Advisory swap references an unknown/non-core category: {swap.category!r}"
             )
-        if swap.category not in valid_ids_by_category:
+        if swap.category not in valid_candidates_by_category:
             candidates = solvers.get_compatible_candidates(swap.category, build_state)
-            valid_ids_by_category[swap.category] = {c.id for c in candidates}
-        if swap.replace_with_id not in valid_ids_by_category[swap.category]:
+            valid_candidates_by_category[swap.category] = {c.id: c for c in candidates}
+        if swap.replace_with_id not in valid_candidates_by_category[swap.category]:
             raise AdvisoryUnavailableError(
                 f"Advisory swap references a non-catalog id {swap.replace_with_id} for category "
                 f"{swap.category!r}"
@@ -727,11 +755,35 @@ def _validate_advisory_actions(build_state: BuildState, response: BuildAdvisoryR
     for swap in response.within_budget.swaps:
         _check_swap(swap)
 
+    real_added_cost = 0.0
     for action in response.stretch_budget.actions:
         if isinstance(action, QuantityAction):
             _check_quantity(action)
+            component = build_state[action.category]
+            current_qty = quantities.get(action.category, 1)
+            if action.quantity <= current_qty:
+                raise AdvisoryUnavailableError(
+                    f"Advisory stretch set_quantity action for {action.category!r} requests quantity "
+                    f"{action.quantity}, which is not an increase over the current quantity {current_qty}"
+                )
+            real_added_cost += component.price_usd * (action.quantity - current_qty)
         else:
             _check_swap(action)
+            current_price = build_state[action.category].price_usd
+            new_price = valid_candidates_by_category[action.category][action.replace_with_id].price_usd
+            if new_price <= current_price:
+                raise AdvisoryUnavailableError(
+                    f"Advisory stretch swap for {action.category!r} to id {action.replace_with_id} is not "
+                    f"strictly pricier than the current pick ({new_price} <= {current_price}) — a stretch "
+                    "action must always be a genuine upgrade, never a lateral or backward move"
+                )
+            real_added_cost += new_price - current_price
+
+    if response.stretch_budget.actions and abs(real_added_cost - response.stretch_budget.added_cost_usd) > 0.5:
+        raise AdvisoryUnavailableError(
+            f"Advisory stretch_budget.added_cost_usd ({response.stretch_budget.added_cost_usd}) doesn't "
+            f"match the real catalog-derived total ({real_added_cost:.2f})"
+        )
 
 
 def get_build_advisory(
@@ -768,7 +820,7 @@ def get_build_advisory(
         payload = _build_request_payload(build_state, mode, current_budget_or_cost, profile, resolved_bottleneck_info)
         raw = _call_openrouter(payload)
         response = BuildAdvisoryResponse.model_validate(raw)
-        _validate_advisory_actions(build_state, response)
+        _validate_advisory_actions(build_state, response, quantities)
     except (AdvisoryUnavailableError, PydanticValidationError):
         return _heuristic_advisory(build_state, direction, mode, profile, quantities)
 

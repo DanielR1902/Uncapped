@@ -236,6 +236,7 @@ from engine import solvers
 from engine.compatibility import evaluate_build
 from engine.scoring import live_bottleneck_and_synergy
 from llm.advisory import get_build_advisory
+from llm.client import analyze_build
 from llm.concierge import get_concierge_response
 from ui import state
 from ui.format import CURRENCY_RATES, format_currency, sanitize_markdown
@@ -557,6 +558,81 @@ def _default_saved_build_name() -> str:
     existing defensive-guard style everywhere else). A timestamped default is
     unambiguous and never collides with a real prior build."""
     return f"Concierge Build – {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+
+def _sync_authoritative_analysis(build_draft: dict, build_state: dict) -> tuple[float, float, str] | None:
+    """GROUND-TRUTH BINDING (a real, confirmed bug this fixes): a live
+    reproduction showed the Concierge's own reply text stating a
+    Synergy/Bottleneck reading that visibly disagreed with the Build
+    Studio's HUD moments later — not because the model invented a number
+    from nothing (the RIGOROUS TELEMETRY REPLY FORMAT already stops that),
+    but because this module's own telemetry line and `create_build.py`'s
+    `_maybe_auto_analyze` were computing TWO INDEPENDENT readings for the
+    same build: this line used the plain deterministic
+    `live_bottleneck_and_synergy` heuristic, while the HUD (once its own
+    lazy analysis finished) shows an LLM-REFINED reading that spec.md §6.3
+    explicitly allows to differ from that same heuristic baseline by up to
+    +/-10 percentage points. Two real, legitimate numbers — just not the
+    SAME one, and showing both is what created the mismatch.
+
+    This closes the gap by computing (or reusing an `llm_cache` hit for) the
+    EXACT SAME analysis `_maybe_auto_analyze` would — `llm.client.
+    analyze_build`, the SAME call, same arguments — for a build with all 8
+    core categories filled, and storing it into
+    `st.session_state["build_draft_analysis"]` right here. The HUD's own
+    next render then finds an analysis already on file and skips
+    recomputing one of its own (the exact "no analysis on file yet" check
+    `_maybe_auto_analyze` already gates on) — so the chat message and the
+    HUD are now reading the SAME stored result, not two independent
+    computations of what should be one number. Falls back to the plain
+    heuristic (matching `_maybe_auto_analyze`'s OWN fallback for an
+    incomplete build) when fewer than all 8 core categories are filled —
+    `analyze_build` requires a complete build, and the HUD wouldn't show a
+    refined reading for an incomplete one either. Returns `None` when there
+    are fewer than 2 components (nothing meaningful to report either way).
+
+    Returns `(synergy, bottleneck_percentage, direction)`, `direction`
+    normalized to `"CPU-bound"|"GPU-bound"|"Balanced"` regardless of source —
+    the same normalization `_current_build_context()` already applies to
+    this exact same ambiguity."""
+    if set(solvers.CATEGORY_ORDER).issubset(build_state.keys()):
+        with st.spinner("Analyzing build..."):
+            response = analyze_build(
+                build_state,
+                workload_profile=build_draft.get("workload_profile"),
+                budget_ceiling=build_draft.get("budget_ceiling"),
+            )
+        st.session_state["build_draft_analysis"] = response.model_dump()
+        limiting = response.bottleneck.limiting_component
+        direction = "Balanced" if limiting == "None" else f"{limiting}-bound"
+        return response.synergy.overall_score, response.bottleneck.bottleneck_percentage, direction
+    if len(build_state) >= 2:
+        return live_bottleneck_and_synergy(build_state)
+    return None
+
+
+def _read_cached_analysis(build_state) -> tuple[float, float, str] | None:
+    """The read-only counterpart to `_sync_authoritative_analysis`, used for
+    the "BEFORE" snapshot only: the pre-mutation build already has whatever
+    analysis was last synced for it sitting in `st.session_state[
+    "build_draft_analysis"]` (kept in lockstep by that same function after
+    every prior build-mutating turn) — re-reading it here, rather than
+    independently recomputing a fresh heuristic estimate, is what closes a
+    second real instance of the exact desync `_sync_authoritative_analysis`
+    exists to fix: without this, a "before" reading computed via the plain
+    heuristic could itself disagree with the LLM-refined number the HUD (and
+    the PREVIOUS turn's own telemetry line) already showed for that same
+    build, one turn ago. Falls back to the live heuristic only when nothing
+    has been cached yet (e.g. the very first build-mutating turn of a
+    session)."""
+    analysis = st.session_state.get("build_draft_analysis")
+    if analysis:
+        limiting = analysis["bottleneck"]["limiting_component"]
+        direction = "Balanced" if limiting == "None" else f"{limiting}-bound"
+        return analysis["synergy"]["overall_score"], analysis["bottleneck"]["bottleneck_percentage"], direction
+    if len(build_state) >= 2:
+        return live_bottleneck_and_synergy(build_state)
+    return None
 
 
 def _apply_concierge_action(action: dict | None) -> float | None:
@@ -1153,10 +1229,24 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         build_draft = st.session_state.get("build_draft")
         if not build_draft:
             return None
-        mode = build_draft.get("creation_mode") or "Free"
-        budget_ceiling = build_draft.get("budget_ceiling")
-        if mode != "Budget" or not budget_ceiling:
+
+        # BUDGET CEILING RESOLUTION: prefer a fresh figure the user stated
+        # THIS message (action["budget_cap_usd"] — e.g. "you have 13000 NIS,
+        # upgrade it accordingly" against a build that was never in Budget
+        # mode at all) over an already-set one on the draft. Either way, once
+        # resolved, the build is (re)confirmed as Budget mode under that
+        # ceiling going forward — a real, confirmed gap this fixes: a
+        # Free-mode build had no way to engage this multi-tier spend-down
+        # loop at all before, even when the user explicitly stated a budget
+        # to build toward in the same breath as "upgrade it".
+        stated_ceiling = action.get("budget_cap_usd")
+        budget_ceiling = stated_ceiling or build_draft.get("budget_ceiling")
+        if not budget_ceiling:
             return None
+        if build_draft.get("creation_mode") != "Budget" or stated_ceiling:
+            build_draft["creation_mode"] = "Budget"
+            build_draft["budget_ceiling"] = budget_ceiling
+        mode = "Budget"
         build_state = state.resolve_build_state(build_draft)
         if not build_state:
             return None
@@ -1230,6 +1320,7 @@ def _apply_concierge_action(action: dict | None) -> float | None:
                 break
 
         st.session_state["build_draft"] = build_draft
+        st.session_state["create_mode"] = build_draft.get("creation_mode") or "Free"
         st.session_state["page"] = "create_build"
         st.session_state["build_draft_analysis"] = None
 
@@ -1313,7 +1404,7 @@ def render_concierge_widget() -> None:
                 if before_build_state
                 else None
             )
-            before_live = live_bottleneck_and_synergy(before_build_state) if len(before_build_state) >= 2 else None
+            before_live = _read_cached_analysis(before_build_state) if before_build_state else None
 
             # Apply BEFORE finalizing the assistant message so the real,
             # Python-computed total (if any) is available to append to the
@@ -1382,26 +1473,75 @@ def render_concierge_widget() -> None:
                     if build_state:
                         real_total = state.build_total_cost(build_state, build_draft.get("quantities", {}))
             reply_content = result["reply"]
-            applied_action_type = (result.get("action") or {}).get("type")
+            action_dict = result.get("action") or {}
+            applied_action_type = action_dict.get("type")
 
-            # RIGOROUS TELEMETRY REPLY FORMAT: for the 4 action types that
-            # patch an EXISTING build (modify_build/fix_warnings/
-            # optimize_bottleneck/use_remaining_budget), replace the plain
-            # "Total: ..." line below with a concise, fully Python-computed
-            # technical summary — bottleneck/synergy before -> after, plus a
-            # cost delta — instead of just a bare new total. Currency-safe by
-            # construction: every number here is run through
-            # `format_currency(..., target_currency)`,
-            # the same function every other price in this app already goes
-            # through, so a NIS/EUR session can never see a stray "$" — the
-            # model's own reply text is never trusted for any of these
-            # numbers (same "never trust what the model typed, restate the
+            # AUTHORITATIVE PUBLISH CONFIRMATION (a real, confirmed bug this
+            # fixes): the model's own `reply` text composes the "Build 'X'
+            # successfully published..." confirmation itself, and a live
+            # reproduction showed it echoing an EXAMPLE build name from deep
+            # inside its own SYSTEM_PROMPT ("Beast Rig" — used repeatedly
+            # there as an illustrative name) instead of the REAL name the
+            # user actually gave, for a build that was in fact saved and
+            # published correctly under the right name — the model's stated
+            # name was wrong, not the underlying data. The same "never trust
+            # what the model typed, restate the Python-computed truth"
+            # discipline this module already applies to Total/Bottleneck/
+            # Synergy applies here too: whenever a `publish_build` action (or
+            # a one-turn `save_build` fast-track with `publish_immediately`
+            # AND a `flair` both set) actually completed — signalled by
+            # `concierge_last_saved_build` being populated, the SAME
+            # real-name/real-id record `_apply_concierge_action` itself just
+            # wrote — this REPLACES the model's own reply outright (not an
+            # appended line: an outright wrong name in the primary
+            # confirmation sentence is actively misleading, unlike a merely
+            # missing supplementary total) with the exact 2-line format,
+            # substituting the REAL name from that same record (the name
+            # actually used in the real `builds_repo.create_build`/
+            # `community_repo.create_post` calls) and the REAL flair the
+            # action carried — never anything the model composed. Gated on
+            # `concierge_last_saved_build` being truthy so a genuine no-op
+            # (nothing was actually saved this session) is never overwritten
+            # with a fabricated success message either.
+            saved_build = st.session_state.get("concierge_last_saved_build")
+            if saved_build and (
+                (applied_action_type == "publish_build" and action_dict.get("flair"))
+                or (
+                    applied_action_type == "save_build"
+                    and action_dict.get("publish_immediately")
+                    and action_dict.get("flair")
+                )
+            ):
+                reply_content = (
+                    f"Build '{saved_build['name']}' successfully published to Community "
+                    f"under '{action_dict['flair']}'!\nViewable now in Community & Your Posts."
+                )
+
+            # RIGOROUS TELEMETRY REPLY FORMAT: for load_build/modify_build/
+            # fix_warnings/optimize_bottleneck/use_remaining_budget, replace
+            # the plain "Total: ..." line below with a concise, fully
+            # Python-computed technical summary — bottleneck/synergy (before
+            # -> after for the 4 that patch an EXISTING build, or just the
+            # real final reading for a brand-new load_build, which has no
+            # "before" to diff against), plus a cost delta (or, again, just
+            # the real final total for load_build) — instead of just a bare
+            # new total. Currency-safe by construction: every number here is
+            # run through `format_currency(..., target_currency)`, the same
+            # function every other price in this app already goes through,
+            # so a NIS/EUR session can never see a stray "$" — the model's
+            # own reply text is never trusted for any of these numbers (the
+            # NO TELEMETRY HALLUCINATION RULE, llm/concierge.py SYSTEM_PROMPT,
+            # explicitly forbids it from stating one at all — a real,
+            # confirmed failure previously showed the model claiming a
+            # Synergy/Bottleneck reading that visibly disagreed with the
+            # Build Studio's own HUD; this line is the one the user should
+            # trust, same "never trust what the model typed, restate the
             # Python-computed truth" discipline the old AUTHORITATIVE
             # TOTAL-COST LINE / AUTHORITATIVE FIX-STATUS LINE this replaces
             # already followed).
             if (
                 applied_action_type in (
-                    "modify_build", "fix_warnings", "optimize_bottleneck", "use_remaining_budget",
+                    "load_build", "modify_build", "fix_warnings", "optimize_bottleneck", "use_remaining_budget",
                 )
                 and real_total is not None
             ):
@@ -1415,11 +1555,18 @@ def render_concierge_widget() -> None:
                         if not remaining
                         else f"{len(remaining)} warning(s) still remaining: {remaining[0]}"
                     )
-                after_live = live_bottleneck_and_synergy(build_state) if len(build_state) >= 2 else None
+                after_live = _sync_authoritative_analysis(build_draft or {}, build_state)
                 if before_live is not None and after_live is not None:
                     lines.append(
                         f"Bottleneck: {before_live[1]:.0f}% -> {after_live[1]:.0f}% ({after_live[2]}) | "
                         f"Synergy: {before_live[0]:.0f} -> {after_live[0]:.0f}"
+                    )
+                elif before_live is None and after_live is not None:
+                    # load_build (a brand-new build has no "before" to diff
+                    # against) — the real, Python-computed final reading only,
+                    # never anything the model's own reply might have guessed.
+                    lines.append(
+                        f"Bottleneck: {after_live[1]:.0f}% ({after_live[2]}) | Synergy: {after_live[0]:.0f}"
                     )
                 elif applied_action_type == "optimize_bottleneck" and after_live is None:
                     lines.append("Bottleneck unavailable.")

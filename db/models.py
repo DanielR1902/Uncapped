@@ -38,6 +38,10 @@ COMPONENT_CATEGORIES = (
     "NetworkCard",
     "SoundCard",
     "OpticalDrive",
+    "Monitor",
+    "Keyboard",
+    "Mouse",
+    "Headset",
 )
 
 WORKLOAD_PROFILES = ("General", "Gaming", "VideoEditing", "Design", "Programming")

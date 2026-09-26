@@ -10,7 +10,7 @@ from ui import router, state, theme
 from ui.components.chat_assistant import render_concierge_widget
 from ui.format import CURRENCY_CODES, currency_label
 
-st.set_page_config(page_title="Uncapped", page_icon="🖥️", layout="wide")
+st.set_page_config(page_title="Uncapped", page_icon="🖥️", layout="wide", menu_items=None)
 
 # Base.metadata.create_all() only creates TABLES that don't already exist —
 # safe and idempotent to call on every boot, including against an existing,
@@ -28,8 +28,7 @@ theme.inject_css()
 with st.sidebar:
     user = st.session_state.get("auth_user")
     if user is not None:
-        st.markdown(f"**{user['full_name']}**")
-        st.caption(f"@{user['username']}")
+        st.markdown(theme.profile_badge(user["full_name"], user["username"]), unsafe_allow_html=True)
         st.markdown("---")
 
         # One-shot Concierge-staged currency switch (ui/components/chat_assistant.py,

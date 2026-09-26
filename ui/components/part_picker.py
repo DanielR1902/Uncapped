@@ -51,6 +51,10 @@ _CATEGORY_ICONS = {
     "NetworkCard": "📶",
     "SoundCard": "🔊",
     "OpticalDrive": "💿",
+    "Monitor": "🖥️",
+    "Keyboard": "⌨️",
+    "Mouse": "🖱️",
+    "Headset": "🎧",
 }
 
 

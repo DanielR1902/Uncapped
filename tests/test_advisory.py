@@ -565,6 +565,128 @@ def test_get_build_advisory_accepts_real_swap_ids(seeded_db, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Stretch-budget cost/direction enforcement — a real, confirmed bug: a live
+# call proposed a stretch "upgrade" swapping a GPU for the SAME component
+# (fabricated "+400 USD"), then on the next round to a CHEAPER compatible
+# GPU labeled as a further upgrade (another fabricated positive delta).
+# _validate_advisory_actions now recomputes the real price delta for every
+# stretch_budget action and rejects (-> heuristic fallback) anything that
+# doesn't check out, exactly like the existing id/category/slot-count guards.
+# ---------------------------------------------------------------------------
+def test_get_build_advisory_falls_back_on_stretch_swap_to_same_component(seeded_db, monkeypatch):
+    """A stretch swap whose replace_with_id is the CURRENTLY-SELECTED
+    component itself (a real, compatible id — just not an upgrade at all)
+    with a nonzero added_cost_usd must fall back to heuristic: a stretch
+    action is defined as a genuine upgrade, and a no-op can never be one."""
+    _set_env(monkeypatch)
+    build_state = make_build_state()
+    payload = json.loads(json.dumps(VALID_ADVISORY_PAYLOAD))
+    payload["stretch_budget"]["actions"] = [
+        {"action": "swap", "category": "GPU", "replace_with_id": build_state["GPU"].id}
+    ]
+    payload["stretch_budget"]["added_cost_usd"] = 400.0
+
+    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+    result = advisory.get_build_advisory(build_state, mode="Budget", current_budget_or_cost=6000.0)
+    assert result["source"] == "heuristic"
+
+
+def test_get_build_advisory_falls_back_on_stretch_swap_that_is_a_downgrade(seeded_db, monkeypatch):
+    """A stretch swap to a real, compatible, but CHEAPER candidate — labeled
+    as an upgrade with a fabricated positive added_cost_usd — must fall back
+    to heuristic. Uses GPU (make_build_state's priciest-tier pick), which has
+    real cheaper compatible neighbors to draw from."""
+    _set_env(monkeypatch)
+    build_state = make_build_state()
+    gpu_candidates = solvers.get_compatible_candidates("GPU", build_state)
+    cheaper = max(
+        (c for c in gpu_candidates if c.price_usd < build_state["GPU"].price_usd),
+        key=lambda c: c.price_usd,
+        default=None,
+    )
+    assert cheaper is not None, "fixture's GPU must have a real cheaper compatible neighbor"
+
+    payload = json.loads(json.dumps(VALID_ADVISORY_PAYLOAD))
+    payload["stretch_budget"]["actions"] = [{"action": "swap", "category": "GPU", "replace_with_id": cheaper.id}]
+    payload["stretch_budget"]["added_cost_usd"] = 999.0
+
+    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+    result = advisory.get_build_advisory(build_state, mode="Budget", current_budget_or_cost=6000.0)
+    assert result["source"] == "heuristic"
+
+
+def test_get_build_advisory_falls_back_on_stretch_added_cost_mismatch(seeded_db, monkeypatch):
+    """A stretch swap to a real, genuinely PRICIER compatible candidate, but
+    with an added_cost_usd that doesn't match the real catalog price delta,
+    must still fall back — the id/direction can be right while the stated
+    number is still fabricated."""
+    _set_env(monkeypatch)
+    build_state = make_build_state()
+    cpu_candidates = solvers.get_compatible_candidates("CPU", build_state)
+    pricier = min(
+        (c for c in cpu_candidates if c.price_usd > build_state["CPU"].price_usd),
+        key=lambda c: c.price_usd,
+        default=None,
+    )
+    assert pricier is not None, "fixture's CPU must have a real pricier compatible neighbor"
+    real_delta = pricier.price_usd - build_state["CPU"].price_usd
+
+    payload = json.loads(json.dumps(VALID_ADVISORY_PAYLOAD))
+    payload["stretch_budget"]["actions"] = [{"action": "swap", "category": "CPU", "replace_with_id": pricier.id}]
+    payload["stretch_budget"]["added_cost_usd"] = real_delta + 500.0  # deliberately wrong
+
+    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+    result = advisory.get_build_advisory(build_state, mode="Budget", current_budget_or_cost=6000.0)
+    assert result["source"] == "heuristic"
+
+
+def test_get_build_advisory_accepts_real_stretch_swap_with_matching_cost(seeded_db, monkeypatch):
+    """Sanity counterpart: a stretch swap to a real, pricier candidate with
+    an added_cost_usd that exactly matches the real catalog delta must NOT
+    be rejected, and the response stays source='llm'."""
+    _set_env(monkeypatch)
+    build_state = make_build_state()
+    cpu_candidates = solvers.get_compatible_candidates("CPU", build_state)
+    pricier = min(
+        (c for c in cpu_candidates if c.price_usd > build_state["CPU"].price_usd),
+        key=lambda c: c.price_usd,
+        default=None,
+    )
+    assert pricier is not None
+    real_delta = pricier.price_usd - build_state["CPU"].price_usd
+
+    payload = json.loads(json.dumps(VALID_ADVISORY_PAYLOAD))
+    payload["stretch_budget"]["actions"] = [{"action": "swap", "category": "CPU", "replace_with_id": pricier.id}]
+    payload["stretch_budget"]["added_cost_usd"] = real_delta
+
+    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+    result = advisory.get_build_advisory(build_state, mode="Budget", current_budget_or_cost=6000.0)
+    assert result["source"] == "llm"
+
+
+def test_get_build_advisory_falls_back_on_stretch_quantity_not_an_increase(seeded_db, monkeypatch):
+    """A stretch set_quantity action requesting the SAME quantity the build
+    already has (a real, in-slot-bounds quantity — just not an increase)
+    must fall back to heuristic, matching the swap-to-same-component guard
+    above: a stretch action must always add something real."""
+    _set_env(monkeypatch)
+    build_state = make_build_state()
+    ram_candidates = solvers.get_compatible_candidates("RAM", build_state)
+    assert ram_candidates
+    build_state["RAM"] = ram_candidates[0]
+
+    payload = json.loads(json.dumps(VALID_ADVISORY_PAYLOAD))
+    payload["stretch_budget"]["actions"] = [{"action": "set_quantity", "category": "RAM", "quantity": 1}]
+    payload["stretch_budget"]["added_cost_usd"] = 0.0
+
+    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+    result = advisory.get_build_advisory(
+        build_state, mode="Budget", current_budget_or_cost=6000.0, quantities={"RAM": 1},
+    )
+    assert result["source"] == "heuristic"
+
+
+# ---------------------------------------------------------------------------
 # Heuristic fallback: swaps reference real catalog ids, can_optimize_further
 # ---------------------------------------------------------------------------
 def test_heuristic_swaps_reference_real_catalog_ids(seeded_db, monkeypatch):
@@ -711,10 +833,17 @@ def test_set_quantity_action_within_ram_slots_survives_validation(seeded_db, mon
     ram_slots = advisory._real_slot_count(build_state, "RAM")
     assert ram_slots is not None and ram_slots >= 1
 
+    # added_cost_usd must be the REAL catalog delta (one more unit at the
+    # current RAM pick's own price, times how many units this adds over the
+    # default current quantity of 1) — _validate_advisory_actions now
+    # recomputes and cross-checks this real figure too, not just the id/slot
+    # bound, so a stale stub number here would (correctly) fall to heuristic.
+    real_added_cost = build_state["RAM"].price_usd * (ram_slots - 1)
     payload = json.loads(json.dumps(VALID_ADVISORY_PAYLOAD))
     payload["stretch_budget"]["actions"] = [
         {"action": "set_quantity", "category": "RAM", "quantity": ram_slots}
     ]
+    payload["stretch_budget"]["added_cost_usd"] = real_added_cost
 
     monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
     result = advisory.get_build_advisory(build_state, mode="Free", current_budget_or_cost=1000.0)

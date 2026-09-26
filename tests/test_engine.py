@@ -427,6 +427,64 @@ def test_budget_solver_converges_toward_ceiling_not_just_cheapest(seeded_db):
     assert total_cost >= ceiling * 0.5
 
 
+def test_budget_solver_spend_up_pass_closes_real_under_utilization_gap(seeded_db):
+    """Root-cause regression test for a real, confirmed bug: `_greedy_fill`'s
+    own per-category "reserve for others' cheapest option" heuristic commits
+    each category's spend without ever revisiting an earlier pick once later
+    categories turn out cheaper than reserved for -- verified empirically
+    against this exact catalog to leave a $6,521.74 ceiling (a live-reported
+    "6000 EUR budget" case) converging to only ~65.6%, even though every
+    category still had a real, affordable upgrade within the leftover
+    headroom. For a ceiling that's actually ACHIEVABLE given this catalog's
+    real prices (unlike that one, which exceeds the catalog's own true
+    maximum -- see the next test), the `_spend_up_remaining_headroom` pass
+    this fixes must now converge close to 100%, not just "a substantial
+    fraction"."""
+    ceiling = 3243.24  # comfortably under this catalog's real max full-build cost
+    build = solvers.initialize_budget_build(ceiling, fill_peripherals_with_surplus=True)
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= ceiling
+    assert total_cost >= ceiling * 0.95
+
+
+def test_budget_solver_never_exceeds_catalogs_true_maximum_possible_cost(seeded_db):
+    """A ceiling ABOVE the catalog's own true maximum possible full-build cost
+    (every category's single priciest real option, summed) can never be
+    reached by any algorithm -- not a solver defect, a hard data ceiling.
+    This is the exact scenario a live "6000 EUR" report turned out to be:
+    the catalog's real maximum is well under that figure, so ~65% utilization
+    was already the correct, maximum-possible answer, not under-spending."""
+    from db.repositories import components_repo
+
+    theoretical_max = sum(
+        max(c.price_usd for c in components_repo.get_by_category(cat))
+        for cat in solvers.CATEGORY_ORDER
+    )
+    ceiling = theoretical_max * 2  # deliberately unreachable
+    build = solvers.initialize_budget_build(ceiling, fill_peripherals_with_surplus=True)
+    total_cost = sum(c.price_usd for c in build.values())
+    assert total_cost <= theoretical_max
+    assert total_cost <= ceiling
+
+
+def test_budget_solver_spend_up_pass_never_touches_a_caller_pinned_category(seeded_db):
+    """The spend-up pass must never proactively upgrade a category the
+    CALLER explicitly pinned via `seed_selection` -- a user's own explicit
+    part choice is preserved, never silently swapped out just because
+    headroom remains (the same "a pin only yields to necessity" precedent
+    `_downgrade_pinned_until_feasible` already applies in the other
+    direction)."""
+    from db.repositories import components_repo
+
+    cheapest_gpu = min(components_repo.get_by_category("GPU"), key=lambda c: c.price_usd)
+    ceiling = 3243.24
+    build = solvers.initialize_budget_build(
+        ceiling, seed_selection={"GPU": cheapest_gpu}, fill_peripherals_with_surplus=True,
+    )
+    assert build["GPU"].id == cheapest_gpu.id
+    assert sum(c.price_usd for c in build.values()) <= ceiling
+
+
 def test_budget_solver_degrades_gracefully_on_unrealistic_ceiling(seeded_db):
     # ceiling far below the true minimum full-build cost: every category must
     # still get filled (never left empty), even though this necessarily

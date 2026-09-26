@@ -11,7 +11,7 @@ Uncapped is an AI-assisted, Spec-Driven Development (SDD) PC configuration platf
   * Session State: Persistent login with an accessible Logout button in the bottom left sidebar.
 
 3. PC BUILD ENGINE (THREE CREATION MODES)
-Supports 8 core components (CPU, Motherboard, GPU, RAM, Storage, PSU, Case, Cooler) alongside optional peripheral expansion slots (Network Card, Sound Card, Optical Drive).
+Supports 8 core components (CPU, Motherboard, GPU, RAM, Storage, PSU, Case, Cooler) alongside optional internal peripheral expansion slots (Network Card, Sound Card, Optical Drive) AND optional desk/setup peripherals (Monitor, Keyboard, Mouse, Headset) — the latter carry no PC-internal compatibility constraints (no socket/slot/wattage interaction with the rest of the build) and are purely additive to Total Cost, rendered in their own dedicated "Optional Peripherals & Setup" section distinct from the internal expansion-slot peripherals.
 - Mode A: Budget Constrained Build
   * User defines a monetary ceiling.
   * Greedy/Max-coverage algorithm computes viable hardware patterns converging to the ceiling.

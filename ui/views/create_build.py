@@ -34,6 +34,12 @@ from ui.format import format_currency, humanize_profile, sanitize_markdown
 
 CORE_CATEGORIES = solvers.CATEGORY_ORDER
 PERIPHERAL_CATEGORIES = solvers.PERIPHERAL_CATEGORIES
+# Desk/setup peripherals (spec.md §7.4) — no PC-internal compatibility
+# constraints at all (no socket/slot/wattage interaction with the rest of
+# the build), so these are never touched by engine.solvers (not part of
+# PERIPHERAL_CATEGORIES/the Budget solver's surplus-fill) and are rendered
+# in their own distinct UI section, manual-pick-only in every creation mode.
+DESK_PERIPHERAL_CATEGORIES = ("Monitor", "Keyboard", "Mouse", "Headset")
 TIERS = ("Entry", "Mid", "High", "Enthusiast")
 
 _MODE_CARDS = (
@@ -224,6 +230,20 @@ def _part_pickers(build_draft: dict, build_state: dict) -> None:
                     on_remove=lambda cat=category: state.remove_component(build_draft, cat),
                     budget_ceiling=build_draft.get("budget_ceiling"),
                 )
+
+    st.markdown("#### 🎧 Optional Peripherals & Setup")
+    desk_periph_cols = st.columns(2)
+    for index, category in enumerate(DESK_PERIPHERAL_CATEGORIES):
+        candidates = components_repo.get_by_category(category)
+        with desk_periph_cols[index % 2]:
+            render_part_picker(
+                category,
+                build_state,
+                candidates,
+                on_select=lambda component, cat=category: state.set_component(build_draft, cat, component),
+                on_remove=lambda cat=category: state.remove_component(build_draft, cat),
+                budget_ceiling=build_draft.get("budget_ceiling"),
+            )
 
 
 def _maybe_auto_analyze(build_draft: dict, build_state: dict) -> None:

@@ -2232,7 +2232,37 @@ def test_use_remaining_budget_action_passes_through(monkeypatch):
     )
 
     assert result["source"] == "llm"
-    assert result["action"] == {"type": "use_remaining_budget", "explanation": ""}
+    # budget_cap_usd defaults to None and is always present in the dumped
+    # action (this round's spec.md §6.7 intent 13 extension).
+    assert result["action"] == {"type": "use_remaining_budget", "budget_cap_usd": None, "explanation": ""}
+
+
+def test_use_remaining_budget_action_parses_freshly_stated_ceiling(monkeypatch):
+    """"you have 13000 NIS, upgrade it accordingly" against a build that was
+    NEVER in Budget mode at all -- the model extracts the stated ceiling
+    (converted to USD) into budget_cap_usd rather than requiring an
+    already-set budget_ceiling."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Using your remaining budget on the best upgrades that fit.",
+        "action": {"type": "use_remaining_budget", "budget_cap_usd": 3513.51},
+        "currency_switch": "NIS",
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    build_context = dict(CURRENT_BUILD_CONTEXT)
+    build_context["mode"] = "Free"
+    build_context["budget_ceiling"] = None
+
+    result = concierge.get_concierge_response(
+        "you have 13000 NIS, upgrade it accordingly", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY,
+        current_build_context=build_context,
+        currency_rates={"USD": 1.0, "EUR": 0.92, "NIS": 3.70},
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["budget_cap_usd"] == 3513.51
+    assert result["currency_switch"] == "NIS"
 
 
 # ---------------------------------------------------------------------------

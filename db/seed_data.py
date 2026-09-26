@@ -434,6 +434,39 @@ STORAGE = [
          workloads=[W("VideoEditing", "High", 0.7)]),
 ]
 
+# High-capacity NVMe additions (4TB/8TB) — kept in a SEPARATE list appended
+# at the very end of ALL_COMPONENTS (below), rather than inside STORAGE
+# itself, even though they're logically Storage-category rows:
+# seed_admin_builds.py's BuildPlan.free_component_ids references components
+# by fixed, hardcoded integer id (assigned by insertion order at seed time),
+# so inserting new rows anywhere before the LAST category with a hardcoded
+# reference (Cooler) shifts every subsequent id and silently corrupts those
+# references — verified live: an earlier attempt at inserting these inline
+# broke 2 admin build plans' Cooler/PSU/Case lookups. Appending only at the
+# true end of the flat ALL_COMPONENTS list is the only insertion point that
+# can never shift an existing id; the `category` field (not list position)
+# is what actually determines these rows show up under Storage everywhere.
+EXTRA_STORAGE = [
+    PART("Storage", "Samsung 990 Pro 4TB", "Samsung", 299, interface="NVMe", capacity_gb=4000,
+         specs={"read_speed_mbps": 7450, "write_speed_mbps": 6900, "form_factor": "M.2-2280"},
+         workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Design", "Enthusiast", 1.0)]),
+    PART("Storage", "WD Black SN850X 4TB", "Western Digital", 309, interface="NVMe", capacity_gb=4000,
+         specs={"read_speed_mbps": 7300, "write_speed_mbps": 6600, "form_factor": "M.2-2280"},
+         workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Gaming", "Enthusiast", 0.85)]),
+    PART("Storage", "Crucial T705 4TB", "Crucial", 379, interface="NVMe", capacity_gb=4000,
+         specs={"read_speed_mbps": 14500, "write_speed_mbps": 12700, "form_factor": "M.2-2280",
+                "pcie_generation": "5.0"},
+         workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Design", "Enthusiast", 1.0),
+                    W("Programming", "Enthusiast", 0.85)]),
+    PART("Storage", "Samsung 990 Pro 8TB", "Samsung", 649, interface="NVMe", capacity_gb=8000,
+         specs={"read_speed_mbps": 7450, "write_speed_mbps": 6900, "form_factor": "M.2-2280"},
+         workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Design", "Enthusiast", 1.0)]),
+    PART("Storage", "Crucial T705 8TB", "Crucial", 749, interface="NVMe", capacity_gb=8000,
+         specs={"read_speed_mbps": 14500, "write_speed_mbps": 12700, "form_factor": "M.2-2280",
+                "pcie_generation": "5.0"},
+         workloads=[W("VideoEditing", "Enthusiast", 1.0), W("Programming", "Enthusiast", 0.85)]),
+]
+
 # ---------------------------------------------------------------------------
 # PSU
 # ---------------------------------------------------------------------------
@@ -640,6 +673,66 @@ PERIPHERALS = [
          workloads=[W("General", "Mid", 1.0)]),
 ]
 
+# ---------------------------------------------------------------------------
+# Desk / Setup Peripherals (Monitor, Keyboard, Mouse, Headset) — carry no
+# PC-internal compatibility constraints (no socket/slot/wattage interaction
+# with the rest of the build) and are never touched by allocate_workload_
+# baseline/PERIPHERAL_CATEGORIES, so `workloads` tags are omitted entirely
+# here rather than fabricated for a feature that would never read them.
+# ---------------------------------------------------------------------------
+DESK_PERIPHERALS = [
+    # --- Monitor ---
+    PART("Monitor", "AOC 24G2 24\" 1080p 144Hz IPS", "AOC", 109,
+         specs={"resolution": "1920x1080", "refresh_hz": 144, "panel": "IPS", "size_in": 24}),
+    PART("Monitor", "Dell S2721QS 27\" 4K 60Hz IPS", "Dell", 179,
+         specs={"resolution": "3840x2160", "refresh_hz": 60, "panel": "IPS", "size_in": 27}),
+    PART("Monitor", "LG 34WN80C 34\" Curved Ultrawide QHD USB-C", "LG", 449,
+         specs={"resolution": "3440x1440", "refresh_hz": 60, "panel": "IPS", "size_in": 34,
+                "usb_c_power_delivery": True}),
+    PART("Monitor", "ASUS ProArt PA279CV 27\" 4K 100% sRGB Calibrated", "ASUS", 599,
+         specs={"resolution": "3840x2160", "refresh_hz": 60, "panel": "IPS", "size_in": 27,
+                "factory_calibrated": True, "color_gamut": "100% sRGB"}),
+    PART("Monitor", "Alienware AW2725DF 27\" QHD 280Hz QD-OLED", "Alienware", 899,
+         specs={"resolution": "2560x1440", "refresh_hz": 280, "panel": "QD-OLED", "size_in": 27}),
+    PART("Monitor", "LG 45GR95QE 45\" Curved Ultrawide QHD 240Hz OLED", "LG", 1399,
+         specs={"resolution": "3440x1440", "refresh_hz": 240, "panel": "OLED", "size_in": 45}),
+    # --- Keyboard ---
+    PART("Keyboard", "Logitech K120 Membrane", "Logitech", 15,
+         specs={"switch_type": "Membrane", "form_factor": "Full-size", "wireless": False}),
+    PART("Keyboard", "Dell KB216 Quiet Membrane", "Dell", 22,
+         specs={"switch_type": "Membrane", "form_factor": "Full-size", "wireless": False}),
+    PART("Keyboard", "Logitech MX Keys", "Logitech", 109,
+         specs={"switch_type": "Scissor", "form_factor": "Full-size", "wireless": True}),
+    PART("Keyboard", "Logitech Ergo K860 Split", "Logitech", 149,
+         specs={"switch_type": "Scissor", "form_factor": "Split-ergonomic", "wireless": True}),
+    PART("Keyboard", "Keychron Q1 Hot-Swap Mechanical", "Keychron", 179,
+         specs={"switch_type": "Mechanical (hot-swap)", "form_factor": "75%", "keycap_material": "PBT"}),
+    PART("Keyboard", "Wooting 60HE Hot-Swap Mechanical", "Wooting", 199,
+         specs={"switch_type": "Mechanical (hot-swap, analog)", "form_factor": "60%", "keycap_material": "PBT"}),
+    # --- Mouse ---
+    PART("Mouse", "Logitech M185 Optical", "Logitech", 16,
+         specs={"sensor": "Optical", "dpi_max": 1000, "wireless": True}),
+    PART("Mouse", "Dell MS116 Wired Optical", "Dell", 12,
+         specs={"sensor": "Optical", "dpi_max": 1000, "wireless": False}),
+    PART("Mouse", "Logitech MX Master 3S", "Logitech", 99,
+         specs={"sensor": "Optical", "dpi_max": 8000, "wireless": True, "ergonomic": "Vertical-friendly"}),
+    PART("Mouse", "Logitech MX Vertical", "Logitech", 89,
+         specs={"sensor": "Optical", "dpi_max": 4000, "wireless": True, "ergonomic": "Vertical"}),
+    PART("Mouse", "Razer Viper V3 Pro Lightweight Wireless", "Razer", 159,
+         specs={"sensor": "Optical", "dpi_max": 35000, "polling_rate_hz": 8000, "weight_g": 54, "wireless": True}),
+    # --- Headset ---
+    PART("Headset", "Anker Soundcore Life Q35 ANC", "Anker", 49,
+         specs={"type": "Office ANC", "wireless": True, "microphone": True}),
+    PART("Headset", "Jabra Evolve2 65", "Jabra", 65,
+         specs={"type": "Office ANC", "wireless": True, "microphone": True}),
+    PART("Headset", "Audio-Technica ATH-M50x Studio Monitoring", "Audio-Technica", 149,
+         specs={"type": "Studio Monitoring", "wireless": False, "microphone": False}),
+    PART("Headset", "Sennheiser HD 660S2 Reference", "Sennheiser", 299,
+         specs={"type": "Studio Monitoring", "wireless": False, "microphone": False}),
+    PART("Headset", "SteelSeries Arctis Nova Pro Wireless Gaming", "SteelSeries", 249,
+         specs={"type": "Gaming Spatial Audio", "wireless": True, "microphone": True}),
+]
+
 ALL_COMPONENTS: list[dict[str, Any]] = [
     *CPUS,
     *MOTHERBOARDS,
@@ -650,4 +743,6 @@ ALL_COMPONENTS: list[dict[str, Any]] = [
     *CASE,
     *COOLER,
     *PERIPHERALS,
+    *DESK_PERIPHERALS,
+    *EXTRA_STORAGE,
 ]

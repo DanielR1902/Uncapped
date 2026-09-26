@@ -546,11 +546,12 @@ class ConciergeUseRemainingBudgetAction(BaseModel):
     """The user's explicit request to spend whatever budget headroom is left
     on the CURRENTLY ACTIVE build (e.g. "is there any upgrade possible within
     my budget?", "how much can you add without going over budget?", "upgrade
-    what you can with the remaining budget") — requires `current_build_
-    context["mode"] == "Budget"` with a real numeric ceiling (see llm/
-    concierge.py SYSTEM_PROMPT); if there's no active Budget-mode build, or
-    it's already effectively maxed out, the model must say so plainly in
-    `reply` and return `action: null` instead.
+    what you can with the remaining budget", "you have 13000 NIS, upgrade it
+    accordingly") — requires EITHER `current_build_context["mode"] ==
+    "Budget"` with a real numeric ceiling already set, OR a fresh ceiling
+    figure stated in THIS message (`budget_cap_usd` below); if neither
+    applies, or the build is already effectively maxed out, the model must
+    say so plainly in `reply` and return `action: null` instead.
 
     Carries NO LLM-asserted catalog id, category, or price delta — a real,
     confirmed failure mode this replaces: the model is NOT reliable at
@@ -571,6 +572,16 @@ class ConciergeUseRemainingBudgetAction(BaseModel):
     `ConciergeFixWarningsAction`/`ConciergeOptimizeBottleneckAction` above."""
 
     type: Literal["use_remaining_budget"] = "use_remaining_budget"
+    # Real, converted-to-USD ceiling the user stated FRESH in this message
+    # (e.g. "you have 13000 NIS, upgrade it accordingly" against a build that
+    # was never in Budget mode at all) — the SAME BUDGET CURRENCY CONVERSION
+    # mechanism `ConciergeLoadBuildAction.budget_cap_usd` uses. `None` when
+    # the user didn't state a new figure, in which case the caller falls
+    # back to `current_build_context`'s own EXISTING `budget_ceiling` (only
+    # meaningful when `mode == "Budget"` already). When this IS set, the
+    # caller converts/keeps the active build in Budget mode under this
+    # ceiling going forward, even if it was previously Free/Workload mode.
+    budget_cap_usd: float | None = None
     explanation: str = ""
 
 

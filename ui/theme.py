@@ -79,6 +79,25 @@ def avatar_html(name: str, size_px: int = 32) -> str:
     )
 
 
+def profile_badge(full_name: str, username: str) -> str:
+    """Sidebar "cyber identity" card (spec.md §7.7/§7.8) replacing the plain
+    `**{full_name}**` + `@{username}` caption — a bold, cyan display name
+    with an inline "ARCHITECT" role tag on line 1, and a muted monospace
+    "@{username} • Online" handle on line 2. Both `full_name`/`username` are
+    real user-supplied text (registration fields) — HTML-escaped before
+    interpolation, the same discipline `avatar_html`/`tag` already follow.
+    Render via `st.markdown(profile_badge(...), unsafe_allow_html=True)`."""
+    safe_name = html.escape(full_name) if full_name else "Architect"
+    safe_username = html.escape(username) if username else ""
+    return (
+        '<div class="uncapped-profile-badge">'
+        f'<div class="uncapped-profile-badge-name">⚡ {safe_name}'
+        f'<span class="uncapped-profile-badge-role">ARCHITECT</span></div>'
+        f'<div class="uncapped-profile-badge-handle">@{safe_username} • Online</div>'
+        "</div>"
+    )
+
+
 _PULSE_STATUS_COLORS = {
     "good": MATRIX_GREEN,
     "warning": WARNING_ACCENT,
@@ -457,6 +476,73 @@ def inject_css() -> None:
         /* No tag qualifier — confirmed live this element is actually a
         <div>, not a <button> as its testid name might suggest. */
         [data-testid="stSidebarCollapseButton"] {{ display: none !important; }}
+
+        /* Hide Streamlit's own default chrome — the top header bar (which
+        holds the Deploy button and the "..." options menu) and, best-effort,
+        the options-menu button specifically. Confirmed live (Streamlit
+        1.63.0) the real DOM is `header[data-testid="stHeader"]` containing
+        `div[data-testid="stToolbar"]`, which in turn contains
+        `div[data-testid="stAppDeployButton"]` (the Deploy button) and
+        `span[data-testid="stMainMenu"]` (the "..." menu) — NOT a
+        `.stDeployButton` class or a bare `#MainMenu` id as a first guess
+        might assume (`#MainMenu` DOES still exist as a legacy compatibility
+        id on that same `stMainMenu` span, verified live, but the real
+        testid is the one this rule targets). Hiding the outer `stHeader`
+        alone already hides everything nested inside it; the `stToolbar`/
+        `stAppDeployButton` rules are extra, harmless belt-and-suspenders in
+        case a future Streamlit version restructures the header but keeps
+        those inner testids stable. No `<footer>` element exists anywhere in
+        this Streamlit version's DOM (checked live) — there is nothing for a
+        `footer { ... }` rule to target, so none is included here.
+        `min-height` must be zeroed too, not just `height`: confirmed live
+        Streamlit's own emotion CSS sets a `min-height: 60px` on this
+        element, and `min-height` always wins as the effective rendered
+        height over a smaller `height` regardless of `!important` on
+        `height` alone (a real box-model floor, not a specificity fight) —
+        `height: 0px !important` by itself left a real 60px blank (if
+        invisible) gap at the top of the page. */
+        header[data-testid="stHeader"] {{
+            visibility: hidden !important;
+            height: 0px !important;
+            min-height: 0px !important;
+        }}
+        div[data-testid="stToolbar"], div[data-testid="stAppDeployButton"] {{
+            visibility: hidden !important;
+            display: none !important;
+        }}
+
+        /* User profile identity card (spec.md §7.7/§7.8, theme.profile_badge)
+        — the sidebar's own bold-name + muted-@handle text, reskinned as a
+        small "cyber identity" module. */
+        .uncapped-profile-badge {{
+            background: rgba(16, 34, 53, 0.65);
+            border: 1px solid rgba(0, 229, 255, 0.25);
+            border-radius: 6px;
+            padding: 10px 14px;
+            margin-bottom: 0.5rem;
+        }}
+        .uncapped-profile-badge-name {{
+            font-size: 1rem;
+            font-weight: 700;
+            color: {PRIMARY_ACCENT};
+        }}
+        .uncapped-profile-badge-role {{
+            font-family: {FONT_MONO};
+            font-size: 0.7rem;
+            font-weight: 600;
+            color: {PRIMARY_ACCENT};
+            border: 1px solid {PRIMARY_ACCENT}55;
+            border-radius: 4px;
+            padding: 1px 5px;
+            margin-left: 6px;
+            vertical-align: middle;
+        }}
+        .uncapped-profile-badge-handle {{
+            font-family: {FONT_MONO};
+            font-size: 0.8rem;
+            color: {TEXT_MUTED};
+            margin-top: 2px;
+        }}
         /* Widened from an earlier round's 320px (spec.md §7.7/§7.8) — the
         currency segmented control, nav buttons, and Concierge chat/telemetry
         were cramped at that width. 420px keeps a real min/max range

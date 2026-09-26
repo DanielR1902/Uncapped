@@ -540,6 +540,65 @@ def _fill_peripherals_with_surplus(core_build: BuildState, ceiling: float) -> Bu
     return result
 
 
+def _spend_up_remaining_headroom(
+    result: BuildState, adjustable_categories: list[str], ceiling: float
+) -> BuildState:
+    """Repair pass for a real, confirmed under-utilization bug: `_greedy_fill`'s
+    own per-category "reserve enough for every OTHER open category's cheapest
+    option, then take the most expensive still-affordable candidate" heuristic
+    can leave substantial, genuinely spendable headroom unused once every
+    category is filled — verified empirically against this catalog: a
+    $6,521.74 ceiling (6000 EUR) converged to only ~65.6% ($4,281) even
+    though every one of the 8 core categories still had a real, affordable
+    upgrade available within the leftover ~$2,241. The per-category
+    reservation math that makes the main loop safe (never overshoot) is
+    exactly what makes it conservative — it commits each category's spend
+    without ever revisiting an EARLIER pick once LATER categories turn out
+    cheaper than reserved for.
+
+    This closes that gap deterministically: repeatedly finds, across every
+    category in `adjustable_categories` (never a category the CALLER pinned
+    via `seed_selection` — a user's own explicit part choice is preserved,
+    never proactively upgraded out from under them, the same "a pin only
+    ever yields to necessity" precedent `_downgrade_pinned_until_feasible`
+    already applies in the other direction), the single BIGGEST real
+    catalog upgrade (of any one category) that still fits within the
+    remaining headroom, applies it, and repeats — stopping only once no
+    category has any further affordable upgrade at all. Always terminates:
+    each accepted step strictly increases the total and strictly shrinks the
+    remaining headroom, and every category's own candidate pool is finite."""
+    total = sum(c.price_usd for c in result.values())
+    remaining = ceiling - total
+    progress = True
+    while remaining > 0 and progress:
+        progress = False
+        best_category: str | None = None
+        best_upgrade: Component | None = None
+        best_delta = 0.0
+        for category in adjustable_categories:
+            current = result.get(category)
+            if current is None:
+                continue
+            others = {c: v for c, v in result.items() if c != category}
+            candidates = get_compatible_candidates(category, others)
+            affordable_upgrades = [
+                c for c in candidates
+                if c.price_usd > current.price_usd and c.price_usd - current.price_usd <= remaining
+            ]
+            if not affordable_upgrades:
+                continue
+            upgrade = max(affordable_upgrades, key=lambda c: c.price_usd)
+            delta = upgrade.price_usd - current.price_usd
+            if delta > best_delta:
+                best_category, best_upgrade, best_delta = category, upgrade, delta
+        if best_category is not None:
+            result[best_category] = best_upgrade
+            remaining -= best_delta
+            total += best_delta
+            progress = True
+    return result
+
+
 def initialize_budget_build(
     ceiling: float,
     seed_selection: BuildState | None = None,
@@ -556,6 +615,7 @@ def initialize_budget_build(
     selection = dict(seed_selection or {})
     remaining_categories = [c for c in CATEGORY_ORDER if c not in selection]
     core_build = _greedy_fill(selection, remaining_categories, ceiling)
+    core_build = _spend_up_remaining_headroom(core_build, remaining_categories, ceiling)
     if fill_peripherals_with_surplus:
         return _fill_peripherals_with_surplus(core_build, ceiling)
     return core_build
