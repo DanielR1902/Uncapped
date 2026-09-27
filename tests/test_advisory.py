@@ -309,9 +309,33 @@ def test_get_build_advisory_falls_back_on_connection_error(seeded_db, monkeypatc
         raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(advisory.httpx, "post", fake_post)
+    monkeypatch.setattr(advisory.time, "sleep", lambda _seconds: None)
     result = advisory.get_build_advisory(make_build_state(), mode="Budget", current_budget_or_cost=1500.0)
     assert result["source"] == "heuristic"
     assert result["pros"] and result["cons"]
+
+
+def test_get_build_advisory_transparently_retries_transient_connection_error(seeded_db, monkeypatch):
+    """A cold-start DNS/connection failure on the FIRST attempt must not
+    surface to the caller when a later attempt (within
+    advisory.MAX_REQUEST_ATTEMPTS) succeeds."""
+    _set_env(monkeypatch)
+    build_state = make_build_state()
+    payload = _valid_payload_with_stretch_swap(build_state)
+    calls = {"count": 0}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise httpx.ConnectError("getaddrinfo failed")
+        return _fake_openrouter_response(payload)
+
+    monkeypatch.setattr(advisory.httpx, "post", fake_post)
+    monkeypatch.setattr(advisory.time, "sleep", lambda _seconds: None)
+
+    result = advisory.get_build_advisory(build_state, mode="Budget", current_budget_or_cost=1500.0)
+    assert result["source"] == "llm"
+    assert calls["count"] == 3
 
 
 def test_get_build_advisory_falls_back_on_schema_validation_failure(seeded_db, monkeypatch):

@@ -346,8 +346,36 @@ def test_falls_back_on_connection_error(monkeypatch):
         raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(concierge.httpx, "post", fake_post)
+    monkeypatch.setattr(concierge.time, "sleep", lambda _seconds: None)
     result = concierge.get_concierge_response("Hello", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY)
     assert result["source"] == "heuristic"
+
+
+def test_transparently_retries_transient_connection_error_on_first_turn(monkeypatch):
+    """The directive scenario this feature targets: a cold-start DNS/
+    connection failure on the very first OpenRouter call of a session (e.g.
+    the user's first chat message) must not surface to the user at all when
+    a later attempt succeeds — no dropping to the heuristic fallback."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Heading to the Community page.",
+        "action": {"type": "navigate", "navigate_to": "community", "filters": None, "reset_mode": False},
+    }
+    calls = {"count": 0}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise httpx.ConnectError("getaddrinfo failed")
+        return _fake_openrouter_response(payload)
+
+    monkeypatch.setattr(concierge.httpx, "post", fake_post)
+    monkeypatch.setattr(concierge.time, "sleep", lambda _seconds: None)
+
+    result = concierge.get_concierge_response("go to community", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY)
+    assert result["source"] == "llm"
+    assert result["action"]["navigate_to"] == "community"
+    assert calls["count"] == 3
 
 
 def test_falls_back_on_malformed_json_content(monkeypatch):

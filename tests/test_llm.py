@@ -189,8 +189,50 @@ def test_analyze_build_falls_back_on_connection_error(temp_db, monkeypatch):
         raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(llm_client.httpx, "post", fake_post)
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _seconds: None)
     response = llm_client.analyze_build(make_build_state())
     assert response.source == "heuristic"
+
+
+def test_analyze_build_transparently_retries_transient_connection_error(temp_db, monkeypatch):
+    """A cold-start DNS/connection failure (e.g. Windows Errno 11001
+    getaddrinfo failed) on the FIRST attempt must not surface to the caller
+    at all when a later attempt (within MAX_REQUEST_ATTEMPTS) succeeds — the
+    retry is transparent, not just a fallback-avoider."""
+    _set_env(monkeypatch)
+    calls = {"count": 0}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise httpx.ConnectError("getaddrinfo failed")
+        return _fake_openrouter_response(VALID_RESPONSE_PAYLOAD)
+
+    monkeypatch.setattr(llm_client.httpx, "post", fake_post)
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _seconds: None)  # don't actually wait 1s x2 in tests
+
+    response = llm_client.analyze_build(make_build_state())
+    assert response.source == "llm"  # recovered — never fell back to heuristic
+    assert calls["count"] == 3
+
+
+def test_analyze_build_falls_back_after_exhausting_all_retry_attempts(temp_db, monkeypatch):
+    """All MAX_REQUEST_ATTEMPTS attempts failing transiently must still fall
+    back gracefully (never raise to the caller), exactly like a single
+    immediate failure did before this feature existed."""
+    _set_env(monkeypatch)
+    calls = {"count": 0}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        calls["count"] += 1
+        raise httpx.ConnectError("getaddrinfo failed")
+
+    monkeypatch.setattr(llm_client.httpx, "post", fake_post)
+    monkeypatch.setattr(llm_client.time, "sleep", lambda _seconds: None)
+
+    response = llm_client.analyze_build(make_build_state())
+    assert response.source == "heuristic"
+    assert calls["count"] == llm_client.MAX_REQUEST_ATTEMPTS == 3
 
 
 def test_analyze_build_falls_back_on_rate_limit(temp_db, monkeypatch):

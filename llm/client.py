@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from typing import Any
 
 import httpx
@@ -27,8 +28,45 @@ from llm.schemas import (
 )
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-REQUEST_TIMEOUT_SECONDS = 15.0
+# Extended from 15.0 — a cold-start DNS/connection lookup (the very first
+# request of a session, before any connection pool is warm) can genuinely
+# take longer than a warm subsequent one; 25s gives it room without the
+# retry loop below having to lean on a razor-thin timeout too.
+REQUEST_TIMEOUT_SECONDS = 25.0
 BOTTLENECK_CLAMP_RANGE = 10.0
+
+# Cold-start network/DNS resilience: on some machines the FIRST OpenRouter
+# request of a session intermittently fails with a transient connection/DNS
+# error (e.g. Windows Errno 11001 getaddrinfo failed) purely because the
+# underlying connection pool has nothing warm yet — the very next attempt
+# then succeeds. Only these genuinely transient, connection-establishment
+# failures are retried; a real non-2xx HTTP response or a schema/parse
+# failure is a different, non-transient problem and is never retried here.
+MAX_REQUEST_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 1.0
+_RETRYABLE_NETWORK_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)
+
+
+def _post_with_retry(url: str, **kwargs: Any) -> httpx.Response:
+    """`httpx.post` with up to `MAX_REQUEST_ATTEMPTS` total attempts, 1s apart,
+    for the transient network/DNS failures above — the caller's own
+    `except httpx.TimeoutException`/`except httpx.HTTPError` blocks are
+    unchanged and still fire normally once every attempt here is exhausted."""
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            return httpx.post(url, **kwargs)
+        except _RETRYABLE_NETWORK_ERRORS as exc:
+            last_exc = exc
+            if attempt < MAX_REQUEST_ATTEMPTS:
+                print(
+                    f"OpenRouter request attempt {attempt}/{MAX_REQUEST_ATTEMPTS} "
+                    f"failed transiently ({exc!r}) — retrying...",
+                    file=sys.stderr,
+                )
+                time.sleep(RETRY_DELAY_SECONDS)
+    assert last_exc is not None
+    raise last_exc
 
 
 class LLMUnavailableError(Exception):
@@ -55,7 +93,7 @@ def _model() -> str:
 
 def _call_openrouter(request: BuildAnalysisRequest) -> dict[str, Any]:
     try:
-        response = httpx.post(
+        response = _post_with_retry(
             OPENROUTER_URL,
             timeout=REQUEST_TIMEOUT_SECONDS,
             headers={

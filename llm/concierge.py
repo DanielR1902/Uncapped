@@ -44,6 +44,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import traceback
 from typing import Any
 
@@ -54,7 +55,37 @@ from engine.solvers import CATEGORY_ORDER, PERIPHERAL_CATEGORIES
 from llm.schemas import ConciergeResponse
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-REQUEST_TIMEOUT_SECONDS = 15.0
+# Extended from 15.0 — see llm/client.py's own REQUEST_TIMEOUT_SECONDS
+# comment (cold-start DNS/connection lookups need more room than a warm one).
+REQUEST_TIMEOUT_SECONDS = 25.0
+
+# Cold-start network/DNS resilience — same rationale/behavior as
+# llm/client.py's own _post_with_retry (kept duplicated here rather than
+# imported, matching this package's existing one-concern-per-file
+# convention: OPENROUTER_URL/REQUEST_TIMEOUT_SECONDS above are already
+# duplicated the same way rather than shared across client.py/advisory.py/
+# concierge.py).
+MAX_REQUEST_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 1.0
+_RETRYABLE_NETWORK_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)
+
+
+def _post_with_retry(url: str, **kwargs: Any) -> httpx.Response:
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            return httpx.post(url, **kwargs)
+        except _RETRYABLE_NETWORK_ERRORS as exc:
+            last_exc = exc
+            if attempt < MAX_REQUEST_ATTEMPTS:
+                print(
+                    f"OpenRouter request attempt {attempt}/{MAX_REQUEST_ATTEMPTS} "
+                    f"failed transiently ({exc!r}) — retrying...",
+                    file=sys.stderr,
+                )
+                time.sleep(RETRY_DELAY_SECONDS)
+    assert last_exc is not None
+    raise last_exc
 
 # The 8 core build categories a "build me a PC" request must ALWAYS end up
 # filling in. Peripherals (NetworkCard/SoundCard/OpticalDrive) are a separate,
@@ -1013,7 +1044,7 @@ def _messages(payload: dict) -> list[dict]:
 
 def _call_openrouter(payload: dict) -> dict[str, Any]:
     try:
-        response = httpx.post(
+        response = _post_with_retry(
             OPENROUTER_URL,
             timeout=REQUEST_TIMEOUT_SECONDS,
             headers={
