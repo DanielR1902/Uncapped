@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
-from db import database
+from db import database, seed_mass_content
 from db.models import Build, CommunityComment, CommunityPost, User
 from db.repositories import builds_repo, components_repo
 from db.seed_mass_content import seed_if_empty
@@ -54,6 +55,24 @@ def test_seed_if_empty_bootstraps_a_genuinely_fresh_database(temp_db):
     assert after["builds"] == 70
     assert after["posts"] == 30
     assert after["comments"] > 0
+
+
+def test_seed_if_empty_backs_off_gracefully_on_concurrent_integrity_error(temp_db, monkeypatch):
+    """Regression for the reported startup crash: if a concurrent
+    seed_if_empty() call (another Streamlit session cold-starting the same
+    freshly-deployed, empty database at once) causes an IntegrityError
+    somewhere in this call's own seeding attempt, this call must back off
+    and return None instead of propagating the crash up through app.py's
+    module-level startup code."""
+
+    def _raise_integrity_error():
+        raise IntegrityError("INSERT INTO builds ...", {}, Exception("UNIQUE constraint failed"))
+
+    monkeypatch.setattr(seed_mass_content, "run_mass_content_seed", _raise_integrity_error)
+
+    result = seed_if_empty()
+
+    assert result is None
 
 
 def test_seed_if_empty_is_a_no_op_once_any_build_exists(temp_db):

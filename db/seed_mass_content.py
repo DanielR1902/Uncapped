@@ -40,6 +40,7 @@ import random
 from dataclasses import dataclass
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 
 from db.database import init_db, session_scope
 from db.models import Build, BuildComponent, CommunityComment, CommunityPost
@@ -482,19 +483,31 @@ def seed_if_empty() -> dict | None:
     `init_db()` itself): once seeded, every later call is just the one cheap
     `SELECT ... LIMIT 1` below.
 
-    Not race-safe against two truly simultaneous first-ever requests hitting
-    a brand-new empty deployment in the same instant (a real but narrow
-    window for a demo app, not guarded here with a DB-level lock — out of
-    scope for a "lightweight check", see the EXECUTION DIRECTIVE this was
-    added for)."""
+    Two truly simultaneous first-ever requests hitting a brand-new empty
+    Streamlit Cloud deployment (multiple sessions cold-starting the app at
+    once, before either has finished seeding) can both pass the cheap check
+    above and both start seeding — `run_demo_seed()`'s own user creation is
+    race-safe (`db.seed_demo._register_or_reuse_existing` reuses whichever
+    row actually won the race instead of crashing), but a broader
+    `sqlalchemy.exc.IntegrityError` from anywhere else in this narrow window
+    (e.g. this call's own `run_mass_content_seed()` racing a concurrent
+    call's wipe/insert pass) is still caught here as a backstop: this call
+    simply backs off and returns `None`, trusting the OTHER concurrent call
+    to finish the real seeding, rather than crashing the app boot. This is
+    not a full distributed lock — a still narrower double-seed timing is
+    possible in theory but was judged out of scope for a lightweight
+    startup check on a project of this size."""
     init_db()
     with session_scope() as session:
         has_any_build = session.execute(select(Build.id).limit(1)).first() is not None
     if has_any_build:
         return None
 
-    run_demo_seed()  # idempotent — creates the admin login + 5 persona users if missing
-    return run_mass_content_seed()
+    try:
+        run_demo_seed()  # idempotent — creates the admin login + 5 persona users if missing
+        return run_mass_content_seed()
+    except IntegrityError:
+        return None
 
 
 if __name__ == "__main__":

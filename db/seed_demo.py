@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sqlalchemy import delete
+from sqlalchemy.exc import IntegrityError
 
 from auth import service as auth_service
 from db.database import get_session, init_db
@@ -251,6 +252,33 @@ def _create_build(plan: BuildPlan, user_id: int):
     )
 
 
+def _register_or_reuse_existing(username: str, password: str, email: str, full_name: str) -> User:
+    """`auth_service.register(...)`, but resilient to losing a race against a
+    CONCURRENT caller creating the exact same user first — a real risk for
+    `db.seed_mass_content.seed_if_empty()`, which `app.py` calls on every
+    boot with only a cheap, non-locking "is the database empty" check
+    (see that function's own docstring): two Streamlit sessions hitting a
+    freshly-deployed, genuinely empty database at once can both pass the
+    pre-check here (`users_repo.get_by_username` returning `None` for both)
+    and both call `register(...)`, so the SECOND one's underlying
+    `users_repo.create_user` INSERT hits the real `users.username`/`.email`
+    UNIQUE constraint and raises `sqlalchemy.exc.IntegrityError` (or, in a
+    less-narrow timing window, `register`'s own pre-commit `validate_unique`
+    check catches it first and raises `auth.service.ValidationError`
+    instead) — either way, this used to crash the whole app boot. Both are
+    treated identically here: re-fetch and reuse whichever row actually won
+    the race, rather than raising. If the row still isn't there afterward,
+    this was a genuine, different failure (e.g. a real field-validation
+    problem) and is re-raised rather than silently swallowed."""
+    try:
+        return auth_service.register(username=username, password=password, email=email, full_name=full_name)
+    except (IntegrityError, auth_service.ValidationError):
+        existing = users_repo.get_by_username(username)
+        if existing is None:
+            raise
+        return existing
+
+
 def _ensure_admin_user() -> int:
     """Standing admin/test login. Independent idempotency check from the demo
     personas below — "if already present, do not duplicate" — so it's
@@ -258,7 +286,7 @@ def _ensure_admin_user() -> int:
     existing = users_repo.get_by_username(ADMIN_USER["username"])
     if existing is not None:
         return existing.id
-    user = auth_service.register(
+    user = _register_or_reuse_existing(
         username=ADMIN_USER["username"],
         password=ADMIN_PASSWORD,
         email=ADMIN_USER["email"],
@@ -287,7 +315,7 @@ def run_demo_seed(force: bool = False) -> dict:
 
     user_ids: dict[str, int] = {}
     for entry in DEMO_USERS:
-        user = auth_service.register(
+        user = _register_or_reuse_existing(
             username=entry["username"],
             password=DEMO_PASSWORD,
             email=entry["email"],
