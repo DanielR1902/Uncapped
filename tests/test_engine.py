@@ -843,6 +843,149 @@ def test_get_compatible_candidates_narrows_by_socket(seeded_db):
     assert all(board.socket == "AM5" for board in compatible_boards)
 
 
+# ---------------------------------------------------------------------------
+# find_bottleneck_minimizing_swap — deterministic, exhaustive CPU/GPU
+# rebalancing search backing the AI Concierge's "optimize the bottleneck" /
+# "improve synergy" action (spec.md §6.7 intent 12).
+# ---------------------------------------------------------------------------
+def test_find_bottleneck_minimizing_swap_upgrades_the_cpu_when_cpu_bound(seeded_db):
+    """A weak CPU paired with a flagship GPU must resolve to a real, pricier,
+    still-socket-compatible CPU that measurably narrows the gap — never the
+    GPU (upgrading the non-limiting side only widens the imbalance)."""
+    from db.repositories import components_repo
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "AMD Ryzen 5 5600")
+    gpu = _find("GPU", "AMD Radeon RX 7900 XTX")
+    build_state = {"CPU": cpu, "GPU": gpu}
+    before_pct, before_direction = scoring.bottleneck_percentage_baseline(build_state)
+    assert before_direction == "CPU-bound"  # sanity: the fixture really is CPU-bound
+
+    result = solvers.find_bottleneck_minimizing_swap(build_state)
+
+    assert result is not None
+    new_state, category = result
+    assert category == "CPU"
+    assert new_state["GPU"] is gpu  # the non-limiting side is never touched
+    assert new_state["CPU"].id != cpu.id
+    after_pct, _ = scoring.bottleneck_percentage_baseline(new_state)
+    assert after_pct < before_pct  # a genuine, real improvement
+
+
+def test_find_bottleneck_minimizing_swap_upgrades_the_gpu_when_gpu_bound(seeded_db):
+    from db.repositories import components_repo
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "Intel Core i9-14900KS")
+    gpu = _find("GPU", "AMD Radeon RX 6600")
+    build_state = {"CPU": cpu, "GPU": gpu}
+    before_pct, before_direction = scoring.bottleneck_percentage_baseline(build_state)
+    assert before_direction == "GPU-bound"
+
+    result = solvers.find_bottleneck_minimizing_swap(build_state)
+
+    assert result is not None
+    new_state, category = result
+    assert category == "GPU"
+    assert new_state["CPU"] is cpu
+    after_pct, _ = scoring.bottleneck_percentage_baseline(new_state)
+    assert after_pct < before_pct
+
+
+def test_find_bottleneck_minimizing_swap_finds_the_globally_best_candidate_not_just_any(seeded_db):
+    """Must pick the SINGLE compatible candidate that minimizes the
+    resulting bottleneck percentage across the ENTIRE catalog — not merely
+    the first improvement found — verified by comparing against a brute-
+    force scan of every real, socket-compatible CPU."""
+    from db.repositories import components_repo
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "AMD Ryzen 5 5500")
+    gpu = _find("GPU", "NVIDIA RTX 4090")
+    build_state = {"CPU": cpu, "GPU": gpu}
+
+    result = solvers.find_bottleneck_minimizing_swap(build_state)
+    assert result is not None
+    new_state, category = result
+    assert category == "CPU"
+    achieved_pct, _ = scoring.bottleneck_percentage_baseline(new_state)
+
+    brute_force_best_pct = min(
+        scoring.bottleneck_percentage_baseline({**build_state, "CPU": candidate})[0]
+        for candidate in solvers.get_compatible_candidates("CPU", build_state)
+    )
+    assert achieved_pct == brute_force_best_pct
+
+
+def test_find_bottleneck_minimizing_swap_returns_none_when_already_optimal(seeded_db):
+    """A CPU that is ALREADY the single highest-benchmark compatible option
+    for its socket, paired with an even stronger GPU (still CPU-bound), has
+    no real CPU swap that could possibly help — must return None rather than
+    a lateral/no-op "swap"."""
+    from db.repositories import components_repo
+
+    am5_cpus = [c for c in components_repo.get_by_category("CPU") if c.socket == "AM5"]
+    best_cpu = max(am5_cpus, key=lambda c: c.benchmark_score)
+    best_gpu = max(components_repo.get_by_category("GPU"), key=lambda g: g.benchmark_score)
+    build_state = {"CPU": best_cpu, "GPU": best_gpu}
+    _pct, direction = scoring.bottleneck_percentage_baseline(build_state)
+    assert direction == "CPU-bound"  # sanity: even the best AM5 CPU trails this GPU
+
+    result = solvers.find_bottleneck_minimizing_swap(build_state)
+    assert result is None  # no compatible CPU outperforms the one already picked
+
+
+def test_find_bottleneck_minimizing_swap_strictly_increases_synergy(seeded_db):
+    """Directive's own verification intent, restated with real, internally-
+    consistent numbers rather than a fabricated combination that can't
+    actually occur under this engine's own formula (heuristic_synergy_score
+    = compatibility_score - bottleneck_percentage / 2, so a 5%-bottleneck
+    fully-compatible build has ~97.5 synergy, never 50): reducing bottleneck
+    here MUST strictly raise synergy, since compatibility_score stays 100
+    for every candidate considered (get_compatible_candidates already only
+    offers fully-compatible options) — there is no separate synergy
+    objective to trade off against bottleneck in this codebase's math."""
+    from db.repositories import components_repo
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "AMD Ryzen 5 5600")
+    gpu = _find("GPU", "AMD Radeon RX 7900 XTX")
+    build_state = {"CPU": cpu, "GPU": gpu}
+    before_pct, _ = scoring.bottleneck_percentage_baseline(build_state)
+    before_synergy = scoring.heuristic_synergy_score(100.0, before_pct)
+
+    new_state, _category = solvers.find_bottleneck_minimizing_swap(build_state)
+    after_pct, _ = scoring.bottleneck_percentage_baseline(new_state)
+    after_synergy = scoring.heuristic_synergy_score(100.0, after_pct)
+
+    assert after_synergy > before_synergy
+    assert after_pct < before_pct
+
+
+def test_find_bottleneck_minimizing_swap_none_for_balanced_or_incomplete_build(seeded_db):
+    from db.repositories import components_repo
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    assert solvers.find_bottleneck_minimizing_swap({"CPU": cpu}) is None  # no GPU yet
+
+    # A perfectly balanced pairing (identical benchmark score) has nothing
+    # to improve from either side.
+    matching_gpu = next(
+        (g for g in components_repo.get_by_category("GPU") if g.benchmark_score == cpu.benchmark_score),
+        None,
+    )
+    if matching_gpu is not None:
+        assert solvers.find_bottleneck_minimizing_swap({"CPU": cpu, "GPU": matching_gpu}) is None
+
+
 @pytest.mark.parametrize("profile", ["General", "Gaming", "VideoEditing", "Design", "Programming"])
 def test_workload_baseline_generation_across_profiles(seeded_db, profile):
     build = solvers.allocate_workload_baseline(profile, target_tier="Mid")

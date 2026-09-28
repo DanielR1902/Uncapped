@@ -424,6 +424,20 @@ def inject_css() -> None:
         div[data-testid="stHorizontalBlock"] {{
             align-items: stretch;
         }}
+        /* Equal column WIDTHS, not just heights (my_builds.py's 2-up "Global
+        Sort" build grid, spec.md §7.5): `st.columns(2)` already gives each
+        `stColumn` an equal flex-basis natively, but a flex item's default
+        `min-width: auto` still lets a long, unbroken build name (e.g. a
+        fork/community-clone name with several appended suffixes) force ITS
+        OWN column wider than its sibling's — the classic flexbox
+        "long content won't shrink" gotcha, not a missing/wrong flex-basis.
+        `min-width: 0` on the column itself is the actual fix; `width: 100%`
+        + `box-sizing: border-box` on the card content below then makes the
+        card fill exactly that (now-correctly-shrinkable) column width
+        rather than sizing off its own text content. */
+        div[data-testid="stColumn"] {{
+            min-width: 0;
+        }}
         div[data-testid="stColumn"] > div[data-testid="stVerticalBlock"] {{
             height: 100%;
         }}
@@ -432,6 +446,8 @@ def inject_css() -> None:
         }}
         div[data-testid="stColumn"] div[data-testid="stLayoutWrapper"] > div[data-testid="stVerticalBlock"] {{
             height: 100%;
+            width: 100%;
+            box-sizing: border-box;
             display: flex;
             flex-direction: column;
             min-height: 220px;

@@ -1782,6 +1782,65 @@ def test_apply_in_budget_optimization_terminates_within_round_cap(seeded_db, mon
     assert final_key in cache
 
 
+def test_apply_in_budget_optimization_button_stays_enabled_across_repeated_clicks(seeded_db, monkeypatch):
+    """Verifies THIS round's directive claim ("the button locks after a
+    single run") against the real code: `disabled=not advisory[
+    "within_budget"]["swaps"]` has no one-time latch at all (unlike the
+    Stretch Budget button's own deliberate `stretch_applied_keys` design,
+    see the sibling test below) — as long as the cached advisory after a
+    click still names a real swap, the button stays enabled and a further
+    click runs another full bounded round. Reuses the same "always
+    optimizable" mock as test_apply_in_budget_optimization_terminates_
+    within_round_cap, but presses the button TWICE to prove the second
+    press is not a no-op: each press re-fires the internal bounded loop
+    (a further _MAX_AUTO_OPTIMIZE_ROUNDS worth of real advisory calls)."""
+    from db.repositories import components_repo
+    import ui.views.create_build as create_build_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "repeatclick1", "repeatclick1@example.com", "Repeat Click One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    call_count = {"n": 0}
+
+    def _always_optimizable(build_state, mode, current_budget_or_cost, profile=None, bottleneck_info=None, quantities=None):
+        call_count["n"] += 1
+        category = "CPU"
+        candidates = [c for c in components_repo.get_by_category(category) if c.id != build_state[category].id]
+        replace_with_id = candidates[0].id if candidates else build_state[category].id
+        return {
+            "pros": ["p"], "cons": ["c"],
+            "within_budget": {
+                "explanation": "keep optimizing",
+                "swaps": [{"category": category, "replace_with_id": replace_with_id}],
+                "can_optimize_further": True,
+            },
+            "stretch_budget": {"explanation": "stretch", "actions": [], "added_cost_usd": 0.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(create_build_module, "get_build_advisory", _always_optimizable)
+
+    at.get_by_key("hud_ai_analysis").click().run()
+    assert not at.exception
+    assert at.get_by_key("btn_apply_in_budget").disabled is False
+    at.get_by_key("btn_apply_in_budget").click().run()
+    assert not at.exception
+    calls_after_first_click = call_count["n"]
+
+    # NEVER locked: the button must still be enabled (real swaps still
+    # named in the freshly-cached advisory), and a second click must do
+    # REAL further work, not silently no-op.
+    apply_button_again = at.get_by_key("btn_apply_in_budget")
+    assert apply_button_again.disabled is False
+    apply_button_again.click().run()
+    assert not at.exception
+    assert call_count["n"] > calls_after_first_click
+
+
 def test_apply_stretch_upgrade_locks_per_build(seeded_db, monkeypatch):
     """Clicking "🚀 Apply Stretch Upgrade (One-Time)" applies the stretch
     actions and adds the current advisory cache key to
@@ -1987,7 +2046,10 @@ def test_advisory_apply_buttons_disabled_when_no_swaps(seeded_db, monkeypatch):
     """A build whose advisory has empty `swaps` in either within_budget or
     stretch_budget renders that tab's Apply button as disabled=True — never
     crashing, never silently no-opping on a click that shouldn't be
-    reachable in the first place."""
+    reachable in the first place. The In-Budget Optimization tab ALSO shows
+    a real, confirmed UX gap this closes: a plain red notice explaining WHY
+    the button is greyed out, matching the Stretch Budget tab's own
+    pre-existing st.caption explanations for its two disabled reasons."""
     import ui.views.create_build as create_build_module
 
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
@@ -2014,12 +2076,55 @@ def test_advisory_apply_buttons_disabled_when_no_swaps(seeded_db, monkeypatch):
 
     assert at.get_by_key("btn_apply_in_budget").disabled is True
     assert at.get_by_key("btn_apply_stretch").disabled is True
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "No further adjustments can be made within this budget." in page_text
 
     # clicking a disabled button is a no-op in AppTest terms (nothing to
     # click), so just re-confirm the build/components are untouched.
     components_before = dict(at.session_state["build_draft"]["components"])
     at.run()
     assert at.session_state["build_draft"]["components"] == components_before
+
+
+def test_advisory_apply_in_budget_button_shows_no_red_notice_when_swaps_exist(seeded_db, monkeypatch):
+    """The depleted-state red notice must appear ONLY when the button is
+    genuinely disabled — never displayed alongside a real, still-enabled
+    optimization opportunity."""
+    from db.repositories import components_repo
+    import ui.views.create_build as create_build_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "apply7", "apply7@example.com", "Apply Seven")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    current_cpu_id = at.session_state["build_draft"]["components"]["CPU"]
+    other_cpu = next(c for c in components_repo.get_by_category("CPU") if c.id != current_cpu_id)
+
+    def _has_swaps_advisory(
+        build_state, mode, current_budget_or_cost, profile=None, bottleneck_info=None, quantities=None
+    ):
+        return {
+            "pros": ["p"], "cons": ["c"],
+            "within_budget": {
+                "explanation": "a real swap exists",
+                "swaps": [{"category": "CPU", "replace_with_id": other_cpu.id}],
+                "can_optimize_further": False,
+            },
+            "stretch_budget": {"explanation": "no upgrade available", "actions": [], "added_cost_usd": 0.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(create_build_module, "get_build_advisory", _has_swaps_advisory)
+
+    at.get_by_key("hud_ai_analysis").click().run()
+    assert not at.exception
+
+    assert at.get_by_key("btn_apply_in_budget").disabled is False
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "No further adjustments can be made within this budget." not in page_text
 
 
 def test_reset_all_fields_clears_build_and_budget_ceiling(seeded_db):
@@ -2177,6 +2282,44 @@ def test_rate_my_build_dialog_opens_with_autofilled_title_and_snapshot(seeded_db
     assert expected_tdp in metric_values
 
 
+def test_community_save_to_my_builds_names_it_uploaded_by_original_author(seeded_db):
+    """Saving a community build to "My Builds" must name the new copy
+    "{original_build_name} (uploaded by {author_username})" — crediting the
+    ORIGINAL post author's real username, not the saving user's own, and not
+    the old hardcoded "(from community)" suffix."""
+    from db.repositories import builds_repo, community_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "author_one", "author_one@example.com", "Author One")
+    author_id = at.session_state["auth_user"]["id"]
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=author_id, name="Author's Original Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=True,
+    )
+    community_repo.create_post(build.id, author_id, "Author's Original Rig", flair="Rate My Build")
+
+    at.get_by_key("logout_button").click().run()
+    _register(at, "saver_one", "saver_one@example.com", "Saver One")
+    saver_id = at.session_state["auth_user"]["id"]
+
+    at.get_by_key("sidebar_nav_community").click().run()
+    view_buttons = [b.key for b in at.button if b.key and b.key.startswith("view_post_")]
+    at.get_by_key(view_buttons[0]).click().run()
+    at.get_by_key("save_to_my_builds").click().run()
+
+    assert not at.exception
+    saved_builds = builds_repo.get_builds_for_user(saver_id)
+    assert len(saved_builds) == 1
+    assert saved_builds[0].name == "Author's Original Rig (uploaded by author_one)"
+    # The original post's own build is completely untouched by the save.
+    original = builds_repo.get_build(build.id)
+    assert original.name == "Author's Original Rig"
+
+
 def test_community_rate_my_build_flair_badge_shown_on_feed_and_thread(seeded_db):
     """A "Rate My Build" post's flair badge (theme.pulse_badge) must appear
     both on its Community feed card and on its own thread view. Creates the
@@ -2318,6 +2461,57 @@ def test_previous_builds_publish_form_requires_flair_before_creating_tagged_post
     refreshed = builds_repo.get_build(build.id)
     assert refreshed.name == "Form Publish Rig"
     assert refreshed.is_public is True
+
+
+def test_manual_publish_tracks_last_published_post_for_concierge_navigation(seeded_db, monkeypatch):
+    """Regression for "go to the post I just published/uploaded" failing
+    right after a real publish: ANY real publish (not just a Concierge-driven
+    one) must set st.session_state["concierge_last_published_post"] to the
+    real new post's id/title, and that value must actually reach
+    llm.concierge.get_concierge_response as the last_published_post kwarg on
+    the very next chat turn — the ground truth the model needs since
+    community_summary alone carries no author/timestamp signal for this."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import builds_repo, community_repo, components_repo
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "lastpost1", "lastpost1@example.com", "Last Post One")
+
+    cpu = components_repo.get_by_category("CPU")[0]
+    build = builds_repo.create_build(
+        user_id=at.session_state["auth_user"]["id"], name="Track Me Rig", creation_mode="Free",
+        components=[builds_repo.BuildComponentInput(component_id=cpu.id)],
+        total_cost=cpu.price_usd, compatibility_score=100.0, is_public=False,
+    )
+
+    at.get_by_key("sidebar_nav_my_builds").click().run()
+    at.get_by_key(f"Share_to_Community_{build.id}").click().run()
+    at.get_by_key(f"publish_flair_{build.id}").select("Rate My Build").run()
+    at.get_by_key(f"publish_confirm_{build.id}").click().run()
+
+    feed = community_repo.get_feed()
+    assert len(feed) == 1
+    post = feed[0]
+    assert at.session_state["concierge_last_published_post"] == {"post_id": post.id, "title": "Track Me Rig"}
+
+    captured_kwargs = {}
+
+    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, **kwargs):
+        captured_kwargs.update(kwargs)
+        return {
+            "reply": "Taking you to your published post.",
+            "action": {"type": "open_community_build", "post_id": post.id},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("go to the post I just uploaded").run()
+
+    assert not at.exception
+    assert captured_kwargs["last_published_post"] == {"post_id": post.id, "title": "Track Me Rig"}
+    assert at.session_state["page"] == "community"
+    assert at.session_state["selected_post_id"] == post.id
 
 
 def test_your_posts_view_lists_authored_posts_only(seeded_db):
@@ -5591,6 +5785,79 @@ def test_concierge_fix_warnings_noop_without_active_build(seeded_db, monkeypatch
     assert at.session_state["build_draft"] is None
 
 
+def test_concierge_optimize_bottleneck_fixes_warnings_and_rebalances_in_one_turn(seeded_db, monkeypatch):
+    """SINGLE-TURN RESOLUTION INCLUDING ACTIVE WARNINGS (a real, confirmed
+    fix this round — the "stalls on incremental micro-steps" complaint): a
+    build with an actual compatibility violation — here, a real 850W PSU
+    under-provisioned for an RTX 5090 (requires >= 897W) — used to make
+    optimize_bottleneck refuse to touch the build at all (an EARLIER,
+    now-superseded version of this backstop), requiring a separate
+    fix_warnings turn first and a second message afterward for the
+    bottleneck part. It now resolves the warnings FIRST, automatically, via
+    the exact same deterministic engine.solvers.resolve_compatibility_issues
+    fix_warnings itself uses, THEN continues straight into its own
+    deterministic CPU/GPU search on the now-compatible build — all within
+    the ONE call this single "optimize the bottleneck" message triggers."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine.compatibility import evaluate_build
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "AMD Ryzen 5 5500")
+    gpu = _find("GPU", "NVIDIA RTX 5090")
+    mobo = _find("Motherboard", "MSI B550-A PRO")
+    ram = _find("RAM", "Kingston FURY Beast 32GB (2x16GB) DDR4-3200")
+    storage = _find("Storage", "WD Black SN850X 2TB")
+    psu = _find("PSU", "Corsair RM850x")
+    case = _find("Case", "Corsair 4000D Airflow")
+    cooler = _find("Cooler", "Thermalright Peerless Assassin 120 SE")
+
+    build_state = {
+        "CPU": cpu, "Motherboard": mobo, "GPU": gpu, "RAM": ram, "Storage": storage,
+        "PSU": psu, "Case": case, "Cooler": cooler,
+    }
+    report = evaluate_build(build_state)
+    assert not report.is_compatible  # sanity: this fixture genuinely has a real PSU headroom issue
+    assert any(r.rule == "psu_headroom" for r in report.results if not r.passed)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "optbottleneck7", "optbottleneck7@example.com", "Opt Bottleneck Seven")
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Free", "workload_profile": None, "tier": "Mid", "budget_ceiling": None,
+        "components": {cat: c.id for cat, c in build_state.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Free"
+    before_cpu_id = cpu.id
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Resolving the compatibility warnings and rebalancing your CPU/GPU pairing now.",
+            "action": {"type": "optimize_bottleneck"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("optimize the bottleneck").run()
+
+    assert not at.exception
+    final_draft = at.session_state["build_draft"]
+    final_state = state.resolve_build_state(final_draft)
+    final_report = evaluate_build(final_state, final_draft.get("quantities", {}))
+    assert final_report.is_compatible  # the PSU issue is genuinely resolved, in this same turn
+    # The CPU also actually changed — the bottleneck logic ran on the
+    # now-compatible build in the SAME call, not deferred to a later turn.
+    assert final_draft["components"]["CPU"] != before_cpu_id
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "0 compatibility warnings remaining." in last_message
+
+
 def test_concierge_optimize_bottleneck_applies_advisory_swap(seeded_db, monkeypatch):
     """A mocked optimize_bottleneck action must apply llm.advisory.get_
     build_advisory's own real stretch_budget.actions (the bottleneck-
@@ -5599,10 +5866,27 @@ def test_concierge_optimize_bottleneck_applies_advisory_swap(seeded_db, monkeypa
     resulting build_draft must reflect a real, resolvable catalog swap."""
     import ui.components.chat_assistant as chat_assistant_module
     from db.repositories import components_repo
+    from engine.compatibility import evaluate_build
 
-    picks = {category: components_repo.get_by_category(category)[0] for category in (
-        "CPU", "Motherboard", "GPU", "RAM", "Storage", "PSU", "Case", "Cooler",
-    )}
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    # A real, confirmed-compatible, genuinely CPU-bound starting point —
+    # NOT "first of each category" (that combo is not guaranteed compatible
+    # at all, and this test's own FIX WARNINGS FIRST backstop would
+    # otherwise correctly refuse to touch it for an unrelated reason,
+    # defeating this test's actual purpose of exercising the advisory swap).
+    picks = {
+        "CPU": _find("CPU", "AMD Ryzen 5 5600"),
+        "GPU": _find("GPU", "AMD Radeon RX 7900 XTX"),
+        "Motherboard": _find("Motherboard", "MSI B550-A PRO"),
+        "RAM": _find("RAM", "Kingston FURY Beast 32GB (2x16GB) DDR4-3200"),
+        "Storage": _find("Storage", "WD Black SN850X 2TB"),
+        "PSU": _find("PSU", "Corsair RM850x"),
+        "Case": _find("Case", "Corsair 4000D Airflow"),
+        "Cooler": _find("Cooler", "Thermalright Peerless Assassin 120 SE"),
+    }
+    assert evaluate_build(picks).is_compatible  # sanity: this fixture is genuinely valid
 
     at = AppTest.from_file(str(APP_PATH), default_timeout=30)
     at.run()
@@ -5629,8 +5913,15 @@ def test_concierge_optimize_bottleneck_applies_advisory_swap(seeded_db, monkeypa
     assert not at.exception
     last_message = at.session_state["concierge_messages"][-1]
     # RIGOROUS TELEMETRY REPLY FORMAT (Part 2, this round): the old bare
-    # "Bottleneck now X%." line was replaced with a before -> after delta.
-    assert "Bottleneck:" in last_message["content"] or "Bottleneck unavailable." in last_message["content"]
+    # "Bottleneck now X%." line was replaced with a before -> after delta —
+    # or, if this particular cheapest-of-each-category starting point
+    # happens to already be unimprovable, the ALREADY-OPTIMAL NO-OP
+    # MESSAGING's plain "no changes made" line (never both/neither).
+    assert (
+        "Bottleneck:" in last_message["content"]
+        or "Bottleneck unavailable." in last_message["content"]
+        or "no changes made" in last_message["content"].lower()
+    )
     # The build_draft must still resolve to a real, complete, valid build
     # afterward, whether or not a beneficial swap existed for THIS specific
     # already-cheapest-of-each-category starting point.
@@ -5702,6 +5993,545 @@ def test_concierge_optimize_bottleneck_upgrades_the_bottlenecked_category(seeded
     last_message = at.session_state["concierge_messages"][-1]["content"]
     assert "Bottleneck:" in last_message
     assert "Delta:" in last_message
+
+
+def test_concierge_optimize_bottleneck_deterministic_swap_succeeds_without_advisory(seeded_db, monkeypatch):
+    """The engine.solvers.find_bottleneck_minimizing_swap deterministic path
+    is now PRIMARY: a genuinely fixable CPU-bound build must be resolved on
+    the very first attempt via this exhaustive search, even when
+    llm.advisory.get_build_advisory's own stretch_budget recommendation is
+    empty/unhelpful — a real, confirmed improvement over the advisory-only
+    design, which previously could return nothing useful on one attempt and
+    something real only on a retry."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine.compatibility import evaluate_build
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "AMD Ryzen 5 5600")
+    gpu = _find("GPU", "AMD Radeon RX 7900 XTX")
+    mobo = _find("Motherboard", "MSI B550-A PRO")
+    ram = _find("RAM", "Kingston FURY Beast 32GB (2x16GB) DDR4-3200")
+    storage = _find("Storage", "WD Black SN850X 2TB")
+    psu = _find("PSU", "Corsair RM850x")
+    case = _find("Case", "Corsair 4000D Airflow")
+    cooler = _find("Cooler", "Thermalright Peerless Assassin 120 SE")
+
+    build_state = {
+        "CPU": cpu, "Motherboard": mobo, "GPU": gpu, "RAM": ram, "Storage": storage,
+        "PSU": psu, "Case": case, "Cooler": cooler,
+    }
+    report = evaluate_build(build_state)
+    assert report.is_compatible
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "optbottleneck5", "optbottleneck5@example.com", "Opt Bottleneck Five")
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Free", "workload_profile": None, "tier": "Mid", "budget_ceiling": None,
+        "components": {cat: c.id for cat, c in build_state.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Free"
+
+    # An intentionally EMPTY/unhelpful advisory response — `_advisory_context`
+    # (a separate, informational-only pre-fetch gated on the "optimize"
+    # keyword, unrelated to the optimize_bottleneck handler's own logic)
+    # still legitimately calls this; what matters is that the handler's own
+    # deterministic swap succeeds regardless of what this returns.
+    def _empty_advisory(*args, **kwargs):
+        return {
+            "pros": [], "cons": [],
+            "within_budget": {"explanation": "n/a", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {"explanation": "n/a", "actions": [], "added_cost_usd": 0.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_build_advisory", _empty_advisory)
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Rebalancing your CPU/GPU pairing now.",
+            "action": {"type": "optimize_bottleneck", "target_percentage": 10.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("optimize the bottleneck").run()
+
+    assert not at.exception
+    after_cpu_id = at.session_state["build_draft"]["components"]["CPU"]
+    assert after_cpu_id != cpu.id
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "Delta: +USD 0.00" not in last_message  # a real, non-zero swap actually happened
+
+
+def test_concierge_optimize_bottleneck_is_a_no_op_when_already_well_balanced(seeded_db, monkeypatch):
+    """Root-cause regression for THIS round's reported bug: a build already
+    at/under the target bottleneck must not be touched at all — no advisory
+    call, no swap, no spent money — even if the model fires optimize_bottleneck
+    anyway (compatibility/correctness is never LLM-gated, root CLAUDE.md).
+    Uses a CPU/GPU pair deliberately picked to be well-balanced."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine.compatibility import evaluate_build
+    from engine.scoring import live_bottleneck_and_synergy
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    # A same-generation, comparably-tiered pairing — real, confirmed
+    # compatible and well within the default 10% target.
+    cpu = _find("CPU", "Intel Core i5-13400F")
+    gpu = _find("GPU", "NVIDIA RTX 4060 Ti 16GB")
+    mobo = _find("Motherboard", "ASRock B760M-HDV")
+    ram = _find("RAM", "Kingston FURY Beast 32GB (2x16GB) DDR4-3200")
+    storage = _find("Storage", "WD Black SN850X 2TB")
+    psu = _find("PSU", "Corsair RM850x")
+    case = _find("Case", "Corsair 4000D Airflow")
+    cooler = _find("Cooler", "Thermalright Peerless Assassin 120 SE")
+
+    build_state = {
+        "CPU": cpu, "Motherboard": mobo, "GPU": gpu, "RAM": ram, "Storage": storage,
+        "PSU": psu, "Case": case, "Cooler": cooler,
+    }
+    report = evaluate_build(build_state)
+    assert report.is_compatible
+    _synergy, bottleneck_pct, _direction = live_bottleneck_and_synergy(build_state)
+    assert bottleneck_pct <= 10.0  # sanity: this fixture really is already well-balanced
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "optbottleneck3", "optbottleneck3@example.com", "Opt Bottleneck Three")
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Free", "workload_profile": None, "tier": "Mid", "budget_ceiling": None,
+        "components": {cat: c.id for cat, c in build_state.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Free"
+    before_components = dict(at.session_state["build_draft"]["components"])
+
+    # A stretch_budget suggestion that WOULD apply a real, costly swap if the
+    # optimize_bottleneck handler ever reached its own advisory fetch — this
+    # proves the short-circuit fires before that call, not just that some
+    # OTHER, unrelated advisory pre-fetch (the informational
+    # `_advisory_context` heuristic, gated on the same "upgrade"/"synergy"
+    # keywords) happened not to run.
+    pricier_cooler = components_repo.get_by_category("Cooler")[-1]
+
+    def _fake_advisory(*args, **kwargs):
+        return {
+            "pros": [], "cons": [],
+            "within_budget": {"explanation": "n/a", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {
+                "explanation": "n/a",
+                "actions": [{"action": "swap", "category": "Cooler", "replace_with_id": pricier_cooler.id}],
+                "added_cost_usd": 999.0,
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_build_advisory", _fake_advisory)
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {"reply": "Rebalancing your CPU/GPU pairing now.", "action": {"type": "optimize_bottleneck"}, "source": "heuristic"}
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("upgrade the synergy").run()
+
+    assert not at.exception
+    # Untouched: the short-circuit means _apply_concierge_action's own
+    # advisory fetch (which WOULD have applied the mocked Cooler swap above)
+    # never ran at all.
+    assert at.session_state["build_draft"]["components"] == before_components
+    # ALREADY-OPTIMAL NO-OP MESSAGING: even though the model fired
+    # optimize_bottleneck anyway (for a synergy-phrased request), the reply
+    # must plainly say the build is already optimal instead of showing a
+    # misleading "Synergy: 96 -> 96" pair next to a fake "Delta: +$0.00".
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "no changes made" in last_message.lower()
+    assert "->" not in last_message and "-&gt;" not in last_message
+    assert "Delta:" not in last_message
+    # HONEST "STUCK, NOT GOOD" WORDING: unlike the sibling test below (a build
+    # genuinely stuck well above target), THIS fixture really is already at
+    # or under the default target — "peak synergy" is the honest, correct
+    # word here, and must still appear (a real, confirmed fix scoped the
+    # "peak synergy" wording OUT of the OTHER, badly-balanced case; it must
+    # not have been scoped out of this genuinely-good one too).
+    assert "peak synergy" in last_message.lower()
+
+
+def test_concierge_optimize_rebuilds_platform_when_in_place_swaps_cannot_help(seeded_db, monkeypatch):
+    """A stretch_budget suggestion that doesn't target the actual bottleneck
+    category (e.g. falls through to a Cooler upgrade — a real, valid,
+    catalog-priced swap that engine.scoring's bottleneck formula simply
+    doesn't use) must be rolled back rather than applied and paid for, even
+    though llm.advisory returned a well-formed, resolvable action. Uses the
+    strongest AM4 CPU (Ryzen 7 5800X3D) paired with the strongest GPU (RTX
+    4090) — still CPU-bound, but engine.solvers.find_bottleneck_minimizing_
+    swap's own deterministic search (the handler's now-PRIMARY mechanism,
+    tried before ever consulting the advisory loop this test mocks) finds
+    nothing, since no compatible AM4 CPU outperforms the one already
+    picked — so this test genuinely exercises the ADVISORY LOOP's own
+    rollback, not the deterministic swap's."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine.scoring import live_bottleneck_and_synergy
+    from engine.compatibility import evaluate_build
+    from engine import solvers as solvers_module
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "AMD Ryzen 7 5800X3D")
+    gpu = _find("GPU", "NVIDIA RTX 4090")
+    mobo = _find("Motherboard", "MSI B550-A PRO")
+    ram = _find("RAM", "Kingston FURY Beast 32GB (2x16GB) DDR4-3200")
+    storage = _find("Storage", "WD Black SN850X 2TB")
+    psu = _find("PSU", "Corsair RM850x")
+    case = _find("Case", "Corsair 4000D Airflow")
+    cooler = _find("Cooler", "Thermalright Peerless Assassin 120 SE")
+    pricier_cooler = _find("Cooler", "Noctua NH-D15")
+
+    build_state = {
+        "CPU": cpu, "Motherboard": mobo, "GPU": gpu, "RAM": ram, "Storage": storage,
+        "PSU": psu, "Case": case, "Cooler": cooler,
+    }
+    report = evaluate_build(build_state)
+    assert report.is_compatible  # sanity: the fixture build is genuinely valid, CPU-bound
+    assert solvers_module.find_bottleneck_minimizing_swap(build_state) is None  # sanity: deterministic path finds nothing here
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "optbottleneck4", "optbottleneck4@example.com", "Opt Bottleneck Four")
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Free", "workload_profile": None, "tier": "Mid", "budget_ceiling": None,
+        "components": {cat: c.id for cat, c in build_state.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Free"
+    before_components = dict(at.session_state["build_draft"]["components"])
+    before_total = sum(c.price_usd for c in build_state.values())
+
+    def _fake_advisory(*args, **kwargs):
+        # A real, resolvable swap — but Cooler, which engine.scoring's
+        # bottleneck formula never reads at all.
+        return {
+            "pros": [], "cons": [],
+            "within_budget": {"explanation": "n/a", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {
+                "explanation": "Upgrade the cooler.",
+                "actions": [{"action": "swap", "category": "Cooler", "replace_with_id": pricier_cooler.id}],
+                "added_cost_usd": pricier_cooler.price_usd - cooler.price_usd,
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_build_advisory", _fake_advisory)
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Rebalancing your CPU/GPU pairing now.",
+            "action": {"type": "optimize_bottleneck", "target_percentage": 3.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("reduce the bottleneck").run()
+
+    assert not at.exception
+    # UNIFIED PIPELINE: the AM4 socket is stuck at ~28% with in-place swaps
+    # (the deterministic search finds nothing, the Cooler-only advisory swap
+    # never helps), so the pipeline must scrap the platform and rebuild it in
+    # ONE turn — never answer "a bigger step than this request".
+    after_state = state.resolve_build_state(at.session_state["build_draft"])
+    assert at.session_state["build_draft"]["components"] != before_components
+    assert not evaluate_build(after_state, at.session_state["build_draft"].get("quantities", {})).issues
+    _synergy, after_bottleneck, _direction = live_bottleneck_and_synergy(after_state)
+    assert after_bottleneck < 28
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "bigger step" not in last_message.lower()
+    assert "Bottleneck:" in last_message and "Synergy:" in last_message
+
+
+def test_concierge_optimize_bottleneck_rolls_back_a_budget_reclamp_that_worsens_bottleneck(seeded_db, monkeypatch):
+    """Root-cause regression for a real, confirmed bug: the BUDGET HARD-CAP
+    SAFETY NET inside optimize_bottleneck's advisory-loop fallback (triggered
+    when a round of stretch_budget actions pushes the total over a real
+    Budget-mode ceiling) used to re-clamp via engine.solvers.
+    initialize_budget_build and then `break` OUT of the loop immediately —
+    entirely skipping the "THIS ROUND must have genuinely helped" check that
+    every other path through this loop already goes through.
+    initialize_budget_build is a pure price/compatibility solver with NO
+    bottleneck awareness at all: its own price-descending downgrade pass
+    (_downgrade_pinned_until_feasible) steps down whichever PINNED category
+    costs the most first, which can easily land on a WORSE CPU/GPU imbalance
+    than the round started with (e.g. reported 65% -> 68%) — and the missing
+    check meant that worse result was kept and returned as the final answer.
+    Uses the same Ryzen 7 5800X3D + RTX 4090 pairing as the sibling rollback
+    test above (confirmed CPU-bound, ~28%, with no better AM4 CPU available,
+    so engine.solvers.find_bottleneck_minimizing_swap's own deterministic
+    search finds nothing and this genuinely exercises the ADVISORY LOOP's
+    budget-reclamp path, not the deterministic swap's)."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine.compatibility import evaluate_build
+    from engine.scoring import live_bottleneck_and_synergy
+    from engine import solvers as solvers_module
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "AMD Ryzen 7 5800X3D")
+    gpu = _find("GPU", "NVIDIA RTX 4090")
+    mobo = _find("Motherboard", "MSI B550-A PRO")
+    ram = _find("RAM", "Kingston FURY Beast 32GB (2x16GB) DDR4-3200")
+    storage = _find("Storage", "WD Black SN850X 2TB")
+    psu = _find("PSU", "Corsair RM850x")
+    case = _find("Case", "Corsair 4000D Airflow")
+    cooler = _find("Cooler", "Thermalright Peerless Assassin 120 SE")
+    pricier_cooler = _find("Cooler", "Noctua NH-D15")
+    weak_cpu = _find("CPU", "Intel Core i3-12100F")  # real, catalog-cheap, and far weaker than the 5800X3D
+
+    build_state = {
+        "CPU": cpu, "Motherboard": mobo, "GPU": gpu, "RAM": ram, "Storage": storage,
+        "PSU": psu, "Case": case, "Cooler": cooler,
+    }
+    report = evaluate_build(build_state)
+    assert report.is_compatible  # sanity: the fixture build is genuinely valid, CPU-bound
+    assert solvers_module.find_bottleneck_minimizing_swap(build_state) is None  # sanity: deterministic path finds nothing here
+    before_synergy, before_bottleneck, before_direction = live_bottleneck_and_synergy(build_state)
+    assert before_direction == "CPU-bound"
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "optbottleneck6", "optbottleneck6@example.com", "Opt Bottleneck Six")
+    ceiling = sum(c.price_usd for c in build_state.values())  # zero headroom — ANY extra spend forces the reclamp
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Budget", "workload_profile": None, "tier": "Mid",
+        "budget_ceiling": ceiling,
+        "components": {cat: c.id for cat, c in build_state.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Budget"
+    before_components = dict(at.session_state["build_draft"]["components"])
+
+    # A real, resolvable swap that pushes the total over the (zero-headroom)
+    # ceiling but never touches CPU/GPU at all — engine.scoring's bottleneck
+    # formula doesn't read Cooler, so this round's OWN swap can't be blamed
+    # for any bottleneck change; only the reclamp that follows can be.
+    def _fake_advisory(*args, **kwargs):
+        return {
+            "pros": [], "cons": [],
+            "within_budget": {"explanation": "n/a", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {
+                "explanation": "Upgrade the cooler.",
+                "actions": [{"action": "swap", "category": "Cooler", "replace_with_id": pricier_cooler.id}],
+                "added_cost_usd": pricier_cooler.price_usd - cooler.price_usd,
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_build_advisory", _fake_advisory)
+
+    # The reclamp itself: standing in for initialize_budget_build's real
+    # price-descending downgrade pass, which in a real catalog CAN pick the
+    # limiting CPU as its most-expensive-pinned-category target and downgrade
+    # it further — deliberately forced here so the test is deterministic and
+    # doesn't depend on which real component happens to be priciest today.
+    def _fake_reclamp(ceiling, seed_selection=None, fill_peripherals_with_surplus=False):
+        worsened = dict(seed_selection or {})
+        worsened["CPU"] = weak_cpu
+        return worsened
+
+    monkeypatch.setattr(chat_assistant_module.solvers, "initialize_budget_build", _fake_reclamp)
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Rebalancing your CPU/GPU pairing now.",
+            "action": {"type": "optimize_bottleneck", "target_percentage": 10.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("reduce the bottleneck").run()
+
+    assert not at.exception
+    # The worsening reclamp must have been rolled back — CPU stays the real
+    # 5800X3D, never the mocked weak i3, and nothing else changed either.
+    assert at.session_state["build_draft"]["components"]["CPU"] != weak_cpu.id
+    after_state = state.resolve_build_state(at.session_state["build_draft"])
+    assert sum(c.price_usd for c in after_state.values()) <= ceiling
+    after_synergy, after_bottleneck, _after_direction = live_bottleneck_and_synergy(after_state)
+    assert after_bottleneck <= before_bottleneck  # never worse than where this round started
+    assert after_synergy >= before_synergy
+
+
+def test_concierge_rebuild_platform_replaces_the_core_platform_and_improves_bottleneck(seeded_db, monkeypatch):
+    """A real, confirmed gap this closes: optimize_bottleneck's own
+    deterministic search and advisory fallback are BOTH deliberately scoped
+    to a single CPU or GPU swap within the CURRENT socket, so a build whose
+    socket has genuinely hit its ceiling (the same Ryzen 7 5800X3D + RTX
+    4090 fixture used above — confirmed CPU-bound, ~28%, with no better AM4
+    CPU available) reports that plainly and stops — even if the user THEN
+    explicitly asks for the bigger step. This action is that explicit,
+    user-confirmed path: engine.solvers.initialize_budget_build rebuilds the
+    whole core platform (Motherboard/CPU/RAM/GPU/Storage/Case/PSU/Cooler)
+    together at the same core-platform budget, guaranteed fully compatible
+    by construction. Never asserts a hardcoded target — only checks the
+    REAL resulting reading genuinely improved."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine.compatibility import evaluate_build
+    from engine.scoring import live_bottleneck_and_synergy
+    from engine import solvers as solvers_module
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "AMD Ryzen 7 5800X3D")
+    gpu = _find("GPU", "NVIDIA RTX 4090")
+    mobo = _find("Motherboard", "MSI B550-A PRO")
+    ram = _find("RAM", "Kingston FURY Beast 32GB (2x16GB) DDR4-3200")
+    storage = _find("Storage", "WD Black SN850X 2TB")
+    psu = _find("PSU", "Corsair RM850x")
+    case = _find("Case", "Corsair 4000D Airflow")
+    cooler = _find("Cooler", "Thermalright Peerless Assassin 120 SE")
+    monitor = components_repo.get_by_category("Monitor")[0]  # a peripheral this action must never touch
+
+    build_state = {
+        "CPU": cpu, "Motherboard": mobo, "GPU": gpu, "RAM": ram, "Storage": storage,
+        "PSU": psu, "Case": case, "Cooler": cooler, "Monitor": monitor,
+    }
+    report = evaluate_build(build_state)
+    assert report.is_compatible  # sanity: the fixture build is genuinely valid, CPU-bound
+    assert solvers_module.find_bottleneck_minimizing_swap(build_state) is None  # sanity: single-swap path finds nothing here
+    before_synergy, before_bottleneck, before_direction = live_bottleneck_and_synergy(build_state)
+    assert before_direction == "CPU-bound"
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "rebuildplat1", "rebuildplat1@example.com", "Rebuild Platform One")
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Free", "workload_profile": None, "tier": "Mid", "budget_ceiling": None,
+        "components": {cat: c.id for cat, c in build_state.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Free"
+    before_cpu_id, before_mobo_id = cpu.id, mobo.id
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Rebuilding the core platform now.",
+            "action": {"type": "rebuild_platform"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value(
+        "change all parts needed to fix the bottleneck and get the synergy higher"
+    ).run()
+
+    assert not at.exception
+    final_draft = at.session_state["build_draft"]
+    # Peripheral untouched — this action is about the core platform only.
+    assert final_draft["components"]["Monitor"] == monitor.id
+    final_state = state.resolve_build_state(final_draft)
+    final_report = evaluate_build(final_state, final_draft.get("quantities", {}))
+    assert final_report.is_compatible  # 0 real warnings, guaranteed by construction
+    # A genuine coordinated platform change, not a no-op — the CPU and/or
+    # Motherboard actually changed (a stronger CPU on a different socket
+    # necessarily brings its own compatible Motherboard/RAM along with it).
+    assert (
+        final_draft["components"]["CPU"] != before_cpu_id
+        or final_draft["components"]["Motherboard"] != before_mobo_id
+    )
+    after_synergy, after_bottleneck, _after_direction = live_bottleneck_and_synergy(final_state)
+    assert after_bottleneck < before_bottleneck  # a real, genuine improvement
+    assert after_synergy > before_synergy
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "0 compatibility warnings remaining." in last_message
+    assert "Bottleneck:" in last_message and "Synergy:" in last_message
+
+
+def test_concierge_rebuild_platform_is_a_no_op_when_nothing_better_is_available(seeded_db, monkeypatch):
+    """rebuild_platform's own VERIFIED-IMPROVEMENT ENFORCEMENT (mirroring
+    optimize_bottleneck's exact discipline): engine.solvers.
+    initialize_budget_build's per-category greedy fill is NOT provably
+    bottleneck-improving even with the GPU/CPU-seeding fix — an already
+    well-balanced build asked for a full rebuild anyway must come back
+    completely untouched, never applying a real, catalog-priced platform
+    swap that doesn't actually help. Reuses the same already-well-balanced
+    fixture the sibling optimize_bottleneck no-op test uses."""
+    import ui.components.chat_assistant as chat_assistant_module
+    from db.repositories import components_repo
+    from engine.compatibility import evaluate_build
+
+    def _find(category, name):
+        return next(c for c in components_repo.get_by_category(category) if c.name == name)
+
+    cpu = _find("CPU", "Intel Core i5-13400F")
+    gpu = _find("GPU", "NVIDIA RTX 4060 Ti 16GB")
+    mobo = _find("Motherboard", "ASRock B760M-HDV")
+    ram = _find("RAM", "Kingston FURY Beast 32GB (2x16GB) DDR4-3200")
+    storage = _find("Storage", "WD Black SN850X 2TB")
+    psu = _find("PSU", "Corsair RM850x")
+    case = _find("Case", "Corsair 4000D Airflow")
+    cooler = _find("Cooler", "Thermalright Peerless Assassin 120 SE")
+
+    build_state = {
+        "CPU": cpu, "Motherboard": mobo, "GPU": gpu, "RAM": ram, "Storage": storage,
+        "PSU": psu, "Case": case, "Cooler": cooler,
+    }
+    report = evaluate_build(build_state)
+    assert report.is_compatible  # sanity: fixture is genuinely valid and already well-balanced
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "rebuildplat2", "rebuildplat2@example.com", "Rebuild Platform Two")
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Free", "workload_profile": None, "tier": "Mid", "budget_ceiling": None,
+        "components": {cat: c.id for cat, c in build_state.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Free"
+    before_components = dict(at.session_state["build_draft"]["components"])
+
+    def _fake_response(
+        user_message, conversation_history, catalog_summary, community_summary,
+        current_build_context=None, advisory_context=None, **kwargs,
+    ):
+        return {
+            "reply": "Rebuilding the core platform now.",
+            "action": {"type": "rebuild_platform"},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+    at.get_by_key("concierge_chat_input").set_value("do a full platform overhaul").run()
+
+    assert not at.exception
+    assert at.session_state["build_draft"]["components"] == before_components
+    last_message = at.session_state["concierge_messages"][-1]["content"]
+    assert "no changes made" in last_message.lower()
+    assert "Delta:" not in last_message
 
 
 # ---------------------------------------------------------------------------

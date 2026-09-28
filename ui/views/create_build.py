@@ -385,6 +385,7 @@ def _rate_my_build_dialog(build_draft: dict, build_state: dict) -> None:
             build.id, user["id"], title or _rate_my_build_title(build_state),
             description or None, flair=flair,
         )
+        st.session_state["concierge_last_published_post"] = {"post_id": post.id, "title": post.title}
         # Same "leaving the builder with a real, persisted result" teardown
         # _save_actions' publish branch performs — no database write of its
         # own, just clearing create_mode/build_draft/analysis (spec.md §7.9).
@@ -681,13 +682,25 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
         ])
         with tab1:
             st.markdown(sanitize_markdown(advisory["within_budget"]["explanation"]))
+            in_budget_depleted = not advisory["within_budget"]["swaps"]
             if st.button(
                 "⚡ Apply In-Budget Optimization",
                 key="btn_apply_in_budget",
-                disabled=not advisory["within_budget"]["swaps"],
+                disabled=in_budget_depleted,
             ):
                 _apply_within_budget_optimization(build_draft, build_state, mode, current_budget_or_cost, advisory)
                 st.rerun()
+            # DEPLETED-STATE NOTICE (a real, confirmed UX gap this closes):
+            # the button's own `disabled` condition already correctly
+            # reflected "no further in-budget swap exists" (re-evaluated
+            # fresh from the CURRENT build's own cached advisory on every
+            # render, so it re-enables the moment a later build change makes
+            # a new swap available again) — what was missing was ever telling
+            # the user WHY it's greyed out, unlike tab2's own "Apply Stretch
+            # Upgrade" button, which already explains both of its own
+            # disabled reasons via st.caption below it.
+            if in_budget_depleted:
+                st.markdown(":red[No further adjustments can be made within this budget.]")
         with tab2:
             st.markdown(sanitize_markdown(advisory["stretch_budget"]["explanation"]))
             stretch_already_applied = cache_key in st.session_state["stretch_applied_keys"]
@@ -775,10 +788,11 @@ def _save_actions(build_draft: dict, build_state: dict) -> None:
                 is_public=publish,
             )
             if publish:
-                community_repo.create_post(
+                post = community_repo.create_post(
                     build.id, user["id"], name or "Untitled build", community_description or None,
                     flair=community_flair,
                 )
+                st.session_state["concierge_last_published_post"] = {"post_id": post.id, "title": post.title}
 
             st.success("Build saved!")
             destination_page = "my_builds"

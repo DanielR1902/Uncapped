@@ -233,11 +233,16 @@ from auth.session import current_user
 from db.models import COMPONENT_CATEGORIES
 from db.repositories import builds_repo, community_repo, components_repo, drafts_repo
 from engine import solvers
-from engine.compatibility import evaluate_build
+from engine.compatibility import BuildState, evaluate_build
 from engine.scoring import live_bottleneck_and_synergy
 from llm.advisory import get_build_advisory
 from llm.client import analyze_build
-from llm.concierge import get_concierge_response
+from llm.concierge import (
+    TARGET_BOTTLENECK_PCT,
+    TARGET_SYNERGY,
+    get_concierge_response,
+    optimize_build_full,
+)
 from ui import state
 from ui.format import CURRENCY_RATES, format_currency, sanitize_markdown
 
@@ -993,9 +998,10 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         # never has to wait for a second round-trip they already answered.
         if action.get("publish_immediately"):
             builds_repo.set_public(build.id, True)
-            community_repo.create_post(
+            post = community_repo.create_post(
                 build.id, user["id"], name, action.get("author_notes"), flair=action.get("flair"),
             )
+            st.session_state["concierge_last_published_post"] = {"post_id": post.id, "title": post.title}
         return None
 
     if action_type == "publish_build":
@@ -1005,9 +1011,10 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         user = current_user()
         title = saved.get("name") or "Untitled build"
         builds_repo.set_public(saved["build_id"], True)
-        community_repo.create_post(
+        post = community_repo.create_post(
             saved["build_id"], user["id"], title, action.get("author_notes"), flair=action.get("flair"),
         )
+        st.session_state["concierge_last_published_post"] = {"post_id": post.id, "title": post.title}
         return None
 
     if action_type in ("load_build", "modify_build"):
@@ -1146,7 +1153,7 @@ def _apply_concierge_action(action: dict | None) -> float | None:
             return None
         return state.build_total_cost(final_build_state, build_draft.get("quantities", {}))
 
-    if action_type == "optimize_bottleneck":
+    if action_type in ("optimize_bottleneck", "rebuild_platform"):
         build_draft = st.session_state.get("build_draft")
         if not build_draft:
             return None
@@ -1155,82 +1162,33 @@ def _apply_concierge_action(action: dict | None) -> float | None:
             return None
         mode = build_draft.get("creation_mode") or "Free"
         quantities = build_draft.get("quantities", {})
-        current_budget_or_cost = build_draft.get("budget_ceiling") if mode == "Budget" else None
-        if not current_budget_or_cost:
-            current_budget_or_cost = state.build_total_cost(build_state, quantities)
 
-        target_percentage = action.get("target_percentage")
-        if target_percentage is None:
-            target_percentage = _DEFAULT_BOTTLENECK_TARGET
-
-        # BOTTLENECK-TARGETING FIX (root-cause fix for "AI fails to reduce
-        # bottleneck" / "hallucinates irrelevant swaps"): `within_budget.
-        # swaps` (used here previously) is a cost-neutral REBALANCE — it
-        # downgrades the NON-bottlenecked side to fund a modest paired
-        # upgrade of the bottlenecked one, and returns NO swap at all once
-        # that non-bottlenecked side has no cheaper compatible option left —
-        # a real, confirmed dead end that left an explicit "fix my
-        # bottleneck" request doing nothing. `stretch_budget.actions` is
-        # llm.advisory's own dedicated "target the bottleneck category
-        # directly with a real upgrade" recommendation for Free mode's own
-        # stated objective (llm/CLAUDE.md) — the correct one to apply here,
-        # never the rebalance-only swap. Runs in a bounded retry loop: after
-        # applying one round of upgrades, re-check the LIVE bottleneck
-        # against `target_percentage` and, if still above it and a further
-        # real stretch upgrade exists, fetch and apply one more — capped at
-        # _MAX_BOTTLENECK_OPTIMIZE_ATTEMPTS so a build that's genuinely
-        # peaked at both CPU and GPU tiers degrades gracefully instead of
-        # looping or spamming LLM calls indefinitely.
-        for _ in range(_MAX_BOTTLENECK_OPTIMIZE_ATTEMPTS):
-            advisory = get_build_advisory(
-                build_state, mode, current_budget_or_cost,
-                profile=build_draft.get("workload_profile"),
-                bottleneck_info=(st.session_state.get("build_draft_analysis") or {}).get("bottleneck"),
-                quantities=quantities,
-            )
-            actions = advisory["stretch_budget"]["actions"]
-            if not actions:
-                break
-
-            for stretch_action in actions:
-                if stretch_action.get("action") == "set_quantity":
-                    category = stretch_action.get("category")
-                    effective_max, _reason, _kind = state.resolve_effective_quantity_limit(
-                        build_state, category, quantities,
-                        current_budget_or_cost if mode == "Budget" else None,
-                    )
-                    requested_qty = stretch_action.get("quantity", 1)
-                    clamped_qty = min(requested_qty, effective_max) if effective_max is not None else requested_qty
-                    state.set_quantity(build_draft, category, max(1, clamped_qty))
-                else:
-                    component = components_repo.get_by_id(stretch_action.get("replace_with_id"))
-                    if component is not None:
-                        state.set_component(build_draft, stretch_action.get("category"), component)
-
-            build_state = state.resolve_build_state(build_draft)
-            quantities = build_draft.get("quantities", {})
-
-            # BUDGET HARD-CAP SAFETY NET (Part 2 precedent, applied here too):
-            # llm.advisory's own Budget-mode objective already keeps
-            # stretch_budget within remaining_budget, but this loop never
-            # trusts that alone — if a round of stretch actions somehow still
-            # pushed the total over a real ceiling, re-clamp deterministically
-            # via the same tested solver before continuing.
-            if mode == "Budget":
-                new_total = state.build_total_cost(build_state, quantities)
-                if new_total > current_budget_or_cost:
-                    clamped_state = solvers.initialize_budget_build(
-                        current_budget_or_cost, seed_selection=build_state,
-                    )
-                    for category, component in clamped_state.items():
-                        state.set_component(build_draft, category, component)
-                    build_state = state.resolve_build_state(build_draft)
-                    break
-
-            live = live_bottleneck_and_synergy(build_state) if len(build_state) >= 2 else None
-            if live is None or live[1] <= target_percentage:
-                break
-
+        # UNIFIED OPTIMIZATION PIPELINE (spec.md §6.7 intents 12/15): the same
+        # loop the Build Studio's "Apply In-Budget Optimization" button runs,
+        # executed to completion in ONE turn by llm.concierge.optimize_build_full
+        # — warnings first, then iterative in-place swaps, then (only if the
+        # targets of Synergy >= 90 / Bottleneck <= 10% / 0 warnings are still
+        # missed) a fresh full-platform rebuild via the primary builder solver
+        # around the build's base price, exploring [max(300, X-1000), X+1000].
+        # Full platform swaps and multi-part overhauls are explicitly
+        # authorized by an optimize/fix request — never a "bigger step" refusal.
+        base_price = (
+            build_draft.get("budget_ceiling")
+            if mode == "Budget" and build_draft.get("budget_ceiling")
+            else state.build_total_cost(build_state, quantities)
+        )
+        result = optimize_build_full(
+            build_state, quantities, mode, base_price,
+            resolve_component=components_repo.get_by_id,
+            profile=build_draft.get("workload_profile"),
+        )
+        if result.strategy != "unchanged":
+            for category, component in result.build_state.items():
+                if build_state.get(category) is None or build_state[category].id != component.id:
+                    state.set_component(build_draft, category, component)
+            for category, qty in result.quantities.items():
+                if quantities.get(category) != qty:
+                    state.set_quantity(build_draft, category, qty)
         st.session_state["build_draft"] = build_draft
         st.session_state["page"] = "create_build"
         st.session_state["build_draft_analysis"] = None
@@ -1443,6 +1401,7 @@ def render_concierge_widget() -> None:
                         if st.session_state.get("page") == "community"
                         else None
                     ),
+                    last_published_post=st.session_state.get("concierge_last_published_post"),
                     active_currency=_active_currency(),
                     currency_rates=CURRENCY_RATES,
                 )
@@ -1459,11 +1418,19 @@ def render_concierge_widget() -> None:
                 st.session_state.get("build_draft")
                 if pending_action_type in (
                     "modify_build", "fix_warnings", "optimize_bottleneck", "use_remaining_budget",
-                    "rebalance_budget",
+                    "rebalance_budget", "rebuild_platform",
                 )
                 else None
             )
             before_build_state = state.resolve_build_state(before_build_draft) if before_build_draft else {}
+            # Snapshot of the actual component-id selection, used ONLY to
+            # detect a genuine optimize_bottleneck no-op below (never a
+            # substitute for the before_live/after_live readings above,
+            # which stay the authoritative source for the numbers actually
+            # displayed) — `before_build_draft` is the SAME dict object
+            # `_apply_concierge_action` mutates in place, so this copy must
+            # be taken now, before that call runs.
+            before_components = dict(before_build_draft.get("components", {})) if before_build_draft else None
             before_total = (
                 state.build_total_cost(before_build_state, before_build_draft.get("quantities", {}))
                 if before_build_state
@@ -1607,44 +1574,102 @@ def render_concierge_widget() -> None:
             if (
                 applied_action_type in (
                     "load_build", "modify_build", "fix_warnings", "optimize_bottleneck", "use_remaining_budget",
-                    "rebalance_budget",
+                    "rebalance_budget", "rebuild_platform",
                 )
                 and real_total is not None
             ):
                 build_draft = st.session_state.get("build_draft")
                 build_state = state.resolve_build_state(build_draft) if build_draft else {}
                 lines: list[str] = []
-                if applied_action_type == "fix_warnings":
+                # ALREADY-OPTIMAL NO-OP MESSAGING (a real, confirmed UX bug
+                # this fixes): whenever optimize_bottleneck's own short-circuit
+                # or its deterministic-search-then-advisory-loop chain both
+                # leave the build's component selection completely untouched
+                # (either it was already at/under target, or nothing in the
+                # current catalog can improve it further without a genuine
+                # bottleneck regression), `real_total` still comes back as a
+                # real, non-None number equal to `before_total` — falling
+                # through to the ordinary swap-style telemetry below produced
+                # a misleading "Bottleneck: 8% -> 8% | Synergy: 96 -> 96" plus
+                # "Delta: +$0.00" line that reads exactly like a broken/no-op
+                # swap, even though nothing was ever meant to change. Detected
+                # here via the real component-id snapshot (never inferred from
+                # before_live/after_live equality, since `before_live` can be
+                # a stale LLM-refined reading from an earlier turn that
+                # legitimately differs by a few points from a fresh recompute
+                # of the SAME, unmutated build per spec.md §6.3's own +/-10pt
+                # allowance) — so this fires only on a genuine no-op, never a
+                # real swap that happens to leave the rounded display equal.
+                bottleneck_noop = (
+                    applied_action_type in ("optimize_bottleneck", "rebuild_platform")
+                    and before_components is not None
+                    and build_draft is not None
+                    and build_draft.get("components", {}) == before_components
+                )
+                if bottleneck_noop:
+                    # The unified pipeline (in-place swaps, then a full-platform
+                    # rebuild across the whole budget window) already tried
+                    # everything, so an untouched build means either it already
+                    # meets the targets or nothing in the catalog beats it.
+                    # Report the real reading, never the swap-style telemetry.
                     remaining = evaluate_build(build_state, (build_draft or {}).get("quantities", {})).issues
-                    lines.append(
-                        "0 compatibility warnings remaining."
-                        if not remaining
-                        else f"{len(remaining)} warning(s) still remaining: {remaining[0]}"
-                    )
-                after_live = _sync_authoritative_analysis(build_draft or {}, build_state)
-                if before_live is not None and after_live is not None:
-                    lines.append(
-                        f"Bottleneck: {before_live[1]:.0f}% -> {after_live[1]:.0f}% ({after_live[2]}) | "
-                        f"Synergy: {before_live[0]:.0f} -> {after_live[0]:.0f}"
-                    )
-                elif before_live is None and after_live is not None:
-                    # load_build (a brand-new build has no "before" to diff
-                    # against) — the real, Python-computed final reading only,
-                    # never anything the model's own reply might have guessed.
-                    lines.append(
-                        f"Bottleneck: {after_live[1]:.0f}% ({after_live[2]}) | Synergy: {after_live[0]:.0f}"
-                    )
-                elif applied_action_type == "optimize_bottleneck" and after_live is None:
-                    lines.append("Bottleneck unavailable.")
-                if before_total is not None:
-                    delta = real_total - before_total
-                    sign = "+" if delta >= 0 else "-"
-                    lines.append(
-                        f"Delta: {sign}{format_currency(abs(delta), target_currency)} | "
-                        f"Total: {format_currency(real_total, target_currency)}"
-                    )
+                    if remaining:
+                        lines.append(f"{len(remaining)} warning(s) still remaining: {remaining[0]}")
+                    after_live = _sync_authoritative_analysis(build_draft or {}, build_state)
+                    if after_live is None:
+                        lines.append("Already optimal for this hardware combination — no changes made.")
+                    elif after_live[0] >= TARGET_SYNERGY and after_live[1] <= TARGET_BOTTLENECK_PCT:
+                        lines.append(
+                            f"Already at peak synergy ({after_live[0]:.0f}/100) for this hardware "
+                            "combination under the current catalog — no changes made."
+                        )
+                    else:
+                        lines.append(
+                            f"Bottleneck: {after_live[1]:.0f}% ({after_live[2]}) | Synergy: {after_live[0]:.0f}/100 "
+                            "— no configuration in the catalog within this budget range scores better, "
+                            "so nothing was changed."
+                        )
                 else:
-                    lines.append(f"Total: {format_currency(real_total, target_currency)}")
+                    if applied_action_type in ("fix_warnings", "rebuild_platform", "optimize_bottleneck"):
+                        # For rebuild_platform this is a real, code-enforced
+                        # guarantee (engine.solvers.initialize_budget_build
+                        # only ever assembles from candidates that already
+                        # pass a full evaluate_build check); for
+                        # optimize_bottleneck it's best-effort, same as
+                        # fix_warnings itself (its own internal warnings-first
+                        # step above uses the exact same resolver) — shown
+                        # anyway, never asserted without checking, matching
+                        # every other number in this reply.
+                        remaining = evaluate_build(build_state, (build_draft or {}).get("quantities", {})).issues
+                        lines.append(
+                            "0 compatibility warnings remaining."
+                            if not remaining
+                            else f"{len(remaining)} warning(s) still remaining: {remaining[0]}"
+                        )
+                    after_live = _sync_authoritative_analysis(build_draft or {}, build_state)
+                    if before_live is not None and after_live is not None:
+                        lines.append(
+                            f"Bottleneck: {before_live[1]:.0f}% -> {after_live[1]:.0f}% ({after_live[2]}) | "
+                            f"Synergy: {before_live[0]:.0f} -> {after_live[0]:.0f}"
+                        )
+                    elif before_live is None and after_live is not None:
+                        # load_build (a brand-new build has no "before" to diff
+                        # against) — the real, Python-computed final reading only,
+                        # never anything the model's own reply might have guessed.
+                        lines.append(
+                            f"Bottleneck: {after_live[1]:.0f}% ({after_live[2]}) | Synergy: {after_live[0]:.0f}"
+                        )
+                    elif applied_action_type == "optimize_bottleneck" and after_live is None:
+                        lines.append("Bottleneck unavailable.")
+                    if before_total is not None:
+                        delta = real_total - before_total
+                        sign = "+" if delta >= 0 else "-"
+                        lines.append(
+                            f"Delta: {sign}{format_currency(abs(delta), target_currency)} | "
+                            f"Total: {format_currency(real_total, target_currency)}"
+                        )
+                    else:
+                        lines.append(f"Total: {format_currency(real_total, target_currency)}")
                 reply_content = f"{reply_content}\n\n" + "\n\n".join(f"**{line}**" for line in lines)
             elif real_total is not None:
                 reply_content = f"{reply_content}\n\n**Total: {format_currency(real_total, target_currency)}**"

@@ -55,7 +55,8 @@ def _open_publish_form(build) -> None:
 
 def _confirm_publish(build, description: str, flair: str) -> None:
     builds_repo.set_public(build.id, True)
-    community_repo.create_post(build.id, current_user()["id"], build.name, description or None, flair=flair)
+    post = community_repo.create_post(build.id, current_user()["id"], build.name, description or None, flair=flair)
+    st.session_state["concierge_last_published_post"] = {"post_id": post.id, "title": post.title}
     st.session_state[f"{_PUBLISH_FORM_KEY_PREFIX}{build.id}"] = False
     st.success(f'"{build.name}" published to Community!')
     st.rerun()

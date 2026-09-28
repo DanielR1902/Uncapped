@@ -2049,6 +2049,94 @@ def test_open_community_build_action_no_match_says_so_and_returns_null_action(mo
 
 
 # ---------------------------------------------------------------------------
+# last_published_post: fix for "go to the post I just published" failing
+# right after a real publish (community_summary carries no author/timestamp
+# signal the model could otherwise use to identify "the one").
+# ---------------------------------------------------------------------------
+def test_last_published_post_reaches_the_request_payload_when_provided(monkeypatch):
+    """Same inspection style as advisory_context/active_currency above:
+    confirms last_published_post is actually threaded into the request
+    payload sent to OpenRouter, not just accepted and dropped."""
+    _set_env(monkeypatch)
+    captured_payload = {}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        captured_payload.update(json)
+        return _fake_openrouter_response({"reply": "ok", "action": None})
+
+    monkeypatch.setattr(concierge.httpx, "post", fake_post)
+
+    last_published = {"post_id": 2, "title": "Video Editing Powerhouse"}
+    result = concierge.get_concierge_response(
+        "go to the post", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY, last_published_post=last_published,
+    )
+
+    assert result["source"] == "llm"
+    sent_payload = json.loads(captured_payload["messages"][1]["content"])
+    assert sent_payload["last_published_post"] == last_published
+
+
+def test_last_published_post_defaults_to_null_in_the_request_payload(monkeypatch):
+    """No publish has happened yet this session — the payload must carry a
+    real `null`, never a missing key or a fabricated placeholder."""
+    _set_env(monkeypatch)
+    captured_payload = {}
+
+    def fake_post(url, timeout=None, headers=None, json=None):
+        captured_payload.update(json)
+        return _fake_openrouter_response({"reply": "ok", "action": None})
+
+    monkeypatch.setattr(concierge.httpx, "post", fake_post)
+
+    concierge.get_concierge_response("go to the post", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY)
+
+    sent_payload = json.loads(captured_payload["messages"][1]["content"])
+    assert sent_payload["last_published_post"] is None
+
+
+def test_go_to_last_published_post_resolves_via_last_published_post_id(monkeypatch):
+    """The actual bug scenario: "go to the post [I just uploaded]" with
+    last_published_post set must resolve to that exact post — a real
+    post_id already present in COMMUNITY_SUMMARY, so it passes the
+    zero-hallucination cross-check like any other open_community_build."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Taking you to your published post.",
+        "action": {"type": "open_community_build", "post_id": 2},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "go to the post I just uploaded", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY,
+        last_published_post={"post_id": 2, "title": "Video Editing Powerhouse"},
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {"type": "open_community_build", "post_id": 2}
+
+
+def test_go_to_the_post_with_no_publish_yet_falls_back_to_plain_navigate(monkeypatch):
+    """Directive's explicit fallback: with nothing published this session
+    (last_published_post is None) and no specific build named, the model
+    should navigate generally to Community rather than refuse outright —
+    this only confirms that shape isn't rejected by validation/plumbing."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Here's the Community feed — let me know which post you'd like to open.",
+        "action": {"type": "navigate", "navigate_to": "community"},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = concierge.get_concierge_response(
+        "go to the post", [], CATALOG_SUMMARY, COMMUNITY_SUMMARY, last_published_post=None,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"]["type"] == "navigate"
+    assert result["action"]["navigate_to"] == "community"
+
+
+# ---------------------------------------------------------------------------
 # Intent 9: load an existing draft/build/community post into the studio
 # (load_saved_build) — distinct from load_build (a brand new build) and from
 # open_community_build (a read-only thread view).
@@ -2417,6 +2505,34 @@ def test_optimize_bottleneck_action_parses_explicit_target_percentage(monkeypatc
 
     assert result["source"] == "llm"
     assert result["action"]["target_percentage"] == 10.0
+
+
+def test_rebuild_platform_action_passes_through(monkeypatch):
+    """"change all parts needed to fix the bottleneck and get the synergy
+    higher" -> a pure pass-through rebuild_platform action, no LLM-asserted
+    catalog id at all (spec.md §6.7 intent 15: the actual rebuild is
+    computed entirely by engine.solvers.initialize_budget_build +
+    find_bottleneck_minimizing_swap in ui/components/chat_assistant.py,
+    never a part this response names itself)."""
+    _set_env(monkeypatch)
+    payload = {
+        "reply": "Rebuilding the core platform now.",
+        "action": {"type": "rebuild_platform"},
+    }
+    monkeypatch.setattr(concierge.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    build_context = dict(CURRENT_BUILD_CONTEXT)
+    build_context["compatibility_issues"] = []
+    build_context["bottleneck"] = {"percentage": 50.0, "direction": "CPU-bound"}
+
+    result = concierge.get_concierge_response(
+        "change all parts needed to fix the bottleneck and get the synergy higher",
+        [], CATALOG_SUMMARY, COMMUNITY_SUMMARY,
+        current_build_context=build_context,
+    )
+
+    assert result["source"] == "llm"
+    assert result["action"] == {"type": "rebuild_platform", "explanation": ""}
 
 
 def test_use_remaining_budget_action_passes_through(monkeypatch):

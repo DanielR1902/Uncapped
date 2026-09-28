@@ -636,6 +636,65 @@ class ConciergeRebalanceBudgetAction(BaseModel):
     explanation: str = ""
 
 
+class ConciergeRebuildPlatformAction(BaseModel):
+    """The user's EXPLICIT request for a full platform rebuild — replacing
+    Motherboard/CPU/RAM/GPU/Storage/Case/PSU/Cooler together with a freshly
+    solved, guaranteed-compatible combination at the SAME core-platform
+    budget — a real, confirmed gap `ConciergeOptimizeBottleneckAction` alone
+    can't close: that action's own deterministic search and advisory
+    fallback are both deliberately scoped to a SINGLE CPU or GPU swap within
+    the CURRENT socket (see its own docstring/spec.md §6.7 intent 12's
+    documented "swapping the whole platform is a bigger change than a single
+    optimize-the-bottleneck request implies" exclusion) — so a build whose
+    socket has genuinely hit its ceiling (no compatible CPU on this
+    motherboard closes the gap to its GPU any further) reports that plainly
+    and stops, EVEN IF THE USER THEN EXPLICITLY ASKS FOR THE BIGGER STEP: a
+    live reproduction confirmed there was no action type at all this second,
+    explicit request could resolve to, so it kept getting the same
+    "no changes made" outcome no matter how directly the user asked. THIS
+    action is the (still Python-verified-in-code, still never LLM-invented-
+    swap) path for that explicit ask.
+
+    Recognized ONLY in two cases — never inferred from a vague, generic
+    "optimize my build" (that stays `optimize_bottleneck`, spec.md §6.7
+    intent 12):
+    (a) the user's message is a clear, standalone request naming a FULL/
+        MULTI-PART/PLATFORM change collectively (e.g. "change all parts
+        needed to fix the bottleneck", "do a full platform overhaul",
+        "rebuild the whole thing", "swap the motherboard, CPU and RAM"),
+        never a request naming just one category; or
+    (b) the user's message is a plain, unambiguous affirmative ("yes", "do
+        it", "go ahead", "make the change") whose IMMEDIATELY PRECEDING
+        assistant turn (checked via `conversation_history`, the exact same
+        technique the pre-existing budget-guardrail confirmation flow
+        already uses) is the `optimize_bottleneck`-driven "platform/socket
+        ceiling" reply stating a full platform change could help but wasn't
+        applied — never a bare "yes" answering some OTHER, unrelated prior
+        question.
+
+    Carries NO LLM-asserted catalog id or category — same "pure pass-
+    through, actual work done deterministically by `engine/`" reasoning as
+    `ConciergeFixWarningsAction`/`ConciergeOptimizeBottleneckAction` above:
+    the caller (`ui/components/chat_assistant.py`) computes the real current
+    core-platform cost and calls `engine.solvers.initialize_budget_build` at
+    that exact ceiling (fresh, unseeded — since ANY/ALL core categories may
+    need replacing), guaranteeing a fully compatible (0 real warnings)
+    result by construction, then runs `engine.solvers.
+    find_bottleneck_minimizing_swap` once more on top of that fresh build to
+    squeeze out any further easy CPU/GPU win. The real resulting Bottleneck/
+    Synergy/cost reading is reported via the same Rigorous Telemetry Reply
+    Format every other build-mutating action already gets (spec.md §7.8) —
+    never a number this response states itself, and never a hardcoded
+    "guaranteed <= 5% / >= 85" promise this action's own docstring or the
+    model's `reply` may claim, since `initialize_budget_build` (a general
+    price/compatibility solver, not a bottleneck-specific one) doesn't
+    provably hit an exact target for every possible budget/catalog
+    combination — only the REAL computed number is ever shown."""
+
+    type: Literal["rebuild_platform"] = "rebuild_platform"
+    explanation: str = ""
+
+
 class ConciergeResponse(BaseModel):
     """Response shape for the Concierge chat feature (see llm/concierge.py).
     `reply` is always present (conversational answer to the user's message).
@@ -668,7 +727,11 @@ class ConciergeResponse(BaseModel):
     (`use_remaining_budget` — a bounded, multi-tier (CPU/GPU -> RAM ->
     Storage -> Cooler/PSU) upgrade sequence computed entirely in Python, same
     zero-LLM-arithmetic precedent — see `ConciergeUseRemainingBudgetAction`'s
-    docstring); it is `None` for catalog-question, community-recommendation,
+    docstring), or an EXPLICIT request for a full platform rebuild once a
+    single-swap fix has already been ruled out, or when the user proactively
+    asks for a multi-part/platform change outright (`rebuild_platform` — see
+    `ConciergeRebuildPlatformAction`'s docstring for its narrow, two-case
+    trigger); it is `None` for catalog-question, community-recommendation,
     and optimization/analysis intents, and also `None` (with `reply` saying
     so) when a named part could
     not be found in `catalog_summary` at all, when a modify/save request has
@@ -712,6 +775,7 @@ class ConciergeResponse(BaseModel):
         | ConciergeOptimizeBottleneckAction
         | ConciergeUseRemainingBudgetAction
         | ConciergeRebalanceBudgetAction
+        | ConciergeRebuildPlatformAction
         | None
     ) = None
     currency_switch: Literal["USD", "EUR", "NIS"] | None = None

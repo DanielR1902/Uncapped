@@ -86,11 +86,13 @@ def _fork_into_studio(build) -> None:
     st.rerun()
 
 
-def _save_to_my_builds(build) -> None:
+def _save_to_my_builds(build, post_title: str, author_username: str | None) -> None:
     user = current_user()
+    original_name = build.name or post_title
+    author = author_username or "Community"
     builds_repo.create_build(
         user_id=user["id"],
-        name=f"{build.name} (from community)",
+        name=f"{original_name} (uploaded by {author})",
         creation_mode=build.creation_mode,
         components=[
             builds_repo.BuildComponentInput(component_id=bc.component_id, quantity=bc.quantity)
@@ -315,7 +317,7 @@ def _thread_view(post) -> None:
     if cols[0].button("🍴 Fork / Customize", key="fork_build", use_container_width=True):
         _fork_into_studio(post.build)
     if cols[1].button("💾 Save to My Builds", key="save_to_my_builds", use_container_width=True):
-        _save_to_my_builds(post.build)
+        _save_to_my_builds(post.build, post.title, post.user.username if post.user else None)
 
     _comments_section(post)
 

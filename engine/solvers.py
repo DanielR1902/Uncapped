@@ -25,6 +25,7 @@ from engine.compatibility import (
     check_ram_motherboard_type,
     evaluate_build,
 )
+from engine.scoring import bottleneck_percentage_baseline
 
 # GPU/CPU dominate both cost and performance, so they're locked in first —
 # every other category then negotiates around whatever budget is left.
@@ -82,6 +83,67 @@ def get_all_compatible_candidates(build_state: BuildState) -> dict[str, list[Com
     """Same as get_compatible_candidates, for every core category at once —
     convenient for rendering all part-pickers together."""
     return {category: get_compatible_candidates(category, build_state) for category in CATEGORY_ORDER}
+
+
+def find_bottleneck_minimizing_swap(build_state: BuildState) -> tuple[BuildState, str] | None:
+    """Exhaustive, deterministic search for the single CPU/GPU swap that most
+    reduces the current CPU<->GPU benchmark-score imbalance (spec.md §6.7
+    intent 12) — the AI Concierge's "optimize the bottleneck"/"improve
+    synergy" action's PRIMARY mechanism, a real improvement over relying
+    solely on `llm.advisory.get_build_advisory`'s own narrower, non-
+    exhaustive recommendation chain (which can take several retries to land
+    on a genuine improvement, or occasionally miss one that exists at all).
+
+    Since `engine.scoring.heuristic_synergy_score` is `compatibility_score -
+    bottleneck_percentage / 2`, and every candidate considered here is, by
+    construction (`get_compatible_candidates`), fully compatible
+    (compatibility_score stays 100), MINIMIZING bottleneck_percentage here
+    IS maximizing synergy — there is no separate, independent "synergy
+    objective" to balance against it, and no candidate this function can
+    ever return reduces bottleneck while also reducing synergy. No
+    Pareto-style trade-off scoring is needed for that reason.
+
+    Searches only the currently LIMITING side (CPU if CPU-bound, GPU if
+    GPU-bound) — swapping the non-limiting side can only widen the gap
+    further, per `bottleneck_percentage_baseline`'s own `abs(cpu_score -
+    gpu_score)` formula. Ties on the resulting percentage are broken by
+    price (cheapest first), so an equally-good fix never costs more than it
+    has to.
+
+    Returns `(new_build_state, category)` for the winning swap, or `None`
+    when `build_state` doesn't have both CPU and GPU picked yet, is already
+    perfectly balanced (`direction == "Balanced"`), or no compatible
+    candidate for the limiting category improves on the current percentage
+    at all (already the best available on this platform/socket — this is the
+    single-category building block only; a cross-socket overhaul is done by
+    `llm.concierge.optimize_build_full`, which rebuilds the whole platform
+    via `initialize_budget_build` and is explicitly authorized by an
+    optimize request)."""
+    if "CPU" not in build_state or "GPU" not in build_state:
+        return None
+
+    current_pct, direction = bottleneck_percentage_baseline(build_state)
+    if direction == "Balanced":
+        return None
+    category = "CPU" if direction == "CPU-bound" else "GPU"
+
+    best_state: BuildState | None = None
+    best_pct = current_pct
+    best_price: float | None = None
+    for candidate in get_compatible_candidates(category, build_state):
+        hypothetical = dict(build_state)
+        hypothetical[category] = candidate
+        candidate_pct, _direction = bottleneck_percentage_baseline(hypothetical)
+        if candidate_pct < best_pct or (
+            candidate_pct == best_pct and best_price is not None and candidate.price_usd < best_price
+        ):
+            best_state = hypothetical
+            best_pct = candidate_pct
+            best_price = candidate.price_usd
+
+    if best_state is None:
+        return None
+    return best_state, category
 
 
 # For each failing compatibility rule, which category to try swapping first

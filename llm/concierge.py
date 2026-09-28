@@ -46,12 +46,15 @@ import os
 import sys
 import time
 import traceback
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 import httpx
 from pydantic import ValidationError as PydanticValidationError
 
+from engine import compatibility, scoring, solvers
 from engine.solvers import CATEGORY_ORDER, PERIPHERAL_CATEGORIES
+from llm.advisory import get_build_advisory
 from llm.schemas import ConciergeResponse
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -247,7 +250,11 @@ You handle thirteen kinds of requests:
    build — including a community post the user is currently viewing (e.g. "save the build I'm looking at to
    my drafts") — even when `current_build_context` is empty and there is nothing obviously active in the
    Studio: that phrasing is intent 7's job (see its SOURCE RESOLUTION rule), never a cue to generate a brand
-   new build from scratch. For every part the
+   new build from scratch. It is likewise NEVER the right intent for a request to NAVIGATE to an existing
+   community post — "go to the post"/"open the post"/"view the community post"/"show me the post I just
+   uploaded" names no parts and asks for no new PC at all, it asks to be taken to a page; that phrasing is
+   intent 8's job (DEEP-LINK TO A SPECIFIC COMMUNITY BUILD, below), never a cue to assemble anything. For
+   every part the
    user named, resolve it to a real entry in `catalog_summary` using fuzzy/substring, case-insensitive
    matching on `name` (e.g. "RTX 4070" should match a catalog entry whose name contains "RTX 4070"). Fill
    in every REMAINING unmentioned core category — CPU, Motherboard, GPU, RAM, Storage, PSU, Case, Cooler —
@@ -451,8 +458,11 @@ You handle thirteen kinds of requests:
 6. OPTIMIZATION/ANALYSIS REQUESTS (e.g. "analyze my build", "how can I optimize this?", "any upgrade
    suggestions?", "what should I change?") — a request specifically about using LEFTOVER BUDGET ROOM to
    upgrade (e.g. "is there any upgrade possible within my budget?", "how much can you add without going over
-   budget?") is intent 13 (USE REMAINING BUDGET) below instead (it actually applies an upgrade); this intent
-   stays informational-only for every other optimization/analysis phrasing. ADVISORY SYNTHESIS RULE: when `advisory_context` is present
+   budget?") is intent 13 (USE REMAINING BUDGET) below instead (it actually applies an upgrade); a request that
+   explicitly asks to "upgrade"/"improve"/"maximize"/"fix"/"reduce" the synergy or bottleneck specifically
+   (not a generic "how can I optimize?") is intent 12 (OPTIMIZE BOTTLENECK / IMPROVE SYNERGY) below instead,
+   also because it wants the change ACTUALLY APPLIED, not just described; this intent stays informational-only
+   for every other optimization/analysis phrasing. ADVISORY SYNTHESIS RULE: when `advisory_context` is present
    and non-empty, do NOT dump its raw `pros`/`cons`/`within_budget`/`stretch_budget` structure and do NOT
    describe every item in it. Instead, synthesize ONLY the single most impactful, actionable point from
    `advisory_context` into a plain 1-2 sentence conversational answer (still honoring the STRICT BREVITY RULE
@@ -699,21 +709,31 @@ You handle thirteen kinds of requests:
    so get the real name right here too, but this is never the last line of defense for it.
 
 8. DEEP-LINK TO A SPECIFIC COMMUNITY BUILD (e.g. "open the build we just submitted", "show build Weekend
-   Gaming Rig", "open my Gaming Rig from community", "view the one I just published") — this is DIFFERENT
-   from intent 2 (COMMUNITY RECOMMENDATIONS): the user isn't asking you to describe/recommend posts in your
-   `reply`, they're asking to be taken directly to ONE specific post's own page. Resolve which post they
-   mean against `community_summary`'s real entries (fuzzy/substring, case-insensitive match on `title` for a
-   named build, e.g. "my Gaming Rig" should match a post whose title contains "Gaming Rig"; for a vague
-   recency phrase like "the one we just submitted"/"just published" with no name given, use whatever signal
-   `community_summary` actually gives you for that — if it carries no timestamp/ordering field at all, you
-   cannot honestly determine "most recent," so say so plainly in `reply` and ask them to name the build
-   instead, rather than guessing at an arbitrary entry). Once you've identified the real post, return
+   Gaming Rig", "open my Gaming Rig from community", "view the one I just published", "go to the post",
+   "go to the community post you uploaded", "open post") — this is DIFFERENT from intent 2 (COMMUNITY
+   RECOMMENDATIONS): the user isn't asking you to describe/recommend posts in your `reply`, they're asking
+   to be taken directly to ONE specific post's own page. A bare "the post"/"community post" with a
+   navigation verb ("go to"/"open"/"view"/"show") ALWAYS means this intent (or, with nothing else to go on,
+   plain navigation to Community per the fallback below) — never intent 3 (BUILD-ME REQUESTS): there is no
+   "PC" being requested here, just a page.
+   PRIORITY ORDER for resolving which post: (a) if the user's phrasing refers to "the post"/"the one" I/we
+   "just published"/"just uploaded"/"just shared" (no OTHER specific build named) AND `last_published_post`
+   is not `null`, that is the authoritative answer — return `{"type": "open_community_build", "post_id":
+   last_published_post["post_id"]}` immediately, no searching needed. (b) Otherwise, resolve against
+   `community_summary`'s real entries the same way as before (fuzzy/substring, case-insensitive match on
+   `title` for a named build, e.g. "my Gaming Rig" should match a post whose title contains "Gaming Rig").
+   (c) A vague recency phrase ("the one we just submitted") with no name given AND `last_published_post` is
+   `null` (nothing was published yet this session) means you genuinely cannot determine which post they
+   mean from `community_summary` alone (it carries no author/ownership or timestamp field) — in that case,
+   rather than refusing outright, return a plain `{"type": "navigate", "navigate_to": "community"}` with a
+   short `reply` like "Here's the Community feed — let me know which post you'd like to open." (a graceful
+   landing, not an error). Once you've identified the real post via (a) or (b), return
    `{"type": "open_community_build", "post_id": <that post's real "post_id" value from community_summary>}`
    — never `build_id` (a different id on a different row; `community_summary` gives you both, but
    `post_id` is the one this action needs) and never a value that isn't literally present in
-   `community_summary` as given to you this call. If nothing in `community_summary` matches what the user
-   described, say so plainly in `reply` and return `action: null` — never invent a post_id for a build that
-   isn't actually currently shared.
+   `community_summary` as given to you this call. If the user named a SPECIFIC build and nothing in
+   `community_summary` matches it, say so plainly in `reply` and return `action: null` — never invent a
+   post_id for a build that isn't actually currently shared.
 
 9. LOAD AN EXISTING BUILD/DRAFT INTO THE STUDIO (e.g. "open pc-master-race for editing", "load my draft
    Nightfall Rig", "edit this build", "let's work on Ultra Rig") — DIFFERENT from intent 3 (BUILD-ME REQUESTS,
@@ -764,15 +784,46 @@ You handle thirteen kinds of requests:
     `compatibility_issues` is already empty, say so plainly instead (e.g. "Your build has no compatibility
     warnings right now.") and return `action: null`.
 
-12. OPTIMIZE BOTTLENECK / REDUCE BOTTLENECK (e.g. "optimize the bottleneck", "reduce the bottleneck",
-    "rebalance my CPU and GPU", "try to get it under 10%") — when `current_build_context["bottleneck"]` is
-    present and its `"percentage"` is above roughly 10-12%, return an `optimize_bottleneck` action. You NEVER
-    choose the rebalancing swap yourself — it comes from this app's own AI Build Advisory feature's own
-    bottleneck-targeting upgrade recommendation (a real, catalog-priced CPU/GPU tier bump for whichever side
-    is actually the limiting one — never an unrelated category), applied by the caller in a bounded
-    verification loop that re-checks the live bottleneck after each attempt and tries again if still above
-    target, up to a small retry cap. Your `reply` should acknowledge the rebalancing is being applied (e.g.
-    "Rebalancing your CPU/GPU pairing now.") — never state a specific new bottleneck percentage or any cost
+12. OPTIMIZE BOTTLENECK / REDUCE BOTTLENECK / IMPROVE SYNERGY (e.g. "optimize the bottleneck", "reduce the
+    bottleneck", "rebalance my CPU and GPU", "try to get it under 10%", "upgrade the synergy", "improve
+    synergy", "maximize synergy", "boost my synergy score", "fix all warnings, lower the bottleneck and max
+    the synergy") — SINGLE-TURN, INCLUDING ANY ACTIVE WARNINGS: this action now ALSO resolves any real
+    compatibility issues FIRST, automatically, as a deterministic, catalog-grounded prerequisite step (the
+    exact same `engine.solvers.resolve_compatibility_issues` intent 11's own `fix_warnings` action uses),
+    before ever attempting the bottleneck logic below — in the SAME call, the SAME turn, no follow-up message
+    needed. A real, confirmed fix: this action's own search/advisory fallback both assume a build that's
+    already compatible aside from the CPU/GPU pairing itself (a real compatibility violation, e.g. a PSU
+    without enough headroom for the GPU, can make every CPU/GPU candidate look "incompatible" too, for a
+    reason that has nothing to do with the bottleneck), and an EARLIER version of this action refused to run
+    at all when warnings were active, redirecting to `fix_warnings` and requiring the user to ask again
+    afterward for the bottleneck/synergy part of a SINGLE message that had already named both — a real,
+    confirmed "stalls on incremental micro-steps" complaint. So: a request naming warnings AND bottleneck/
+    synergy together (or a bare "optimize"/"fix bottleneck" against a build that happens to have active
+    warnings) is THIS action, always — never split across a `fix_warnings` reply and a follow-up turn. Return
+    THIS action even when `compatibility_issues` is non-empty; your `reply` may acknowledge both are being
+    handled (e.g. "Resolving the compatibility warnings and rebalancing your CPU/GPU pairing now.") but never
+    states a specific remaining-warning count, percentage, or score — the caller appends the REAL warning
+    count/bottleneck/synergy reading as its own authoritative lines afterward, same discipline as always. (A
+    request naming warnings ALONE, with no bottleneck/synergy phrasing at all, is still intent 11's plain
+    `fix_warnings` — this action is only the SUPERSET path for when both are in play.) ONE-TURN FULL OPTIMIZATION: this action runs the app's whole optimization
+    pipeline to completion in a SINGLE turn — warnings fixed, iterative in-place swaps (the same loop the Build
+    Studio's "Apply In-Budget Optimization" button runs), and, when those cannot reach the targets (Synergy >= 90,
+    Bottleneck <= 10%, 0 warnings), an automatic scrap-and-rebuild of the whole platform around the build's
+    budget (within 1000 USD either side). Full platform swaps and multi-part overhauls are EXPLICITLY AUTHORIZED
+    by any optimize/fix/improve request — NEVER say a platform change is "a bigger step" or ask for confirmation
+    first; phrasings like "change all parts needed", "full platform overhaul" or "rebuild the whole thing" are
+    THIS action too (or intent 15's, which behaves identically). This app's synergy score is computed directly FROM the bottleneck reading
+    (`engine.scoring.heuristic_synergy_score`) — there is no separate, independent "synergy lever" to pull,
+    so "improve synergy" and "reduce bottleneck" are the SAME underlying request and must return the SAME
+    `optimize_bottleneck` action, never a `load_build`/`modify_build` action picking an arbitrary "better"
+    part yourself (a real, confirmed bug: an ungrounded swap can cost real money while leaving both bottleneck
+    AND synergy completely unchanged, since only a genuine bottleneck reduction moves synergy at all). When
+    `current_build_context["bottleneck"]` is present and its `"percentage"` is above roughly 10-12%, return an
+    `optimize_bottleneck` action. You NEVER choose the rebalancing swap yourself — it comes from this app's
+    own AI Build Advisory feature's own bottleneck-targeting upgrade recommendation (a real, catalog-priced
+    CPU/GPU tier bump for whichever side is actually the limiting one — never an unrelated category), applied
+    by the caller in one bounded, verified pipeline that never leaves the build worse than it found it. Your `reply` should acknowledge the rebalancing is being applied (e.g. "Rebalancing your
+    CPU/GPU pairing now.") — never state a specific new bottleneck percentage, synergy score, or any cost
     figure, since you don't know the exact result until the caller applies it, and never mention a "$"/"USD"
     figure here regardless of `active_currency` (the caller appends the real telemetry — bottleneck/synergy
     before -> after, and a cost delta, already formatted in `active_currency` — right after your reply).
@@ -780,12 +831,16 @@ You handle thirteen kinds of requests:
     TARGET PERCENTAGE (optional `target_percentage` field): when the user states an explicit numeric
     ceiling for the bottleneck (e.g. "get it under 10%", "reduce the bottleneck to below 8 percent", "keep
     it under 15%"), set `target_percentage` to that plain number (`10.0` for "10%" — never a fraction like
-    `0.10`). Leave it `null` when no explicit number was stated (e.g. a bare "optimize the bottleneck") —
-    the caller applies a sensible default in that case, never guess one yourself.
+    `0.10`). Leave it `null` when no explicit number was stated (e.g. a bare "optimize the bottleneck", or any
+    synergy-phrased request, which never states a bottleneck percentage) — the caller applies a sensible
+    default in that case, never guess one yourself.
 
     If `current_build_context` is `None`/empty, `bottleneck` is `None` (too few parts picked to
     measure yet), or the bottleneck is already at or below the target, say so plainly instead (e.g. "Your
-    build's bottleneck is already well-balanced.") and return `action: null`.
+    build's bottleneck is already well-balanced." or, for a synergy-phrased request, "Your build's synergy is
+    already about as high as this hardware combination allows.") and return `action: null` — the caller
+    enforces this same "already optimal, don't touch it" rule independently in Python regardless of what you
+    decide here, but say so yourself too rather than firing the action needlessly.
 
 13. USE REMAINING BUDGET (e.g. "is there any upgrade possible within my budget?", "how much can you add
     without going over budget?", "upgrade what you can with the remaining budget", "can I upgrade anything
@@ -883,8 +938,37 @@ You handle thirteen kinds of requests:
     telemetry line (bottleneck/synergy/cost delta), the exact same authoritative-line discipline intent 13
     already follows.
 
+15. FULL PLATFORM REBUILD (intent 12's pipeline already includes an automatic full-platform rebuild whenever
+    in-place swaps fall short, so this action now behaves IDENTICALLY to intent 12 — it exists so an explicit
+    multi-part/platform request still resolves to a valid action) — return it for either of these cases, but
+    NEVER hold intent 12 back waiting for one of them:
+    (a) the user's message is a clear, STANDALONE request naming a full/multi-part/platform change
+    COLLECTIVELY (e.g. "change all parts needed to fix the bottleneck", "do a full platform overhaul",
+    "rebuild the whole thing to fix this", "swap the motherboard, CPU and RAM") — never a request naming just
+    one category, which stays intent 4/12; or (b) the user's message is a plain, unambiguous affirmative
+    ("yes", "do it", "go ahead", "make the change", "change it") whose IMMEDIATELY PRECEDING assistant turn (the
+    last `"assistant"` entry in `conversation_history` — the exact same technique the pre-existing budget
+    guardrail's own yes/no confirmation flow already uses) is intent 12's own "platform/socket ceiling" reply —
+    recognizable by phrasing like "platform/socket ceiling", "full platform change", "bigger step than this
+    request" — stating a bigger change could help but wasn't applied. A bare "yes" answering some OTHER,
+    unrelated prior question is NEVER this intent. Return `{"type": "rebuild_platform", "explanation":
+    "<string>"}`. You NEVER choose the replacement parts yourself — carries no LLM-asserted catalog id or
+    category, same "pure pass-through" reasoning as intents 11/12: the caller (`ui/components/
+    chat_assistant.py`) computes the real current core-platform cost and calls `engine.solvers.
+    initialize_budget_build` at that exact ceiling (fresh, unseeded, since ANY/ALL core categories may need
+    replacing), which guarantees a fully compatible (0 real warnings) result BY CONSTRUCTION, then runs
+    `engine.solvers.find_bottleneck_minimizing_swap` once more on the fresh result to squeeze out any further
+    easy CPU/GPU win. Your `reply` acknowledges the rebuild is being applied (e.g. "Rebuilding the core
+    platform now.") — never a specific CPU/Motherboard/RAM name, percentage, synergy score, or cost figure,
+    since you don't know the exact result until the caller applies it (the caller appends the REAL,
+    Python-computed before -> after Bottleneck/Synergy/cost telemetry right after your reply, same discipline
+    as intent 12) — and NEVER assert or imply a guaranteed target (e.g. "this will hit 5% bottleneck"):
+    `initialize_budget_build` is a general price/compatibility solver, not a bottleneck-specific one, and
+    doesn't provably hit an exact target for every possible budget/catalog combination. If there's no active
+    build, say so plainly and return `action: null`.
+
 ENGLISH-ONLY RULE: you only communicate in English. If the user writes in any other language, do not answer
-their request in that language and do not attempt any of the fourteen intents above for that message — reply,
+their request in that language and do not attempt any of the fifteen intents above for that message — reply,
 politely and concisely, in English only, that you currently only operate in English and ask them to
 rephrase their request in English. Return `action: null` in that case; do not guess at or partially fulfill
 a non-English request. This applies regardless of how well you understand the other language — the
@@ -1016,6 +1100,7 @@ def _build_payload(
     previous_builds_summary: list[dict] | None = None,
     current_page: str | None = None,
     viewed_post_id: int | None = None,
+    last_published_post: dict | None = None,
     active_currency: str = "USD",
     currency_rates: dict[str, float] | None = None,
 ) -> dict:
@@ -1030,6 +1115,7 @@ def _build_payload(
         "previous_builds_summary": previous_builds_summary or [],
         "current_page": current_page,
         "viewed_post_id": viewed_post_id,
+        "last_published_post": last_published_post,
         "active_currency": active_currency,
         "currency_rates": currency_rates or {"USD": 1.0},
     }
@@ -1151,13 +1237,14 @@ def _validate_action(
     - `publish_build`: same reasoning as `save_build` — it carries only an
       optional free-text `author_notes` string, nothing that references the
       catalog or could be hallucinated in a way this guard could catch.
-    - `fix_warnings`/`optimize_bottleneck`: same reasoning again — neither
-      carries an LLM-asserted catalog id, category, or post id at all; the
-      actual fix/rebalancing swap is resolved entirely by the caller
-      (`engine.solvers.resolve_compatibility_issues`/
-      `llm.advisory.get_build_advisory`'s own already-validated swaps) after
-      this action is returned, so there is nothing for THIS guard to
-      cross-check.
+    - `fix_warnings`/`optimize_bottleneck`/`rebuild_platform`: same reasoning
+      again — none of the three carries an LLM-asserted catalog id, category,
+      or post id at all; the actual fix/rebalancing swap/rebuild is resolved
+      entirely by the caller (`engine.solvers.resolve_compatibility_issues`/
+      `llm.advisory.get_build_advisory`'s own already-validated swaps/
+      `engine.solvers.initialize_budget_build` +
+      `find_bottleneck_minimizing_swap`) after this action is returned, so
+      there is nothing for THIS guard to cross-check.
 
     Raises ConciergeUnavailableError on any violation so
     get_concierge_response's existing except block funnels it into the same
@@ -1165,6 +1252,7 @@ def _validate_action(
     action = response.action
     if action is None or action.type in (
         "navigate", "publish_build", "fix_warnings", "optimize_bottleneck", "use_remaining_budget",
+        "rebuild_platform",
     ):
         return
 
@@ -1320,6 +1408,7 @@ def get_concierge_response(
     previous_builds_summary: list[dict] | None = None,
     current_page: str | None = None,
     viewed_post_id: int | None = None,
+    last_published_post: dict | None = None,
     active_currency: str = "USD",
     currency_rates: dict[str, float] | None = None,
 ) -> dict:
@@ -1414,7 +1503,19 @@ def get_concierge_response(
     `community_summary`'s real `post_id` values (never a `build_id` -- see
     `llm.schemas.ConciergeOpenCommunityBuildAction`'s docstring); the caller
     applies it by setting `st.session_state["page"] = "community"` and
-    `st.session_state["selected_post_id"] = action["post_id"]`. A
+    `st.session_state["selected_post_id"] = action["post_id"]`.
+    `last_published_post` (optional, default `None`) is `{"post_id": int,
+    "title": str} | None` -- the caller's own record of the post most
+    recently created by ANY real publish action this session (a Concierge
+    `save_build`-with-`publish_immediately`/`publish_build`, or a manual
+    "Share to Community"/"Rate My Build" click elsewhere in the app; see
+    `ui/CLAUDE.md`'s `concierge_last_published_post` key). This is the
+    authoritative answer to "go to the post I just published/uploaded" --
+    without it, the model has no way to tell WHICH of potentially many
+    entries in `community_summary` (which carries no author/ownership or
+    timestamp field) is "the one" the user means, and the correct, honest
+    behavior (refusing to guess) reads to the user as the feature being
+    broken. A
     `load_saved_build` action loads an EXISTING draft/saved build/community
     post's build directly into the Build Studio for editing -- distinct from
     `load_build` (a brand NEW build from named catalog parts) and from
@@ -1452,6 +1553,7 @@ def get_concierge_response(
             previous_builds_summary,
             current_page,
             viewed_post_id,
+            last_published_post,
             active_currency,
             currency_rates,
         )
@@ -1480,3 +1582,194 @@ def get_concierge_response(
 
     response.source = "llm"
     return response.model_dump()
+
+
+# ---------------------------------------------------------------------------
+# Unified optimization pipeline (spec.md §6.7 intents 12/15)
+#
+# The same "optimize" loop the Build Studio's In-Budget button runs
+# (`advisory["within_budget"]["swaps"]`, plus the exhaustive CPU/GPU swap), run
+# to completion in ONE call, with a full-platform rebuild via
+# `engine.solvers.initialize_budget_build` when in-place swaps can't reach the
+# targets. Every part comes from the engine/advisory — never an LLM-chosen id.
+# `resolve_component` is injected by the caller (`ui/`) so this module still
+# never touches `db.repositories`.
+# ---------------------------------------------------------------------------
+TARGET_SYNERGY = 90.0
+TARGET_BOTTLENECK_PCT = 10.0
+BUDGET_WINDOW_USD = 1000.0
+MIN_BUDGET_USD = 300.0
+_MAX_INPLACE_ROUNDS = 8
+_REBUILD_STEP_USD = 250.0
+
+
+@dataclass
+class OptimizationResult:
+    build_state: dict
+    quantities: dict
+    strategy: str  # "unchanged" | "in_place" | "rebuilt"
+    warnings: list = field(default_factory=list)
+    synergy: float | None = None
+    bottleneck_pct: float | None = None
+
+    @property
+    def meets_targets(self) -> bool:
+        return _meets_targets(self.warnings, self.synergy, self.bottleneck_pct)
+
+
+def _meets_targets(warnings: list, synergy: float | None, bottleneck: float | None) -> bool:
+    return (
+        not warnings
+        and synergy is not None
+        and bottleneck is not None
+        and synergy >= TARGET_SYNERGY
+        and bottleneck <= TARGET_BOTTLENECK_PCT
+    )
+
+
+def _cost(state: dict, quantities: dict) -> float:
+    return sum(c.price_usd * quantities.get(cat, 1) for cat, c in state.items())
+
+
+def _evaluate(state: dict, quantities: dict) -> tuple[list, float | None, float | None]:
+    warnings = compatibility.evaluate_build(state, quantities).issues
+    live = scoring.live_bottleneck_and_synergy(state)
+    if live is None:
+        return warnings, None, None
+    return warnings, live[0], live[1]
+
+
+def _rank(warnings: list, synergy: float | None) -> tuple[int, float]:
+    """Higher is better: fewer warnings first, then higher synergy."""
+    return (-len(warnings), synergy if synergy is not None else -1.0)
+
+
+def _fix_warnings(state: dict, quantities: dict, resolve_component: Callable[[int], Any]) -> dict:
+    patched = dict(state)
+    for category, component_id in solvers.resolve_compatibility_issues(state, quantities).items():
+        component = resolve_component(component_id)
+        if component is not None:
+            patched[category] = component
+    return patched
+
+
+def _optimize_in_place(
+    state: dict, quantities: dict, mode: str, base_price: float, profile: str | None,
+    resolve_component: Callable[[int], Any],
+) -> dict:
+    upper = base_price + BUDGET_WINDOW_USD
+    state = _fix_warnings(state, quantities, resolve_component)
+    for _ in range(_MAX_INPLACE_ROUNDS):
+        warnings, synergy, bottleneck = _evaluate(state, quantities)
+        if _meets_targets(warnings, synergy, bottleneck):
+            break
+        before_rank = _rank(warnings, synergy)
+
+        candidate = dict(state)
+        advisory = get_build_advisory(
+            state, mode, base_price if mode == "Budget" else _cost(state, quantities),
+            profile=profile, quantities=quantities,
+        )
+        for swap in advisory["within_budget"]["swaps"]:
+            component = resolve_component(swap["replace_with_id"])
+            if component is not None:
+                candidate[swap["category"]] = component
+        exhaustive = solvers.find_bottleneck_minimizing_swap(candidate)
+        if exhaustive is not None:
+            candidate = dict(exhaustive[0])
+        candidate = _fix_warnings(candidate, quantities, resolve_component)
+
+        if candidate == state or _cost(candidate, quantities) > upper:
+            break
+        c_warnings, c_synergy, _c_bottleneck = _evaluate(candidate, quantities)
+        if _rank(c_warnings, c_synergy) <= before_rank:
+            break
+        state = candidate
+    return state
+
+
+def _clamp_quantities(state: dict, quantities: dict) -> dict:
+    clamped = dict(quantities)
+    for category in ("RAM", "Storage"):
+        if category in clamped and category in state:
+            limit, _reason = compatibility.resolve_quantity_limit(state, category)
+            if limit is not None:
+                clamped[category] = max(1, min(clamped[category], limit))
+    return clamped
+
+
+def _polish_swaps(state: dict) -> dict:
+    for _ in range(_MAX_INPLACE_ROUNDS):
+        swap = solvers.find_bottleneck_minimizing_swap(state)
+        if swap is None:
+            break
+        state = swap[0]
+    return state
+
+
+def _rebuild_platform(state: dict, quantities: dict, base_price: float) -> dict | None:
+    """Scrap the core configuration and synthesize a fresh one via the primary
+    builder solver, exploring core ceilings within the allowed budget window
+    [max(300, X - 1000), X + 1000]. Peripherals are carried over untouched."""
+    peripherals = {c: v for c, v in state.items() if c not in solvers.CATEGORY_ORDER}
+    core_base = max(0.0, base_price - _cost(peripherals, quantities))
+    low = max(MIN_BUDGET_USD, core_base - BUDGET_WINDOW_USD)
+    high = max(low, core_base + BUDGET_WINDOW_USD)
+    ceilings = {min(max(core_base, low), high), low, high}
+    step = _REBUILD_STEP_USD
+    while core_base - step >= low or core_base + step <= high:
+        ceilings.update(c for c in (core_base + step, core_base - step) if low <= c <= high)
+        step += _REBUILD_STEP_USD
+    ordered = sorted(ceilings, key=lambda c: abs(c - core_base))
+
+    best: tuple[tuple, dict] | None = None
+    for ceiling in ordered:
+        merged = {**_polish_swaps(solvers.initialize_budget_build(ceiling)), **peripherals}
+        warnings, synergy, bottleneck = _evaluate(merged, _clamp_quantities(merged, quantities))
+        key = (_meets_targets(warnings, synergy, bottleneck), *_rank(warnings, synergy))
+        if best is None or key > best[0]:
+            best = (key, merged)
+        if key[0]:
+            break
+    return best[1] if best else None
+
+
+def optimize_build_full(
+    build_state: dict,
+    quantities: dict | None,
+    mode: str,
+    base_price: float,
+    resolve_component: Callable[[int], Any],
+    profile: str | None = None,
+) -> OptimizationResult:
+    """Run the whole optimize pipeline in one call: warnings -> in-place
+    iterative swaps -> (if targets are still missed) a fresh full-platform
+    rebuild around `base_price`. Targets: synergy >= 90, bottleneck <= 10%,
+    zero warnings. Never worsens the build: the result is whichever of
+    original / in-place / rebuilt ranks best (fewer warnings, then synergy)."""
+    quantities = dict(quantities or {})
+    original = dict(build_state)
+    o_warn, o_syn, o_bn = _evaluate(original, quantities)
+    if len(original) < 2 or _meets_targets(o_warn, o_syn, o_bn):
+        return OptimizationResult(original, quantities, "unchanged", o_warn, o_syn, o_bn)
+
+    best_state, best_q, strategy = original, quantities, "unchanged"
+    best_rank = _rank(o_warn, o_syn)
+
+    in_place = _optimize_in_place(original, quantities, mode, base_price, profile, resolve_component)
+    ip_q = _clamp_quantities(in_place, quantities)
+    ip_warn, ip_syn, _ip_bn = _evaluate(in_place, ip_q)
+    if in_place != original and _rank(ip_warn, ip_syn) > best_rank:
+        best_state, best_q, strategy, best_rank = in_place, ip_q, "in_place", _rank(ip_warn, ip_syn)
+
+    b_warn, b_syn, b_bn = _evaluate(best_state, best_q)
+    if not _meets_targets(b_warn, b_syn, b_bn):
+        rebuilt = _rebuild_platform(original, quantities, base_price)
+        if rebuilt is not None:
+            r_q = _clamp_quantities(rebuilt, quantities)
+            r_warn, r_syn, _r_bn = _evaluate(rebuilt, r_q)
+            if _rank(r_warn, r_syn) > best_rank:
+                best_state, best_q, strategy = rebuilt, r_q, "rebuilt"
+
+    warnings, synergy, bottleneck = _evaluate(best_state, best_q)
+    return OptimizationResult(best_state, best_q, strategy, warnings, synergy, bottleneck)
