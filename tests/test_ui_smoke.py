@@ -41,6 +41,24 @@ def _no_live_llm_calls(monkeypatch):
     monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_autoseed_on_boot(monkeypatch):
+    """app.py calls db.seed_mass_content.seed_if_empty() on every boot — an
+    auto-seed hook for a genuinely empty PRODUCTION deployment (e.g.
+    Streamlit Community Cloud with no bundled db/uncapped.db). Every smoke
+    test in this file relies on `seeded_db`/`demo_seeded_db`'s own
+    deliberately small, controlled dataset (catalog only, or catalog + the
+    standing demo accounts, with zero Build rows until a test creates its
+    own) — without this, AppTest re-executing app.py against that
+    empty-of-builds temp DB would trigger the SAME 70-build/30-post mass
+    seed on every single test, destroying the exact isolation those
+    fixtures exist for. seed_if_empty() itself is covered directly (no
+    AppTest involved) by tests/test_seed_mass_content.py."""
+    import db.seed_mass_content as seed_mass_content_module
+
+    monkeypatch.setattr(seed_mass_content_module, "seed_if_empty", lambda: None)
+
+
 @pytest.fixture()
 def seeded_db(tmp_path):
     db_path = tmp_path / "test_ui.db"

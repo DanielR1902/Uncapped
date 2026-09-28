@@ -39,13 +39,13 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from db.database import init_db, session_scope
 from db.models import Build, BuildComponent, CommunityComment, CommunityPost
 from db.repositories import builds_repo, community_repo, users_repo
 from db.seed import run_seed as run_catalog_seed
-from db.seed_demo import DEMO_USERNAMES
+from db.seed_demo import DEMO_USERNAMES, run_demo_seed
 from engine import scoring, solvers
 from engine.compatibility import BuildState, evaluate_build
 
@@ -460,6 +460,41 @@ def run_mass_content_seed() -> dict:
         "persona_builds": {k: len(v) for k, v in persona_builds.items()},
         "published": published_count,
     }
+
+
+def seed_if_empty() -> dict | None:
+    """Auto-seed hook for a fresh deployment with an empty database (spec.md
+    scenario: Streamlit Community Cloud, where no local db/uncapped.db is
+    bundled and schema creation alone leaves every table empty) — called
+    once from app.py right after init_db(), on every script rerun. Checks
+    one real, cheap signal (zero `Build` rows) and, ONLY then, runs the full
+    bootstrap chain this module's own docstring describes (catalog ->
+    the standing admin login + 5 demo personas -> this module's own
+    70-build/30-post mass content seed), so a freshly-deployed instance
+    never presents a completely empty Community feed / My Builds page.
+
+    A no-op returning `None` the instant ANY `Build` row already exists —
+    whether from a prior run of this exact hook, or a real user's own saved
+    build in a long-running deployment — so, unlike calling
+    `run_mass_content_seed()` directly, this NEVER wipes or touches an
+    already-populated database. Safe to call unconditionally on every
+    Streamlit rerun (the module-level pattern `app.py` already uses for
+    `init_db()` itself): once seeded, every later call is just the one cheap
+    `SELECT ... LIMIT 1` below.
+
+    Not race-safe against two truly simultaneous first-ever requests hitting
+    a brand-new empty deployment in the same instant (a real but narrow
+    window for a demo app, not guarded here with a DB-level lock — out of
+    scope for a "lightweight check", see the EXECUTION DIRECTIVE this was
+    added for)."""
+    init_db()
+    with session_scope() as session:
+        has_any_build = session.execute(select(Build.id).limit(1)).first() is not None
+    if has_any_build:
+        return None
+
+    run_demo_seed()  # idempotent — creates the admin login + 5 persona users if missing
+    return run_mass_content_seed()
 
 
 if __name__ == "__main__":

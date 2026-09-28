@@ -6,6 +6,7 @@ import streamlit as st
 
 from auth.session import log_out
 from db.database import init_db
+from db.seed_mass_content import seed_if_empty
 from ui import router, state, theme
 from ui.components.chat_assistant import render_concierge_widget
 from ui.format import CURRENCY_CODES, currency_label
@@ -21,6 +22,12 @@ st.set_page_config(page_title="Uncapped", page_icon="🖥️", layout="wide", me
 # to run a seed script by hand first — this makes the app self-healing on
 # every startup instead of silently depending on that.
 init_db()
+
+# Auto-seed hook for a fresh deployment with an empty database (e.g. Streamlit
+# Community Cloud, where no local db/uncapped.db is bundled) — a no-op the
+# instant any Build row already exists, so this never touches an
+# already-populated database (db/seed_mass_content.py::seed_if_empty).
+seed_if_empty()
 
 state.init_session_state()
 theme.inject_css()
