@@ -7263,3 +7263,54 @@ def test_concierge_navigate_creates_no_draft_without_active_build_either(seeded_
     assert at.session_state["page"] == "community"
     user_id = at.session_state["auth_user"]["id"]
     assert drafts_repo.get_user_drafts(user_id) == []
+
+
+def test_stale_advisory_swap_not_reproposed_after_apply_in_budget(seeded_db, monkeypatch):
+    """Regression: after "Apply In-Budget Optimization" swaps CPU A -> B, the
+    advisory card must not keep proposing the just-applied swap (formerly the
+    pre-swap advisory was cached under the POST-swap key). Even a (mock) advisor
+    that keeps proposing B is pruned by the render-time stale-proposal guard, so
+    the In-Budget button is disabled and the depleted message shows."""
+    from db.repositories import components_repo
+    import ui.views.create_build as create_build_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "stale1", "stale1@example.com", "Stale One")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    target = {}
+
+    def _stale_proposer(build_state, mode, cost, profile=None, bottleneck_info=None, quantities=None):
+        if "id" not in target:
+            target["id"] = next(
+                c.id for c in components_repo.get_by_category("CPU") if c.id != build_state["CPU"].id
+            )
+        return {
+            "pros": ["p"], "cons": ["c"],
+            "within_budget": {
+                "explanation": "Swap CPU to the target part",
+                "swaps": [{"action": "swap", "category": "CPU", "replace_with_id": target["id"]}],
+                "can_optimize_further": False,
+            },
+            "stretch_budget": {"explanation": "s", "actions": [], "added_cost_usd": 0.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(create_build_module, "get_build_advisory", _stale_proposer)
+
+    at.get_by_key("hud_ai_analysis").click().run()
+    assert at.get_by_key("btn_apply_in_budget").disabled is False
+    at.get_by_key("btn_apply_in_budget").click().run()
+    assert not at.exception
+
+    assert at.session_state["build_draft"]["components"]["CPU"] == target["id"]
+    # No cached advisory anywhere still proposes the already-applied swap.
+    for cached in at.session_state["advisory_cache"].values():
+        assert all(s["replace_with_id"] != target["id"] for s in cached["within_budget"]["swaps"])
+    assert at.get_by_key("btn_apply_in_budget").disabled is True
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "The current configuration is already fully optimized for this budget." in page_text
+    assert "Swap CPU to the target part" not in page_text

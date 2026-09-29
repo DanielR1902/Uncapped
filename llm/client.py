@@ -16,6 +16,7 @@ from pydantic import ValidationError as PydanticValidationError
 from db.repositories import llm_cache_repo
 from engine import scoring
 from engine.compatibility import BuildState
+from llm import _json_utils
 from llm.cache import cache_key
 from llm.prompts import build_messages, build_request
 from llm.schemas import (
@@ -44,6 +45,9 @@ BOTTLENECK_CLAMP_RANGE = 10.0
 # failure is a different, non-transient problem and is never retried here.
 MAX_REQUEST_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 1.0
+# Malformed/truncated-body retry backoff (1s, 2s); monkeypatched in tests.
+MALFORMED_RETRY_DELAYS: tuple[float, ...] = _json_utils.MALFORMED_RETRY_DELAYS
+MAX_TOKENS = _json_utils.DEFAULT_MAX_TOKENS
 _RETRYABLE_NETWORK_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)
 
 
@@ -91,7 +95,7 @@ def _model() -> str:
     return model
 
 
-def _call_openrouter(request: BuildAnalysisRequest) -> dict[str, Any]:
+def _post_once(request: BuildAnalysisRequest) -> httpx.Response:
     try:
         response = _post_with_retry(
             OPENROUTER_URL,
@@ -106,6 +110,7 @@ def _call_openrouter(request: BuildAnalysisRequest) -> dict[str, Any]:
                 "model": _model(),
                 "messages": build_messages(request),
                 "response_format": {"type": "json_object"},
+                "max_tokens": MAX_TOKENS,
             },
         )
     except httpx.TimeoutException as exc:
@@ -120,12 +125,50 @@ def _call_openrouter(request: BuildAnalysisRequest) -> dict[str, Any]:
         print(f"OpenRouter returned HTTP {response.status_code}: {response.text}", file=sys.stderr)
         raise LLMUnavailableError(f"OpenRouter returned HTTP {response.status_code}")
 
-    try:
-        payload = response.json()
-        content = payload["choices"][0]["message"]["content"]
-        return json.loads(content)
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise LLMUnavailableError(f"Malformed OpenRouter response: {exc}") from exc
+    return response
+
+
+def _call_openrouter(request: BuildAnalysisRequest) -> dict[str, Any]:
+    """POST + parse with retry on a malformed/truncated body
+    (`MALFORMED_RETRY_DELAYS`, plus `finish_reason == "length"`), then a
+    conservative JSON repair as a last resort. The caller still validates the
+    result against `BuildAnalysisResponse`, so a repaired payload that fails
+    the schema is discarded."""
+    attempts = len(MALFORMED_RETRY_DELAYS) + 1
+    last_content: str | None = None
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        response = _post_once(request)
+        try:
+            content, finish_reason = _json_utils.extract_message(response.json())
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            last_error = exc
+        else:
+            last_content = content
+            if finish_reason == "length":
+                last_error = _json_utils.TruncatedResponseError("response truncated (finish_reason=length)")
+            else:
+                try:
+                    return _json_utils.parse_strict(content)
+                except ValueError as exc:
+                    last_error = exc
+        if attempt < attempts - 1:
+            print(
+                f"Analysis response malformed ({last_error}) - retry {attempt + 1}/{attempts - 1}...",
+                file=sys.stderr,
+            )
+            time.sleep(MALFORMED_RETRY_DELAYS[attempt])
+
+    if last_content is not None:
+        try:
+            return _json_utils.parse_strict(last_content)
+        except ValueError:
+            pass
+        repaired = _json_utils.repair_json(last_content)
+        if repaired is not None:
+            print("Analysis response repaired after retries were exhausted.", file=sys.stderr)
+            return repaired
+    raise LLMUnavailableError(f"Malformed OpenRouter response: {last_error}") from last_error
 
 
 def _clamp_bottleneck(response: BuildAnalysisResponse, request: BuildAnalysisRequest) -> BuildAnalysisResponse:

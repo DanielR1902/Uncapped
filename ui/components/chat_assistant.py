@@ -220,6 +220,7 @@ is meaningful there) or when the action no-ops (no active draft / empty
 """
 from __future__ import annotations
 
+import copy
 import html
 import json
 import re
@@ -640,7 +641,162 @@ def _read_cached_analysis(build_state) -> tuple[float, float, str] | None:
     return None
 
 
-def _apply_concierge_action(action: dict | None) -> float | None:
+_ADDITIVE_VERB_RE = re.compile(
+    r"\b(add|adding|include|attach|plug in|throw in|get me|i (?:also )?(?:want|need)|also get|another|extra)\b",
+    re.IGNORECASE,
+)
+_ADDITIVE_NOUN_RE = re.compile(
+    r"\b(monitors?|displays?|screens?|keyboards?|mouse|mice|headsets?|headphones?|network ?cards?|"
+    r"wi-?fi(?: card| adapter)?|sound ?cards?|optical ?drives?|dvd|blu-?ray|accessor(?:y|ies)|"
+    r"peripherals?|(?:another|extra|additional|second) (?:\w+ )?(?:drive|ssd|hdd|ram|memory|kit|stick))\b",
+    re.IGNORECASE,
+)
+_QUANTITY_NOUN_RE = re.compile(r"\b(drive|ssd|hdd|storage|ram|memory|kit|stick)s?\b", re.IGNORECASE)
+_NON_ADDITIVE_RE = re.compile(
+    r"\b(remove|delete|clear|take out|replace|swap|instead|start over|start fresh|scrap|from scratch|"
+    r"new (?:pc|build|rig|computer)|rebuild|downgrade|upgrade)\b",
+    re.IGNORECASE,
+)
+_QUANTITY_CATEGORIES = ("RAM", "Storage")
+_APPLY_NOTES_KEY = "concierge_apply_notes"
+
+
+def _is_additive_request(user_message: str | None) -> bool:
+    """True for a plain "add a monitor / another drive"-style message: an
+    additive verb AND a peripheral/extra noun, with no removal/replace/
+    start-over/upgrade wording. Deterministic guard for spec.md §6.7 intent
+    4's PURE ADDITIVE rule."""
+    if not user_message:
+        return False
+    return bool(
+        _ADDITIVE_VERB_RE.search(user_message)
+        and _ADDITIVE_NOUN_RE.search(user_message)
+        and not _NON_ADDITIVE_RE.search(user_message)
+    )
+
+
+def _enforce_additive_action(
+    action: dict, user_message: str | None, build_draft: dict | None
+) -> tuple[dict, bool, str | None]:
+    """Deterministic Python-side enforcement of the pure-additive rule.
+
+    Returns `(action, strict, note)`. `strict` is True when the action must be
+    applied as a strict patch (no budget re-solve, no downgrade reclamp, and a
+    post-apply "every untouched part is unchanged" verification). It is True
+    when a build with real components is active AND either the user message is
+    an additive request (`load_build`/`modify_build` alike — a `load_build`
+    is rewritten into a peripheral-only `modify_build` and its
+    `budget_cap_usd` discarded) or a `modify_build` names only peripheral
+    categories. In strict mode only peripheral-category `components` survive,
+    plus a strict increase of RAM/Storage quantity when the message names a
+    drive/RAM; everything else the model returned is dropped (noted)."""
+    if not build_draft or not build_draft.get("components"):
+        return action, False, None
+    action_type = action.get("type")
+    additive_message = _is_additive_request(user_message)
+    components = dict(action.get("components") or {})
+    if action_type == "load_build":
+        strict = additive_message
+    elif action_type == "modify_build":
+        peripheral_only = (
+            bool(components)
+            and set(components) <= set(solvers.PERIPHERAL_CATEGORIES)
+            and not action.get("remove_categories")
+            and not action.get("quantities")
+        )
+        strict = additive_message or peripheral_only
+    else:
+        return action, False, None
+    if not strict:
+        return action, False, None
+
+    allowed = {c: i for c, i in components.items() if c in solvers.PERIPHERAL_CATEGORIES}
+    current_quantities = build_draft.get("quantities", {}) or {}
+    quantities: dict[str, int] = {}
+    if additive_message and user_message and _QUANTITY_NOUN_RE.search(user_message):
+        for category, qty in (action.get("quantities") or {}).items():
+            if (
+                category in _QUANTITY_CATEGORIES
+                and category in build_draft["components"]
+                and qty > current_quantities.get(category, 1)
+            ):
+                quantities[category] = qty
+    dropped = (
+        set(components) - set(allowed)
+        or set(action.get("quantities") or {}) - set(quantities)
+        or action.get("remove_categories")
+        or (action_type == "load_build")
+    )
+    patched = {
+        "type": "modify_build",
+        "components": allowed,
+        "quantities": quantities,
+        "remove_categories": [],
+        "explanation": action.get("explanation", ""),
+    }
+    note = None
+    if dropped:
+        note = (
+            "Your request was an add-on, so it was applied as a pure addition: existing parts were "
+            "left exactly as they were."
+        )
+    if not allowed and not quantities:
+        note = "Nothing was added: I could not identify a valid peripheral or extra to add to your build."
+    return patched, True, note
+
+
+def _overage_confirmed() -> bool:
+    """True when the assistant turn immediately before the current user
+    message was the BUDGET GUARDRAIL's exact over-ceiling question."""
+    messages = st.session_state.get("concierge_messages") or []
+    if len(messages) < 2:
+        return False
+    previous = messages[-2]
+    return previous.get("role") == "assistant" and "exceed your budget" in str(previous.get("content", ""))
+
+
+_CHANGE_ORDER = tuple(solvers.CATEGORY_ORDER) + tuple(solvers.PERIPHERAL_CATEGORIES)
+
+
+def _component_name(component_id: int | None) -> str:
+    component = components_repo.get_by_id(component_id) if component_id is not None else None
+    return component.name if component is not None else f"#{component_id}"
+
+
+def _describe_changes(
+    before_components: dict[str, int],
+    before_quantities: dict[str, int],
+    after_components: dict[str, int],
+    after_quantities: dict[str, int],
+) -> str:
+    """Python-computed, truthful diff of two drafts (category -> component id,
+    plus RAM/Storage quantities): added / replaced / removed parts by category
+    with real catalog names, and quantity changes. Returns the joined
+    description, or "no component changes"."""
+    categories = [c for c in _CHANGE_ORDER if c in before_components or c in after_components]
+    categories += sorted((set(before_components) | set(after_components)) - set(categories))
+    parts: list[str] = []
+    for category in categories:
+        old_id = before_components.get(category)
+        new_id = after_components.get(category)
+        old_qty = (before_quantities or {}).get(category, 1)
+        new_qty = (after_quantities or {}).get(category, 1)
+        if old_id is None and new_id is not None:
+            suffix = f" x{new_qty}" if new_qty > 1 else ""
+            parts.append(f"added {category}: {_component_name(new_id)}{suffix}")
+        elif old_id is not None and new_id is None:
+            parts.append(f"removed {category}: {_component_name(old_id)}")
+        elif old_id != new_id:
+            suffix = f" x{new_qty}" if new_qty > 1 else ""
+            parts.append(
+                f"replaced {category}: {_component_name(old_id)} -> {_component_name(new_id)}{suffix}"
+            )
+        elif old_qty != new_qty:
+            parts.append(f"{category} quantity {old_qty} -> {new_qty}")
+    return "; ".join(parts) if parts else "no component changes"
+
+
+def _apply_concierge_action(action: dict | None, user_message: str | None = None) -> float | None:
     """Applies a `load_build`/`modify_build`/`navigate`/`save_build`/
     `publish_build`/`open_community_build`/`fix_warnings`/
     `optimize_bottleneck` action immediately — no confirmation step for any
@@ -1029,8 +1185,26 @@ def _apply_concierge_action(action: dict | None) -> float | None:
         # both NEVER exceed a ceiling and converge close to — not just
         # comfortably under — it) deterministically fills/downgrades
         # everything else.
-        budget_cap_usd = action.get("budget_cap_usd") if action_type == "load_build" else None
         build_draft = st.session_state.get("build_draft")
+
+        # PURE ADDITIVE ENFORCEMENT (spec.md §6.7 intent 4 / §7.8): an "add a
+        # monitor"-style request against an existing build must never become a
+        # full budget re-solve. Root cause of the confirmed regression: the
+        # model returned `load_build` + `budget_cap_usd` (the message named a
+        # price, or intent 3 won the routing), which flows into
+        # `initialize_budget_build(..., fill_peripherals_with_surplus=True)`
+        # below and downgrades unrelated parts. Here the action is rewritten
+        # into a peripheral-only `modify_build` patch and applied strictly.
+        strict_additive = False
+        additive_snapshot: dict | None = None
+        if build_draft and build_draft.get("components"):
+            action, strict_additive, additive_note = _enforce_additive_action(action, user_message, build_draft)
+            action_type = action["type"]
+            if additive_note:
+                st.session_state.setdefault(_APPLY_NOTES_KEY, []).append(additive_note)
+            if strict_additive:
+                additive_snapshot = copy.deepcopy(build_draft)
+        budget_cap_usd = action.get("budget_cap_usd") if action_type == "load_build" else None
 
         if budget_cap_usd:
             seed_selection = {}
@@ -1101,7 +1275,42 @@ def _apply_concierge_action(action: dict | None) -> float | None:
             # first). A no-op when there's no ceiling, or the patch is
             # already within it (the overwhelmingly common case).
             budget_ceiling = build_draft.get("budget_ceiling")
-            if budget_ceiling:
+            if strict_additive and additive_snapshot is not None:
+                # Strict patch: never re-solve/downgrade other parts. Verify
+                # every untouched pre-existing part/quantity is unchanged, and
+                # honor the BUDGET GUARDRAIL by rolling the addition back when
+                # it would exceed the ceiling without a prior "yes".
+                touched = (
+                    set(action.get("components", {}))
+                    | set(action.get("quantities", {}))
+                    | set(action.get("remove_categories", []) or [])
+                )
+                before_components_snap = additive_snapshot.get("components", {})
+                before_quantities_snap = additive_snapshot.get("quantities", {}) or {}
+                after_quantities = build_draft.get("quantities", {}) or {}
+                violated = any(
+                    category not in touched and build_draft["components"].get(category) != component_id
+                    for category, component_id in before_components_snap.items()
+                ) or any(
+                    category not in touched and after_quantities.get(category, 1) != before_qty
+                    for category, before_qty in before_quantities_snap.items()
+                )
+                over_ceiling = False
+                if budget_ceiling and not violated:
+                    current_state = state.resolve_build_state(build_draft)
+                    over_ceiling = (
+                        state.build_total_cost(current_state, after_quantities) > budget_ceiling
+                        and not _overage_confirmed()
+                    )
+                if violated or over_ceiling:
+                    build_draft.clear()
+                    build_draft.update(additive_snapshot)
+                    st.session_state.setdefault(_APPLY_NOTES_KEY, []).append(
+                        "The addition would exceed your budget, so nothing was changed. Say yes to proceed anyway."
+                        if over_ceiling
+                        else "The addition could not be applied without altering other parts, so nothing was changed."
+                    )
+            elif budget_ceiling:
                 current_state = state.resolve_build_state(build_draft)
                 current_total = state.build_total_cost(current_state, build_draft.get("quantities", {}))
                 if current_state and current_total > budget_ceiling:
@@ -1437,6 +1646,19 @@ def render_concierge_widget() -> None:
                 else None
             )
             before_live = _read_cached_analysis(before_build_state) if before_build_state else None
+            # Independent snapshot for the Python-computed "Changes:" line
+            # (taken for EVERY action type, unlike `before_components` above,
+            # since a load_build replacing an existing build also needs a
+            # truthful diff). Deep-copied: `_apply_concierge_action` mutates
+            # the draft in place.
+            _diff_draft = st.session_state.get("build_draft")
+            diff_before_components = dict((_diff_draft or {}).get("components", {}))
+            diff_before_quantities = dict((_diff_draft or {}).get("quantities", {}) or {})
+            diff_before_state = state.resolve_build_state(_diff_draft) if diff_before_components else {}
+            diff_before_total = (
+                state.build_total_cost(diff_before_state, diff_before_quantities) if diff_before_state else None
+            )
+            st.session_state.pop(_APPLY_NOTES_KEY, None)
 
             # Apply BEFORE finalizing the assistant message so the real,
             # Python-computed total (if any) is available to append to the
@@ -1457,7 +1679,7 @@ def render_concierge_widget() -> None:
             # calls) is completely unaffected: this only changes behavior
             # when `_apply_concierge_action` itself raises.
             try:
-                real_total = _apply_concierge_action(result.get("action"))
+                real_total = _apply_concierge_action(result.get("action"), user_input)
             except Exception:
                 traceback.print_exc(file=sys.stderr)
                 real_total = None
@@ -1670,9 +1892,32 @@ def render_concierge_widget() -> None:
                         )
                     else:
                         lines.append(f"Total: {format_currency(real_total, target_currency)}")
+                    # PYTHON-COMPUTED CHANGES LINE: the truthful before/after
+                    # diff by category with real names and the real cost
+                    # delta — the model's prose is never trusted for it (it
+                    # once claimed "no components were downgraded" on a
+                    # rebuild that did exactly that). Skipped only when there
+                    # was no prior build to diff against.
+                    if diff_before_components and build_draft is not None:
+                        change_text = _describe_changes(
+                            diff_before_components,
+                            diff_before_quantities,
+                            build_draft.get("components", {}),
+                            build_draft.get("quantities", {}) or {},
+                        )
+                        if diff_before_total is not None:
+                            cost_delta = real_total - diff_before_total
+                            change_sign = "+" if cost_delta >= 0 else "-"
+                            change_text += (
+                                f" (cost {change_sign}{format_currency(abs(cost_delta), target_currency)})"
+                            )
+                        lines.insert(0, f"Changes: {change_text}")
                 reply_content = f"{reply_content}\n\n" + "\n\n".join(f"**{line}**" for line in lines)
             elif real_total is not None:
                 reply_content = f"{reply_content}\n\n**Total: {format_currency(real_total, target_currency)}**"
+            apply_notes = st.session_state.pop(_APPLY_NOTES_KEY, None) or []
+            if apply_notes:
+                reply_content = f"{reply_content}\n\n" + "\n\n".join(f"_({note})_" for note in apply_notes)
             st.session_state["concierge_messages"].append(
                 {"role": "assistant", "content": sanitize_markdown(reply_content)}
             )

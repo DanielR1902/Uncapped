@@ -54,6 +54,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from engine import compatibility, scoring, solvers
 from engine.solvers import CATEGORY_ORDER, PERIPHERAL_CATEGORIES
+from llm import _json_utils
 from llm.advisory import get_build_advisory
 from llm.schemas import ConciergeResponse
 
@@ -70,6 +71,12 @@ REQUEST_TIMEOUT_SECONDS = 25.0
 # concierge.py).
 MAX_REQUEST_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 1.0
+# Malformed/truncated-body retry backoff (1s, 2s => 2 retries after the first
+# attempt). Module constant so tests can monkeypatch it to zeros.
+MALFORMED_RETRY_DELAYS: tuple[float, ...] = _json_utils.MALFORMED_RETRY_DELAYS
+MAX_TOKENS = _json_utils.DEFAULT_MAX_TOKENS
+# String-valued fields safe to close if the body was cut off mid-string.
+_REPAIRABLE_STRING_KEYS = frozenset({"reply", "explanation", "author_notes"})
 _RETRYABLE_NETWORK_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)
 
 
@@ -246,7 +253,8 @@ You handle thirteen kinds of requests:
    style request against a build that isn't empty is intent 4's job (see intent 4's COMPLETING/FINISHING AN
    EXISTING BUILD rule below), even though it superficially looks like a from-scratch build-me request; this
    intent (`load_build`) is reserved for building something genuinely NEW, discarding whatever (if anything)
-   was already active. It is likewise NEVER the right intent for a request to SAVE/persist/clone an EXISTING
+   was already active. It is equally NEVER the right intent for "add a monitor"/"add a keyboard"-style
+   requests against a non-empty build — that is intent 4's PURE ADDITIVE rule, even if a price is mentioned. It is likewise NEVER the right intent for a request to SAVE/persist/clone an EXISTING
    build — including a community post the user is currently viewing (e.g. "save the build I'm looking at to
    my drafts") — even when `current_build_context` is empty and there is nothing obviously active in the
    Studio: that phrasing is intent 7's job (see its SOURCE RESOLUTION rule), never a cue to generate a brand
@@ -338,7 +346,9 @@ You handle thirteen kinds of requests:
    number yourself; only `engine.scoring`'s deterministic formulas do. Describe the CHANGE qualitatively
    instead ("improved synergy", "reduced the bottleneck", "better balanced CPU/GPU pairing") — never a number,
    never even an approximate one, and never a direction-only claim you're not certain of either if you're not
-   sure which way a specific swap moves it. The caller appends the REAL, freshly computed before -> after
+   sure which way a specific swap moves it. Likewise never claim anything about parts you did not change
+   ("no components were downgraded", "the rest is unchanged") — the caller's Python "Changes:" line is the only
+   trusted statement of what was added/replaced/removed. The caller appends the REAL, freshly computed before -> after
    reading (or, for a brand-new `load_build`, the real final reading) as its own separate, clearly-marked line
    immediately after your reply — that line, not anything in your own prose, is what the user should trust.
 
@@ -388,6 +398,22 @@ You handle thirteen kinds of requests:
    "build me a new PC", "start fresh", "scrap this and build a gaming rig instead" -- never for "complete"/
    "finish what I started" phrasing, even when `current_build_context` happens to already be almost entirely
    empty.
+
+   PURE ADDITIVE "ADD X" REQUESTS (a real, confirmed failure this fixes: "add a monitor" was answered with a
+   `load_build` carrying a `budget_cap_usd`, which re-solved the WHOLE build from a budget and silently
+   DOWNGRADED unrelated parts, lowering the total): any request to ADD a peripheral/accessory/extra
+   (Monitor, Keyboard, Mouse, Headset, NetworkCard, SoundCard, OpticalDrive, or "another drive"/"another RAM
+   kit") to a build that already has components in `current_build_context` is ALWAYS a `modify_build`, NEVER
+   a `load_build`, even when the message also states a price/budget figure ("add a monitor around 300
+   USD" means pick a monitor near that price — it is NOT a build budget). `components` names ONLY the new
+   peripheral category (e.g. `{"Monitor": <real id>}`) — never CPU/GPU/Motherboard/RAM/Storage/PSU/Case/
+   Cooler, never `budget_cap_usd`, never `remove_categories`. Leave every existing part exactly as it is; the
+   caller enforces this in Python and rejects anything else.
+
+   NO CLAIMS ABOUT OTHER PARTS: never say that other parts were kept, unchanged, preserved, downgraded, or
+   swapped (e.g. never write "no components were downgraded" or "everything else stays the same") — you are
+   not told what the final build looks like. The caller appends a Python-computed "Changes:" line listing the
+   real added/replaced/removed parts and the real cost change; that line, not your prose, is the truth.
 
    The same NO AGGREGATE TOTALS RULE from intent 3 applies here too: never state the build's new resulting
    total cost after the patch — describe what was added/changed qualitatively (individual component names/
@@ -1128,7 +1154,7 @@ def _messages(payload: dict) -> list[dict]:
     ]
 
 
-def _call_openrouter(payload: dict) -> dict[str, Any]:
+def _post_once(payload: dict) -> httpx.Response:
     try:
         response = _post_with_retry(
             OPENROUTER_URL,
@@ -1143,6 +1169,7 @@ def _call_openrouter(payload: dict) -> dict[str, Any]:
                 "model": _model(),
                 "messages": _messages(payload),
                 "response_format": {"type": "json_object"},
+                "max_tokens": MAX_TOKENS,
             },
         )
     except httpx.TimeoutException as exc:
@@ -1157,12 +1184,51 @@ def _call_openrouter(payload: dict) -> dict[str, Any]:
         print(f"OpenRouter returned HTTP {response.status_code}: {response.text}", file=sys.stderr)
         raise ConciergeUnavailableError(f"OpenRouter returned HTTP {response.status_code}")
 
-    try:
-        body = response.json()
-        content = body["choices"][0]["message"]["content"]
-        return json.loads(content)
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise ConciergeUnavailableError(f"Malformed OpenRouter response: {exc}") from exc
+    return response
+
+
+def _call_openrouter(payload: dict) -> dict[str, Any]:
+    """POST + parse. A malformed/unterminated/non-JSON body (or a
+    `finish_reason == "length"` truncation) is retried up to
+    `len(MALFORMED_RETRY_DELAYS)` more times with exponential backoff; when
+    every attempt fails, a conservative JSON repair is tried on the last body
+    (`llm/_json_utils.py`). The repaired dict is still validated by the
+    caller's pydantic schema and `_validate_action`."""
+    attempts = len(MALFORMED_RETRY_DELAYS) + 1
+    last_content: str | None = None
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        response = _post_once(payload)
+        try:
+            content, finish_reason = _json_utils.extract_message(response.json())
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            last_error = exc
+        else:
+            last_content = content
+            if finish_reason == "length":
+                last_error = _json_utils.TruncatedResponseError("response truncated (finish_reason=length)")
+            else:
+                try:
+                    return _json_utils.parse_strict(content)
+                except ValueError as exc:
+                    last_error = exc
+        if attempt < attempts - 1:
+            print(
+                f"Concierge response malformed ({last_error}) - retry {attempt + 1}/{attempts - 1}...",
+                file=sys.stderr,
+            )
+            time.sleep(MALFORMED_RETRY_DELAYS[attempt])
+
+    if last_content is not None:
+        try:
+            return _json_utils.parse_strict(last_content)
+        except ValueError:
+            pass
+        repaired = _json_utils.repair_json(last_content, _REPAIRABLE_STRING_KEYS)
+        if repaired is not None:
+            print("Concierge response repaired after retries were exhausted.", file=sys.stderr)
+            return repaired
+    raise ConciergeUnavailableError(f"Malformed OpenRouter response: {last_error}") from last_error
 
 
 def _heuristic_response() -> dict:

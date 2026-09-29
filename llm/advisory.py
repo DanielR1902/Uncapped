@@ -1183,6 +1183,92 @@ def _sanitize_stretch(
     }
 
 
+def _is_stale_action(action: dict, build_state: BuildState, quantities: dict[str, int] | None) -> bool:
+    """True when `action` would be a no-op against `build_state`: a swap whose
+    target id is already the selected component of that category, or a
+    set_quantity equal to the current quantity."""
+    category = action.get("category")
+    if action.get("action", "swap") == "set_quantity":
+        return category in build_state and (quantities or {}).get(category, 1) == action.get("quantity")
+    current = build_state.get(category)
+    return current is not None and current.id == action.get("replace_with_id")
+
+
+def prune_stale_actions(
+    advisory: dict, build_state: BuildState, quantities: dict[str, int] | None = None
+) -> dict:
+    """STALE-PROPOSAL GUARD (spec.md §7.4.1). Returns a copy of `advisory`
+    with every within_budget swap / stretch action that targets the component
+    already selected in `build_state` (same category) removed — an advisory
+    computed for a build that has since changed (e.g. right after an applied
+    optimization) must never keep proposing the swap that was just applied.
+    When nothing is pruned the input is returned unchanged. When every
+    within_budget swap is pruned the explanation becomes the existing
+    "already optimal for this budget" wording and `can_optimize_further` is
+    False; when every stretch action is pruned the stretch text becomes the
+    existing no-improvement wording with `added_cost_usd` 0.0. A partial prune
+    regenerates the text from the survivors."""
+    within = advisory.get("within_budget") or {}
+    stretch = advisory.get("stretch_budget") or {}
+    swaps = list(within.get("swaps") or [])
+    actions = list(stretch.get("actions") or [])
+    kept_swaps = [s for s in swaps if not _is_stale_action(s, build_state, quantities)]
+    kept_actions = [a for a in actions if not _is_stale_action(a, build_state, quantities)]
+    if len(kept_swaps) == len(swaps) and len(kept_actions) == len(actions):
+        return advisory
+
+    result = dict(advisory)
+
+    def _describe(kept: list[dict]) -> str:
+        final_state = dict(build_state)
+        for action in kept:
+            if action.get("action", "swap") == "swap":
+                candidate = _swap_candidates(action["category"], build_state, platform=True).get(
+                    action["replace_with_id"]
+                )
+                if candidate is not None:
+                    final_state[action["category"]] = candidate
+        try:
+            return _describe_kept(build_state, kept, final_state)
+        except KeyError:
+            return "the remaining suggested changes"
+
+    if len(kept_swaps) != len(swaps):
+        if kept_swaps:
+            result["within_budget"] = {
+                **within,
+                "explanation": "Swap " + _describe(kept_swaps) + " to improve balance within your budget.",
+                "swaps": kept_swaps,
+            }
+        else:
+            result["within_budget"] = {
+                **within, "explanation": _NO_IN_BUDGET_IMPROVEMENT, "swaps": [], "can_optimize_further": False,
+            }
+    if len(kept_actions) != len(actions):
+        if kept_actions:
+            cost = _real_cost_delta(build_state, quantities, kept_actions, {
+                **build_state,
+                **{
+                    a["category"]: c
+                    for a in kept_actions
+                    if a.get("action", "swap") == "swap"
+                    for c in [_swap_candidates(a["category"], build_state, platform=True).get(a["replace_with_id"])]
+                    if c is not None
+                },
+            })
+            result["stretch_budget"] = {
+                **stretch,
+                "explanation": f"Apply {_describe(kept_actions)} (+{cost:,.2f} USD) to strictly improve synergy or bottleneck.",
+                "actions": kept_actions,
+                "added_cost_usd": cost,
+            }
+        else:
+            result["stretch_budget"] = {
+                **stretch, "explanation": _NO_STRETCH_IMPROVEMENT, "actions": [], "added_cost_usd": 0.0,
+            }
+    return result
+
+
 def get_build_advisory(
     build_state: BuildState,
     mode: str,

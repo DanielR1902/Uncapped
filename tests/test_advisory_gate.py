@@ -336,3 +336,43 @@ def test_heuristic_stretch_only_proposes_scope_categories(seeded_db):
     result = advisory._heuristic_stretch_budget(build, "CPU-bound", "Free", None, {})
     assert result["actions"]
     assert {a["category"] for a in result["actions"]} <= set(advisory.STRETCH_CATEGORIES)
+
+
+def test_prune_stale_actions_removes_swap_targeting_selected_component(seeded_db):
+    state = make_build_state()
+    cpu = state["CPU"]
+    adv = {
+        "pros": [], "cons": [],
+        "within_budget": {
+            "explanation": "Swap CPU from X to Y", "swaps": [{"action": "swap", "category": "CPU", "replace_with_id": cpu.id}],
+            "can_optimize_further": True,
+        },
+        "stretch_budget": {
+            "explanation": "Apply CPU upgrade", "actions": [{"action": "swap", "category": "CPU", "replace_with_id": cpu.id}],
+            "added_cost_usd": 50.0,
+        },
+        "source": "llm",
+    }
+    pruned = advisory.prune_stale_actions(adv, state)
+    assert pruned["within_budget"]["swaps"] == []
+    assert pruned["within_budget"]["can_optimize_further"] is False
+    assert pruned["within_budget"]["explanation"] == advisory._NO_IN_BUDGET_IMPROVEMENT
+    assert pruned["stretch_budget"]["actions"] == []
+    assert pruned["stretch_budget"]["added_cost_usd"] == 0.0
+    assert pruned["stretch_budget"]["explanation"] == advisory._NO_STRETCH_IMPROVEMENT
+    assert adv["within_budget"]["swaps"]  # input not mutated
+
+
+def test_prune_stale_actions_keeps_valid_and_returns_same_object_when_clean(seeded_db):
+    state = make_build_state()
+    other = next(c for c in solvers.get_compatible_candidates("CPU", state) if c.id != state["CPU"].id)
+    adv = {
+        "pros": [], "cons": [],
+        "within_budget": {
+            "explanation": "keep me", "swaps": [{"action": "swap", "category": "CPU", "replace_with_id": other.id}],
+            "can_optimize_further": True,
+        },
+        "stretch_budget": {"explanation": "s", "actions": [], "added_cost_usd": 0.0},
+        "source": "llm",
+    }
+    assert advisory.prune_stale_actions(adv, state) is adv

@@ -26,7 +26,7 @@ from db.models import WORKLOAD_PROFILES
 from db.repositories import builds_repo, community_repo, components_repo, drafts_repo
 from engine import scoring, solvers
 from engine.compatibility import PSU_HEADROOM_MULTIPLIER, SYSTEM_BASELINE_WATTS, evaluate_build
-from llm.advisory import get_build_advisory
+from llm.advisory import get_build_advisory, prune_stale_actions
 from llm.client import analyze_build
 from ui import state, theme
 from ui.components.part_picker import render_part_picker
@@ -533,9 +533,11 @@ def _apply_within_budget_optimization(
     round since state.set_component only mutates build_draft, never the
     build_state dict passed in here."""
     current = advisory
+    current_is_fresh = False  # True only when `current` was computed AFTER the latest applied swap
     with st.spinner("Applying optimization..."):
         for _round_num in range(_MAX_AUTO_OPTIMIZE_ROUNDS):
             _apply_swaps(build_draft, current["within_budget"]["swaps"])
+            current_is_fresh = False
             build_state = state.resolve_build_state(build_draft)
             if not current["within_budget"]["can_optimize_further"]:
                 break
@@ -550,23 +552,31 @@ def _apply_within_budget_optimization(
                 profile=build_draft.get("workload_profile"),
                 quantities=build_draft.get("quantities", {}),
             )
+            current_is_fresh = True
 
-        # Cache the final state's advisory under ITS OWN cache key (same
-        # tuple shape _advisory_controls computes on every render) so the
-        # expander shows a coherent result for the build as it now stands,
-        # not a stale one keyed to the pre-swap build.
+        # ROOT CAUSE of the "stale swap proposal" bug: `current` here is the
+        # advisory computed for the build BEFORE the last `_apply_swaps` call
+        # (its swaps were just applied), yet it used to be cached under the
+        # POST-swap build's key — so the card kept proposing "Swap CPU from
+        # 5700X to 5600X" against a build already holding the 5600X. Now the
+        # cache is invalidated (state.set_component already cleared it) and
+        # a FRESH advisory is computed from the post-swap build, then pruned.
+        build_state = state.resolve_build_state(build_draft)
+        quantities = build_draft.get("quantities", {})
         final_cost = (
             build_draft.get("budget_ceiling")
             if mode == "Budget" and build_draft.get("budget_ceiling")
-            else state.build_total_cost(build_state, build_draft.get("quantities", {}))
+            else state.build_total_cost(build_state, quantities)
         )
-        final_key = (
-            mode,
-            build_draft.get("workload_profile"),
-            tuple(sorted((category, component.id) for category, component in build_state.items())),
-            round(final_cost, 2),
+        state.invalidate_advisory_cache()
+        fresh = current if current_is_fresh else get_build_advisory(
+            build_state, mode, final_cost,
+            profile=build_draft.get("workload_profile"),
+            quantities=quantities,
         )
-        st.session_state.setdefault("advisory_cache", {})[final_key] = current
+        fresh = prune_stale_actions(fresh, build_state, quantities)
+        _, _, final_key = _advisory_cache_key(build_draft, build_state)
+        st.session_state.setdefault("advisory_cache", {})[final_key] = fresh
 
 
 def _advisory_cache_key(build_draft: dict, build_state: dict) -> tuple[str | None, float, tuple]:
@@ -654,6 +664,10 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
     cache = st.session_state.setdefault("advisory_cache", {})
 
     advisory = cache.get(cache_key)
+    if advisory is not None:
+        # Stale-proposal guard (spec.md §7.4.1): never propose a swap/stretch
+        # action targeting the component already selected in this build.
+        advisory = prune_stale_actions(advisory, build_state, build_draft.get("quantities", {}))
     if advisory is None:
         if len(build_state) >= 2:
             st.caption("Click **✨ AI Analysis** above to get optimization tips and an upgrade path.")
@@ -720,6 +734,9 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
                 ),
             ):
                 _apply_stretch_actions(build_draft, stretch_actions)
+                # set_component already cleared advisory_cache for swap actions;
+                # a set_quantity-only apply keeps the entry (same key) and the
+                # render-time prune guard disables the now-no-op action.
                 st.session_state["stretch_applied_keys"].add(cache_key)
                 st.rerun()
             if in_budget_available:

@@ -209,6 +209,7 @@ def _sync_qty_widget_key(category: str, value: int | None) -> None:
 def set_component(build_draft: dict, category: str, component: Component) -> None:
     build_draft.setdefault("components", {})[category] = component.id
     _invalidate_analysis()
+    invalidate_advisory_cache()
     st.session_state["has_unsaved_build_changes"] = True
 
 
@@ -229,6 +230,7 @@ def remove_component(build_draft: dict, category: str) -> None:
     # this pop is wrapped defensively.
     _sync_qty_widget_key(category, None)
     _invalidate_analysis()
+    invalidate_advisory_cache()
     st.session_state["has_unsaved_build_changes"] = True
 
 
@@ -266,6 +268,21 @@ def _invalidate_analysis() -> None:
     for a build that no longer matches what's on screen (it'll say "select at
     least two components" or need a fresh "Analyze" click instead)."""
     st.session_state["build_draft_analysis"] = None
+
+
+def invalidate_advisory_cache() -> None:
+    """Drop every cached advisory (`advisory_cache`). Called on any build
+    mutation so an advisory computed for the pre-change build can never be
+    re-displayed against the changed one (spec.md §7.4.1 stale-proposal
+    guard). The next render simply has no entry until a fresh evaluation.
+    Called by set_component/remove_component only — set_quantity keeps the
+    cache (quantities are not part of the cache key; the render-time
+    `llm.advisory.prune_stale_actions` guard drops a now-no-op
+    set_quantity action instead, preserving the stretch button's
+    "already applied" lock)."""
+    cache = st.session_state.get("advisory_cache")
+    if cache:
+        cache.clear()
 
 
 def build_total_cost(build_state: BuildState, quantities: dict[str, int] | None = None) -> float:
