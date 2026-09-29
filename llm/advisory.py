@@ -131,6 +131,14 @@ these change what "within_budget" and "stretch_budget" should optimize for:
   motherboard's real DIMM slot count), an additional or upgraded Storage drive, or a Cooler upgrade
   instead. Never claim no stretch upgrade exists if a high-impact option fits the allowance.
 
+STRETCH SCOPE (overrides every other mention of RAM, Storage, Case, Cooler, PSU, quantities or peripherals
+in the stretch guidance below): "stretch_budget.actions" may ONLY contain `swap` actions for the core
+categories CPU, GPU or Motherboard. A Motherboard upgrade is valid on its own or paired with a CPU on a
+different socket (list both swaps). RAM capacity, Storage size, Case, Cooler, PSU and every peripheral are
+manual adjustments — never propose them, and never use `set_quantity` in stretch_budget. Every action
+must strictly improve synergy or bottleneck without worsening the other; if none does, return an empty
+`actions` list and `added_cost_usd` 0.0.
+
 PEAKED-CATEGORY FALLTHROUGH RULE (applies to "stretch_budget" in every mode): If a specific category
 (e.g. CPU) has peaked in socket/tier compatibility — no pricier compatible option exists for it —
 evaluate GPU upgrades, increasing RAM quantity via a `set_quantity` action (up to the motherboard's
@@ -381,7 +389,13 @@ def _call_openrouter(payload: dict) -> dict[str, Any]:
 # weak side" logic engine/scoring.py's value_index and the rest of this
 # project's balancing philosophy already assume.
 # ---------------------------------------------------------------------------
-def _heuristic_within_budget(build_state: BuildState, direction: str, mode: str, profile: str | None) -> dict:
+def _heuristic_within_budget(
+    build_state: BuildState,
+    direction: str,
+    mode: str,
+    profile: str | None,
+    quantities: dict[str, int] | None = None,
+) -> dict:
     """Returns a dict shaped like WithinBudgetAdvice.model_dump():
     {"explanation": str, "swaps": [{"category", "replace_with_id"}, ...], "can_optimize_further": bool}.
 
@@ -465,6 +479,19 @@ def _heuristic_within_budget(build_state: BuildState, direction: str, mode: str,
         paired_upgrade = max(affordable_upgrades, key=lambda c: c.price_usd)  # best upgrade the savings can buy
         swaps.append({"category": limiting_category, "replace_with_id": paired_upgrade.id})
         hypothetical[limiting_category] = paired_upgrade
+
+    # Monotonic Improvement Gate: the heuristic's own candidates are held to
+    # the same strict rule as LLM-returned ones (a lone downgrade that only
+    # pays off when paired is judged together with its paired upgrade).
+    kept, gated_state, _gated_q = _gate_actions(
+        build_state, quantities, [{"action": "swap", **swap} for swap in swaps]
+    )
+    if not kept:
+        return {"explanation": _NO_IN_BUDGET_IMPROVEMENT, "swaps": [], "can_optimize_further": False}
+    if len(kept) != len(swaps):
+        explanation = "Swap " + _describe_kept(build_state, kept, gated_state) + " to improve balance within your budget."
+        hypothetical = gated_state
+    swaps = [{"category": s["category"], "replace_with_id": s["replace_with_id"]} for s in kept]
 
     _, new_direction = scoring.bottleneck_percentage_baseline(hypothetical)
     can_optimize_further = new_direction != "Balanced"
@@ -615,6 +642,61 @@ def _quantity_explanation(
     return f"{detail}, {reason}."
 
 
+# Stretch Budget scope (spec.md §6.6.3): only these core categories may be
+# proposed. RAM/Storage/Case/Cooler/PSU and peripherals stay manual.
+STRETCH_CATEGORIES: tuple[str, ...] = ("CPU", "GPU", "Motherboard")
+
+
+def _swap_candidates(category: str, build_state: BuildState, platform: bool = False) -> dict[int, Component]:
+    """Compatible candidates by id. With `platform=True`, CPU/Motherboard also
+    include parts that are only compatible once their socket partner is
+    swapped too (a CPU on a new socket needs a new board); the monotonic gate
+    then judges the pair jointly against the full build."""
+    found = {c.id: c for c in solvers.get_compatible_candidates(category, build_state)}
+    if platform and category in ("CPU", "Motherboard"):
+        partner = "Motherboard" if category == "CPU" else "CPU"
+        without_partner = {c: v for c, v in build_state.items() if c != partner}
+        for c in solvers.get_compatible_candidates(category, without_partner):
+            found.setdefault(c.id, c)
+    return found
+
+
+def _try_platform_upgrade(build_state: BuildState, quantities: dict[str, int], limiting_category: str) -> dict | None:
+    """CPU-on-a-new-socket + cheapest compatible Motherboard, gated as a unit."""
+    cpu, board = build_state.get("CPU"), build_state.get("Motherboard")
+    if limiting_category != "CPU" or cpu is None or board is None:
+        return None
+    current_pct, _direction = scoring.bottleneck_percentage_baseline(build_state)
+    base_without_pair = {c: v for c, v in build_state.items() if c not in ("CPU", "Motherboard")}
+    for candidate in sorted(
+        (c for c in _swap_candidates("CPU", build_state, platform=True).values() if c.price_usd > cpu.price_usd),
+        key=lambda c: c.price_usd,
+    ):
+        new_pct, _d = scoring.bottleneck_percentage_baseline({**build_state, "CPU": candidate})
+        if new_pct >= current_pct:
+            continue  # cheap pre-filter: can't improve, skip the expensive board search
+        boards = sorted(
+            solvers.get_compatible_candidates("Motherboard", {**base_without_pair, "CPU": candidate}),
+            key=lambda m: m.price_usd,
+        )
+        for new_board in boards:
+            actions = [
+                {"action": "swap", "category": "CPU", "replace_with_id": candidate.id},
+                {"action": "swap", "category": "Motherboard", "replace_with_id": new_board.id},
+            ]
+            kept, final_state, _q = _gate_actions(build_state, quantities, actions)
+            if len(kept) == 2:
+                cost = _real_cost_delta(build_state, quantities, kept, final_state)
+                if cost <= 0:
+                    continue
+                explanation = (
+                    f"Upgrade the platform: CPU to {candidate.name} with Motherboard {new_board.name} "
+                    f"(+{cost:,.2f} USD) to strictly improve synergy."
+                )
+                return {"explanation": explanation, "actions": kept, "added_cost_usd": cost}
+    return None
+
+
 def _heuristic_stretch_budget(
     build_state: BuildState,
     direction: str,
@@ -654,74 +736,70 @@ def _heuristic_stretch_budget(
         explanation = "Add a CPU and a GPU to the build to get a stretch-budget upgrade recommendation."
         return {"explanation": explanation, "actions": [], "added_cost_usd": 0.0}
 
+    # Every proposal below is held to the Monotonic Improvement Gate
+    # (`_gate_actions`): an action that does not strictly improve synergy or
+    # bottleneck without degrading the other is skipped, so the chain
+    # continues to the next option instead of suggesting something that only
+    # costs money (RAM/Storage quantity, Cooler and peripherals do not move
+    # either metric, so in practice they are rejected here).
+    def _passes(action: dict) -> bool:
+        kept, _state, _q = _gate_actions(build_state, quantities, [action])
+        return bool(kept)
+
     tried_swap_categories: set[str] = set()
 
     for candidate_category in (limiting_category, "GPU"):
         if candidate_category in tried_swap_categories or candidate_category not in build_state:
             continue
         tried_swap_categories.add(candidate_category)
-        result = _try_swap_upgrade(build_state, candidate_category)
-        if result is None:
-            continue
-        current, upgrade, delta = result
-        reason = _stretch_reason(mode, profile, direction, candidate_category, limiting_category)
-        explanation = f"Upgrade {candidate_category} to {upgrade.name} (+{delta:,.2f} USD) {reason}."
-        return {
-            "explanation": explanation,
-            "actions": [{"action": "swap", "category": candidate_category, "replace_with_id": upgrade.id}],
-            "added_cost_usd": round(delta, 2),
-        }
-
-    for quantity_category in ("RAM", "Storage"):
-        result = _try_quantity_increment(build_state, quantity_category, quantities)
-        if result is None:
-            continue
-        component, _current_qty, new_qty, added_cost = result
-        explanation = _quantity_explanation(
-            component, quantity_category, new_qty, mode, profile, direction, limiting_category
+        current = build_state[candidate_category]
+        others_fixed = {c: v for c, v in build_state.items() if c != candidate_category}
+        pricier = sorted(
+            (
+                c
+                for c in solvers.get_compatible_candidates(candidate_category, others_fixed)
+                if c.id != current.id and c.price_usd > current.price_usd
+            ),
+            key=lambda c: c.price_usd,
         )
-        return {
-            "explanation": explanation,
-            "actions": [{"action": "set_quantity", "category": quantity_category, "quantity": new_qty}],
-            "added_cost_usd": round(added_cost, 2),
-        }
+        for upgrade in pricier:  # cheapest upgrade that also strictly improves the build
+            action = {"action": "swap", "category": candidate_category, "replace_with_id": upgrade.id}
+            if not _passes(action):
+                continue
+            delta = upgrade.price_usd - current.price_usd
+            reason = _stretch_reason(mode, profile, direction, candidate_category, limiting_category)
+            explanation = f"Upgrade {candidate_category} to {upgrade.name} (+{delta:,.2f} USD) {reason}."
+            return {"explanation": explanation, "actions": [action], "added_cost_usd": round(delta, 2)}
 
-    result = _try_swap_upgrade(build_state, "Cooler")
-    if result is not None:
-        current, upgrade, delta = result
-        reason = _stretch_reason(mode, profile, direction, "Cooler", limiting_category)
-        explanation = f"Upgrade Cooler to {upgrade.name} (+{delta:,.2f} USD) {reason}."
-        return {
-            "explanation": explanation,
-            "actions": [{"action": "swap", "category": "Cooler", "replace_with_id": upgrade.id}],
-            "added_cost_usd": round(delta, 2),
-        }
+    # Motherboard is a core stretch category alongside CPU/GPU (spec.md §6.6.3).
+    # It is not itself scored, so a standalone board swap only survives the
+    # gate if it genuinely moves synergy/bottleneck (e.g. resolving a warning);
+    # the real payoff is a PLATFORM upgrade — a stronger CPU on a new socket
+    # together with the cheapest board that makes the build compatible again,
+    # judged as one unit.
+    current_board = build_state.get("Motherboard")
+    if current_board is not None:
+        others_fixed = {c: v for c, v in build_state.items() if c != "Motherboard"}
+        pricier_boards = sorted(
+            (
+                c
+                for c in solvers.get_compatible_candidates("Motherboard", others_fixed)
+                if c.id != current_board.id and c.price_usd > current_board.price_usd
+            ),
+            key=lambda c: c.price_usd,
+        )
+        for board in pricier_boards:
+            action = {"action": "swap", "category": "Motherboard", "replace_with_id": board.id}
+            if _passes(action):
+                delta = board.price_usd - current_board.price_usd
+                explanation = f"Upgrade Motherboard to {board.name} (+{delta:,.2f} USD) to improve platform synergy."
+                return {"explanation": explanation, "actions": [action], "added_cost_usd": round(delta, 2)}
 
-    # 7. Peripherals (a real, confirmed gap this closes — see
-    # _try_peripheral_upgrade_or_add's own docstring): every core category
-    # above has genuinely peaked, but real budget headroom can still exist
-    # for an unselected or upgradeable Monitor/Keyboard/Mouse/Headset/
-    # NetworkCard/SoundCard/OpticalDrive — checked in PERIPHERAL_CATEGORIES'
-    # own priority order (desk peripherals before internal expansion cards).
-    for peripheral_category in solvers.PERIPHERAL_CATEGORIES:
-        result = _try_peripheral_upgrade_or_add(build_state, peripheral_category)
-        if result is None:
-            continue
-        current, upgrade, delta = result
-        verb = "Upgrade" if current.id != -1 else "Add"
-        explanation = f"{verb} {peripheral_category} to {upgrade.name} (+{delta:,.2f} USD) for extra headroom."
-        return {
-            "explanation": explanation,
-            "actions": [{"action": "swap", "category": peripheral_category, "replace_with_id": upgrade.id}],
-            "added_cost_usd": round(delta, 2),
-        }
+    platform = _try_platform_upgrade(build_state, quantities, limiting_category)
+    if platform is not None:
+        return platform
 
-    explanation = (
-        f"{build_state[limiting_category].name} is already the priciest compatible {limiting_category} "
-        "option in the catalog, and GPU, RAM, Storage, Cooler, and every peripheral category were "
-        "checked too — no stretch-budget upgrade is available right now."
-    )
-    return {"explanation": explanation, "actions": [], "added_cost_usd": 0.0}
+    return {"explanation": _NO_STRETCH_IMPROVEMENT, "actions": [], "added_cost_usd": 0.0}
 
 
 def _heuristic_pros(build_state: BuildState, direction: str, profile: str | None = None) -> list[str]:
@@ -768,7 +846,7 @@ def _heuristic_advisory(
     return {
         "pros": _heuristic_pros(build_state, direction, profile),
         "cons": _heuristic_cons(build_state, direction, profile),
-        "within_budget": _heuristic_within_budget(build_state, direction, mode, profile),
+        "within_budget": _heuristic_within_budget(build_state, direction, mode, profile, quantities),
         "stretch_budget": _heuristic_stretch_budget(build_state, direction, mode, profile, quantities),
         "source": "heuristic",
     }
@@ -859,8 +937,9 @@ def _validate_advisory_actions(
                 f"{swap.category!r}"
             )
         if swap.category not in valid_candidates_by_category:
-            candidates = solvers.get_compatible_candidates(swap.category, build_state)
-            valid_candidates_by_category[swap.category] = {c.id: c for c in candidates}
+            valid_candidates_by_category[swap.category] = _swap_candidates(
+                swap.category, build_state, platform=(swap.category in STRETCH_CATEGORIES)
+            )
         if swap.replace_with_id not in valid_candidates_by_category[swap.category]:
             raise AdvisoryUnavailableError(
                 f"Advisory swap references a non-catalog id {swap.replace_with_id} for category "
@@ -923,6 +1002,187 @@ def _validate_advisory_actions(
         )
 
 
+_NO_IN_BUDGET_IMPROVEMENT = (
+    "No in-budget swap strictly improves this build's synergy or bottleneck without degrading the "
+    "other — it is already optimal for this budget."
+)
+_NO_STRETCH_IMPROVEMENT = (
+    "No stretch-budget upgrade strictly improves this build's synergy or bottleneck without "
+    "degrading the other, so there is nothing worth adding right now."
+)
+
+
+def _apply_action(
+    state: BuildState,
+    quantities: dict[str, int],
+    action: dict,
+    lookup: dict[str, dict[int, Component]],
+) -> tuple[BuildState, dict[str, int]] | None:
+    """Simulate ONE swap/set_quantity on copies of `state`/`quantities`.
+    Returns None for a no-op (same id / same quantity) or an unknown part.
+    Parts are identified by unique `id` only (never chipset/name similarity)."""
+    category = action["category"]
+    if action.get("action", "swap") == "set_quantity":
+        if category not in state or quantities.get(category, 1) == action["quantity"]:
+            return None
+        return state, {**quantities, category: action["quantity"]}
+    component = lookup.get(category, {}).get(action["replace_with_id"])
+    current = state.get(category)
+    if component is None or (current is not None and current.id == component.id):
+        return None
+    return {**state, category: component}, quantities
+
+
+def _gate_actions(
+    build_state: BuildState,
+    quantities: dict[str, int] | None,
+    actions: list[dict],
+) -> tuple[list[dict], BuildState, dict[str, int]]:
+    """MONOTONIC IMPROVEMENT GATE (spec.md §6.6.3). Applies `actions`
+    cumulatively on a copy of the build and keeps only those that move the
+    build strictly forward per `engine.solvers.is_monotonic_improvement`
+    (warnings 0 or strictly fewer; synergy never down; bottleneck never up;
+    at least one strictly better). Degrading, lateral, no-op, duplicate
+    (same category + action kind) or invalid actions are discarded. A paired
+    reallocation (e.g. downgrade GPU + upgrade CPU) is judged as a unit: an
+    action that fails alone is held pending and re-judged together with the
+    next one. Returns (kept, resulting_state, resulting_quantities)."""
+    quantities = dict(quantities or {})
+    lookup: dict[str, dict[int, Component]] = {}
+    for action in actions:
+        if action.get("action", "swap") == "swap" and action["category"] not in lookup:
+            lookup[action["category"]] = _swap_candidates(action["category"], build_state, platform=True)
+
+    accepted_state, accepted_q = dict(build_state), quantities
+    accepted_metrics = solvers.build_metrics(accepted_state, accepted_q)
+    kept: list[dict] = []
+    pending: list[dict] = []
+    work_state, work_q = accepted_state, accepted_q
+    seen: set[tuple[str, str]] = set()
+    for action in actions:
+        key = (action.get("action", "swap"), action["category"])
+        if key in seen:
+            continue
+        applied = _apply_action(work_state, work_q, action, lookup)
+        if applied is None:
+            continue
+        seen.add(key)
+        trial_state, trial_q = applied
+        if solvers.is_monotonic_improvement(accepted_metrics, solvers.build_metrics(trial_state, trial_q)):
+            kept.extend(pending + [action])
+            pending = []
+            accepted_state, accepted_q = trial_state, trial_q
+            accepted_metrics = solvers.build_metrics(accepted_state, accepted_q)
+            work_state, work_q = accepted_state, accepted_q
+            continue
+        if pending:
+            alone = _apply_action(accepted_state, accepted_q, action, lookup)
+            if alone is not None and solvers.is_monotonic_improvement(
+                accepted_metrics, solvers.build_metrics(*alone)
+            ):
+                kept.append(action)
+                accepted_state, accepted_q = alone
+                accepted_metrics = solvers.build_metrics(accepted_state, accepted_q)
+                pending = []
+                work_state, work_q = accepted_state, accepted_q
+                continue
+        pending.append(action)
+        work_state, work_q = trial_state, trial_q
+    return kept, accepted_state, accepted_q
+
+
+def _describe_kept(build_state: BuildState, kept: list[dict], final_state: BuildState) -> str:
+    parts = []
+    for action in kept:
+        category = action["category"]
+        if action.get("action", "swap") == "set_quantity":
+            parts.append(f"set {category} quantity to {action['quantity']}")
+        else:
+            old = build_state.get(category)
+            parts.append(f"{category} from {old.name if old is not None else 'none'} to {final_state[category].name}")
+    return "; ".join(parts)
+
+
+def _real_cost_delta(
+    build_state: BuildState, quantities: dict[str, int] | None, kept: list[dict], final_state: BuildState
+) -> float:
+    quantities = quantities or {}
+    total = 0.0
+    for action in kept:
+        category = action["category"]
+        if action.get("action", "swap") == "set_quantity":
+            component = build_state[category]
+            total += component.price_usd * (action["quantity"] - quantities.get(category, 1))
+        else:
+            old = build_state.get(category)
+            total += final_state[category].price_usd - (old.price_usd if old is not None else 0.0)
+    return round(total, 2)
+
+
+def _sanitize_within_budget(
+    build_state: BuildState,
+    within_budget: dict,
+    direction: str,
+    mode: str,
+    profile: str | None,
+    quantities: dict[str, int] | None,
+) -> dict:
+    """Run `within_budget.swaps` through the monotonic improvement gate
+    (`_gate_actions`) so every remaining swap is executable AND strictly
+    improves the build (no no-ops, duplicates, incompatible or degrading
+    swaps — e.g. synergy 95->85 / bottleneck 1%->10% is discarded). If
+    nothing was dropped, the LLM's own text is kept; if some were dropped, the
+    explanation is regenerated from what remains; if none remain, the (also
+    gated) deterministic heuristic is consulted, and if it finds nothing the
+    result is an honest empty `swaps: []`."""
+    swaps = within_budget["swaps"]
+    if not swaps:
+        return within_budget
+    kept, final_state, _final_q = _gate_actions(build_state, quantities, swaps)
+    if len(kept) == len(swaps):
+        return within_budget
+    if not kept:
+        return _heuristic_within_budget(build_state, direction, mode, profile, quantities)
+    return {
+        "explanation": "Swap " + _describe_kept(build_state, kept, final_state) + " to improve balance within your budget.",
+        "swaps": kept,
+        "can_optimize_further": within_budget["can_optimize_further"],
+    }
+
+
+def _sanitize_stretch(
+    build_state: BuildState,
+    stretch: dict,
+    quantities: dict[str, int] | None,
+) -> dict:
+    """Stretch counterpart of `_sanitize_within_budget`: only actions that
+    strictly improve without degrading the other metric survive;
+    `added_cost_usd` is recomputed from the kept actions' real catalog
+    deltas; when all are dropped the result is `actions: []`,
+    `added_cost_usd: 0.0` with an honest explanation (never a fallback that
+    reintroduces a non-monotonic action)."""
+    actions = [
+        a for a in stretch["actions"]
+        if a.get("action", "swap") == "swap" and a["category"] in STRETCH_CATEGORIES
+    ]
+    if not actions:
+        return stretch if not stretch["actions"] else {
+            "explanation": _NO_STRETCH_IMPROVEMENT, "actions": [], "added_cost_usd": 0.0,
+        }
+    kept, final_state, _final_q = _gate_actions(build_state, quantities, actions)
+    if not kept:
+        return {"explanation": _NO_STRETCH_IMPROVEMENT, "actions": [], "added_cost_usd": 0.0}
+    cost = _real_cost_delta(build_state, quantities, kept, final_state)
+    if len(kept) == len(stretch["actions"]):
+        return {**stretch, "added_cost_usd": cost}
+    return {
+        "explanation": f"Apply {_describe_kept(build_state, kept, final_state)} (+{cost:,.2f} USD) "
+        "to strictly improve synergy or bottleneck.",
+        "actions": kept,
+        "added_cost_usd": cost,
+    }
+
+
 def get_build_advisory(
     build_state: BuildState,
     mode: str,
@@ -981,13 +1241,17 @@ def get_build_advisory(
     # `stretch_budget` itself is swapped in, and `source` is corrected to
     # "heuristic" since the part that actually matters here came from
     # Python, not the model).
-    if not response.stretch_budget.actions:
+    response.source = "llm"
+    result = response.model_dump()
+    result["within_budget"] = _sanitize_within_budget(
+        build_state, result["within_budget"], direction, mode, profile, quantities
+    )
+    result["stretch_budget"] = _sanitize_stretch(
+        build_state, result["stretch_budget"], quantities
+    )
+    if not result["stretch_budget"]["actions"]:
         heuristic_stretch = _heuristic_stretch_budget(build_state, direction, mode, profile, quantities)
         if heuristic_stretch["actions"]:
-            result = response.model_dump()
             result["stretch_budget"] = heuristic_stretch
             result["source"] = "heuristic"
-            return result
-
-    response.source = "llm"
-    return response.model_dump()
+    return result

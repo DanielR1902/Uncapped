@@ -25,7 +25,42 @@ from engine.compatibility import (
     check_ram_motherboard_type,
     evaluate_build,
 )
-from engine.scoring import bottleneck_percentage_baseline
+from engine.scoring import bottleneck_percentage_baseline, live_bottleneck_and_synergy
+
+_METRIC_EPSILON = 1e-6
+
+
+def build_metrics(
+    build_state: BuildState, quantities: dict[str, int] | None = None
+) -> tuple[int, float, float] | None:
+    """(warning_count, synergy, bottleneck_pct) for `build_state`, or None when
+    the build has fewer than 2 components (no live score exists to compare)."""
+    live = live_bottleneck_and_synergy(build_state)
+    if live is None:
+        return None
+    warnings = len(evaluate_build(build_state, quantities).issues)
+    return warnings, live[0], live[1]
+
+
+def is_monotonic_improvement(
+    before: tuple[int, float, float] | None, after: tuple[int, float, float] | None
+) -> bool:
+    """Strict monotonic improvement gate (spec.md §6.6.3): `after` is accepted
+    only if compatibility warnings are 0 or strictly fewer than `before`, AND
+    synergy did not drop, AND bottleneck did not rise, AND at least one of
+    synergy/bottleneck is strictly better. Anything lateral or degrading is
+    rejected, which also makes ping-pong (A->B->A) impossible: every accepted
+    step strictly increases the (synergy, -bottleneck) partial order."""
+    if before is None or after is None:
+        return False
+    b_warn, b_syn, b_bn = before
+    a_warn, a_syn, a_bn = after
+    if not (a_warn == 0 or a_warn < b_warn):
+        return False
+    if a_syn < b_syn - _METRIC_EPSILON or a_bn > b_bn + _METRIC_EPSILON:
+        return False
+    return a_syn > b_syn + _METRIC_EPSILON or a_bn < b_bn - _METRIC_EPSILON
+
 
 # GPU/CPU dominate both cost and performance, so they're locked in first —
 # every other category then negotiates around whatever budget is left.

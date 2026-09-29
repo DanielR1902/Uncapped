@@ -2077,7 +2077,9 @@ def test_advisory_apply_buttons_disabled_when_no_swaps(seeded_db, monkeypatch):
     assert at.get_by_key("btn_apply_in_budget").disabled is True
     assert at.get_by_key("btn_apply_stretch").disabled is True
     page_text = "\n".join(m.value for m in at.markdown)
-    assert "No further adjustments can be made within this budget." in page_text
+    assert "The current configuration is already fully optimized for this budget." in page_text
+    assert "Increasing budget will not yield further performance or synergy improvements" in page_text
+    assert "Cannot apply stretch upgrades while in-budget" not in page_text
 
     # clicking a disabled button is a no-op in AppTest terms (nothing to
     # click), so just re-confirm the build/components are untouched.
@@ -2124,7 +2126,53 @@ def test_advisory_apply_in_budget_button_shows_no_red_notice_when_swaps_exist(se
 
     assert at.get_by_key("btn_apply_in_budget").disabled is False
     page_text = "\n".join(m.value for m in at.markdown)
-    assert "No further adjustments can be made within this budget." not in page_text
+    assert "already fully optimized for this budget" not in page_text
+    assert "Cannot apply stretch upgrades while in-budget optimizations are still available." in page_text
+    assert at.get_by_key("btn_apply_stretch").disabled is True
+
+
+def test_advisory_depleted_in_budget_with_stretch_available_state(seeded_db, monkeypatch):
+    """In-Budget depleted + stretch actions present: In-Budget disabled with
+    the red 'already fully optimized' notice, Stretch ACTIVE with no red
+    stretch notice."""
+    from db.repositories import components_repo
+    import ui.views.create_build as create_build_module
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "apply8", "apply8@example.com", "Apply Eight")
+    at.get_by_key("nav_create_build").click().run()
+    at.get_by_key("mode_budget").click().run()
+    at.get_by_key("budget_ceiling_input").set_value(1650.0).run()
+    at.get_by_key("apply_budget_generate").click().run()
+
+    current_cpu_id = at.session_state["build_draft"]["components"]["CPU"]
+    other_cpu = next(c for c in components_repo.get_by_category("CPU") if c.id != current_cpu_id)
+
+    def _stretch_only_advisory(
+        build_state, mode, current_budget_or_cost, profile=None, bottleneck_info=None, quantities=None
+    ):
+        return {
+            "pros": ["p"], "cons": ["c"],
+            "within_budget": {"explanation": "optimal", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {
+                "explanation": "upgrade the CPU",
+                "actions": [{"action": "swap", "category": "CPU", "replace_with_id": other_cpu.id}],
+                "added_cost_usd": 100.0,
+            },
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(create_build_module, "get_build_advisory", _stretch_only_advisory)
+    at.get_by_key("hud_ai_analysis").click().run()
+    assert not at.exception
+
+    assert at.get_by_key("btn_apply_in_budget").disabled is True
+    assert at.get_by_key("btn_apply_stretch").disabled is False
+    page_text = "\n".join(m.value for m in at.markdown)
+    assert "The current configuration is already fully optimized for this budget." in page_text
+    assert "Cannot apply stretch upgrades while in-budget" not in page_text
+    assert "Increasing budget will not yield further" not in page_text
 
 
 def test_reset_all_fields_clears_build_and_budget_ceiling(seeded_db):

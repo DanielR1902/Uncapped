@@ -681,8 +681,9 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
             f"🚀 Stretch Budget Upgrades (+{stretch_amount:,.0f} USD)",
         ])
         with tab1:
-            st.markdown(sanitize_markdown(advisory["within_budget"]["explanation"]))
-            in_budget_depleted = not advisory["within_budget"]["swaps"]
+            st.markdown(sanitize_markdown((advisory.get("within_budget") or {}).get("explanation", "")))
+            in_budget_available = bool((advisory.get("within_budget") or {}).get("swaps"))
+            in_budget_depleted = not in_budget_available
             if st.button(
                 "⚡ Apply In-Budget Optimization",
                 key="btn_apply_in_budget",
@@ -700,20 +701,36 @@ def _advisory_controls(build_draft: dict, build_state: dict) -> None:
             # Upgrade" button, which already explains both of its own
             # disabled reasons via st.caption below it.
             if in_budget_depleted:
-                st.markdown(":red[No further adjustments can be made within this budget.]")
+                st.markdown(
+                    ":red[The current configuration is already fully optimized for this budget. "
+                    "Consider stretching the budget.]"
+                )
         with tab2:
-            st.markdown(sanitize_markdown(advisory["stretch_budget"]["explanation"]))
+            stretch_budget = advisory.get("stretch_budget") or {}
+            stretch_actions = stretch_budget.get("actions") or []
+            st.markdown(sanitize_markdown(stretch_budget.get("explanation", "")))
             stretch_already_applied = cache_key in st.session_state["stretch_applied_keys"]
             if st.button(
                 "🚀 Apply Stretch Upgrade (One-Time)",
                 key="btn_apply_stretch",
-                disabled=not advisory["stretch_budget"]["actions"] or stretch_already_applied,
+                disabled=(
+                    in_budget_available
+                    or not stretch_actions
+                    or stretch_already_applied
+                ),
             ):
-                _apply_stretch_actions(build_draft, advisory["stretch_budget"]["actions"])
+                _apply_stretch_actions(build_draft, stretch_actions)
                 st.session_state["stretch_applied_keys"].add(cache_key)
                 st.rerun()
-            if not advisory["stretch_budget"]["actions"]:
-                st.caption("No stretch upgrade available for this build right now.")
+            if in_budget_available:
+                st.markdown(
+                    ":red[Cannot apply stretch upgrades while in-budget optimizations are still available.]"
+                )
+            elif not stretch_actions:
+                st.markdown(
+                    ":red[Increasing budget will not yield further performance or "
+                    "synergy improvements with available parts.]"
+                )
             elif stretch_already_applied:
                 st.caption("Already applied for this build — a new advisory result (after further changes) unlocks it again.")
 

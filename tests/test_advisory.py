@@ -840,17 +840,18 @@ def test_heuristic_stretch_budget_falls_through_when_bottleneck_category_maxed(s
 
     result = advisory._heuristic_stretch_budget(build_state, "CPU-bound", mode="Free", profile=None)
 
-    assert result["actions"], (
-        "expected the fallthrough chain to find a real GPU/RAM/Storage/Cooler action, "
-        f"got explanation: {result['explanation']!r}"
-    )
-    action = result["actions"][0]
-    assert action["action"] in ("swap", "set_quantity")
-    if action["action"] == "swap":
-        assert action["category"] in ("GPU", "Cooler")
+    # Monotonic Improvement Gate: with the CPU maxed, the fallthrough chain
+    # may only surface an action that strictly improves without degrading.
+    # A pricier GPU widens a CPU-bound gap, and RAM/Storage quantity, Cooler
+    # and peripherals do not move synergy/bottleneck at all, so every option
+    # is rejected -> empty actions, $0 added, and an honest explanation.
+    kept, _state, _q = advisory._gate_actions(build_state, None, result["actions"])
+    assert kept == result["actions"]
+    if not result["actions"]:
+        assert result["added_cost_usd"] == 0.0
+        assert "strictly improves" in result["explanation"]
     else:
-        assert action["category"] in ("RAM", "Storage")
-    assert result["added_cost_usd"] > 0.0
+        assert result["added_cost_usd"] > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -882,7 +883,7 @@ def test_swap_action_parses_from_raw_swap_payload_inside_stretch_actions():
     assert action.replace_with_id == 42
 
 
-def test_set_quantity_action_within_ram_slots_survives_validation(seeded_db, monkeypatch):
+def test_set_quantity_action_within_ram_slots_passes_validation_but_gate_drops_it(seeded_db, monkeypatch):
     """A set_quantity action whose quantity is within the real motherboard
     ram_slots count must parse into a QuantityAction and survive
     _validate_advisory_actions, keeping source == "llm"."""
@@ -913,10 +914,13 @@ def test_set_quantity_action_within_ram_slots_survives_validation(seeded_db, mon
     monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
     result = advisory.get_build_advisory(build_state, mode="Free", current_budget_or_cost=1000.0)
 
-    assert result["source"] == "llm"
-    assert result["stretch_budget"]["actions"] == [
-        {"action": "set_quantity", "category": "RAM", "quantity": ram_slots}
-    ]
+    # The action is genuine (passes id/slot/cost validation) ...
+    response = BuildAdvisoryResponse.model_validate(payload)
+    advisory._validate_advisory_actions(build_state, response)
+    # ... but a RAM quantity bump changes neither synergy nor bottleneck, so
+    # the Monotonic Improvement Gate discards it from the final result.
+    dropped = {"action": "set_quantity", "category": "RAM", "quantity": ram_slots}
+    assert dropped not in result["stretch_budget"]["actions"]
 
 
 def test_set_quantity_action_exceeding_ram_slots_falls_back_to_heuristic(seeded_db, monkeypatch):
@@ -976,3 +980,51 @@ def test_set_quantity_action_for_non_nvme_storage_rejected(seeded_db, monkeypatc
     monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
     result = advisory.get_build_advisory(build_state, mode="Free", current_budget_or_cost=1000.0)
     assert result["source"] == "heuristic"
+
+
+def test_within_budget_noop_swap_to_current_part_is_dropped_and_text_realigned(seeded_db, monkeypatch):
+    """A swap whose replace_with_id is the ALREADY-selected part passes id
+    validation (it is in the compatible list) but mutates nothing. It must be
+    dropped so the button is never active for a silent no-op, and the LLM's
+    swap-instructing explanation must not survive alongside an empty list."""
+    _set_env(monkeypatch)
+    build_state = make_build_state()
+    payload = json.loads(json.dumps(VALID_ADVISORY_PAYLOAD))
+    payload["within_budget"]["swaps"] = [{"category": "CPU", "replace_with_id": build_state["CPU"].id}]
+    payload["within_budget"]["explanation"] = "Swap the CPU for a better one."
+    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = advisory.get_build_advisory(build_state, mode="Free", current_budget_or_cost=1000.0)
+
+    for swap in result["within_budget"]["swaps"]:
+        assert swap["replace_with_id"] != build_state[swap["category"]].id
+    assert result["within_budget"]["explanation"] != "Swap the CPU for a better one."
+
+
+def test_within_budget_same_chipset_motherboard_swap_is_distinct_but_lateral_is_dropped(seeded_db, monkeypatch):
+    """Parts are identified by unique id only (a second same-chipset board is a
+    real, distinct swap, not a no-op) — but a Motherboard swap changes neither
+    synergy nor bottleneck, so the Monotonic Improvement Gate drops it as
+    lateral."""
+    from db.repositories import components_repo
+
+    _set_env(monkeypatch)
+    build_state = make_build_state()
+    current = build_state["Motherboard"]
+    same_chipset = [
+        c for c in solvers.get_compatible_candidates("Motherboard", build_state)
+        if c.id != current.id and getattr(c, "chipset", None) == getattr(current, "chipset", None)
+    ]
+    if not same_chipset:
+        pytest.skip("seed catalog has no second compatible board on the same chipset for this fixture")
+    target = same_chipset[0]
+    assert components_repo.get_by_id(target.id).id != current.id
+    payload = json.loads(json.dumps(VALID_ADVISORY_PAYLOAD))
+    payload["within_budget"]["swaps"] = [{"category": "Motherboard", "replace_with_id": target.id}]
+    monkeypatch.setattr(advisory.httpx, "post", lambda *a, **k: _fake_openrouter_response(payload))
+
+    result = advisory.get_build_advisory(build_state, mode="Free", current_budget_or_cost=1000.0)
+
+    assert ("Motherboard", target.id) not in [
+        (w["category"], w["replace_with_id"]) for w in result["within_budget"]["swaps"]
+    ]

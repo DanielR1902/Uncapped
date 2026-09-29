@@ -1657,15 +1657,21 @@ def _optimize_in_place(
     state: dict, quantities: dict, mode: str, base_price: float, profile: str | None,
     resolve_component: Callable[[int], Any],
 ) -> dict:
+    """Iterate in-place swaps. Every round accepts a candidate ONLY if it is a
+    strict monotonic improvement (engine.solvers.is_monotonic_improvement:
+    warnings 0 or fewer, synergy not lower, bottleneck not higher, at least
+    one strictly better) — the same gate as advisory swaps — and never revisits
+    a state already seen, so parts cannot ping-pong between rounds."""
     upper = base_price + BUDGET_WINDOW_USD
     state = _fix_warnings(state, quantities, resolve_component)
+    seen = [dict(state)]
     for _ in range(_MAX_INPLACE_ROUNDS):
         warnings, synergy, bottleneck = _evaluate(state, quantities)
         if _meets_targets(warnings, synergy, bottleneck):
             break
-        before_rank = _rank(warnings, synergy)
+        before = solvers.build_metrics(state, quantities)
 
-        candidate = dict(state)
+        combined = dict(state)
         advisory = get_build_advisory(
             state, mode, base_price if mode == "Budget" else _cost(state, quantities),
             profile=profile, quantities=quantities,
@@ -1673,18 +1679,29 @@ def _optimize_in_place(
         for swap in advisory["within_budget"]["swaps"]:
             component = resolve_component(swap["replace_with_id"])
             if component is not None:
-                candidate[swap["category"]] = component
-        exhaustive = solvers.find_bottleneck_minimizing_swap(candidate)
-        if exhaustive is not None:
-            candidate = dict(exhaustive[0])
-        candidate = _fix_warnings(candidate, quantities, resolve_component)
+                combined[swap["category"]] = component
+        exhaustive_on_combined = solvers.find_bottleneck_minimizing_swap(combined)
+        if exhaustive_on_combined is not None:
+            combined = dict(exhaustive_on_combined[0])
+        exhaustive_alone = solvers.find_bottleneck_minimizing_swap(state)
+        alone = dict(exhaustive_alone[0]) if exhaustive_alone is not None else None
 
-        if candidate == state or _cost(candidate, quantities) > upper:
+        chosen = None
+        for candidate in (combined, alone):
+            if candidate is None:
+                continue
+            candidate = _fix_warnings(candidate, quantities, resolve_component)
+            if candidate == state or any(candidate == old for old in seen):
+                continue
+            if _cost(candidate, quantities) > upper:
+                continue
+            if solvers.is_monotonic_improvement(before, solvers.build_metrics(candidate, quantities)):
+                chosen = candidate
+                break
+        if chosen is None:
             break
-        c_warnings, c_synergy, _c_bottleneck = _evaluate(candidate, quantities)
-        if _rank(c_warnings, c_synergy) <= before_rank:
-            break
-        state = candidate
+        state = chosen
+        seen.append(dict(state))
     return state
 
 
