@@ -435,7 +435,10 @@ class ConciergePublishBuildAction(BaseModel):
 
     type: Literal["publish_build"] = "publish_build"
     author_notes: str | None = None
-    flair: Literal["Rate My Build", "Looking for Help"]
+    # Still REQUIRED to be stated (no default), but `None` is now a valid value:
+    # the user explicitly declined a tag ("neither"/"no tag"/"skip") — publish
+    # untagged rather than forcing one (spec.md §6.7.5).
+    flair: Literal["Rate My Build", "Looking for Help"] | None
 
 
 class ConciergeOpenCommunityBuildAction(BaseModel):

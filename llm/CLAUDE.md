@@ -20,6 +20,8 @@ All OpenRouter interaction: request construction, structured-output parsing/vali
 
 - **Stretch scope**: `advisory.STRETCH_CATEGORIES = (CPU, GPU, Motherboard)`. `_sanitize_stretch` discards any other category/`set_quantity`; `_try_platform_upgrade` pairs a new-socket CPU with the cheapest compatible Motherboard, judged as a unit by `_gate_actions` (whose lookup and the LLM validator accept socket-partner candidates via `_swap_candidates(..., platform=True)`). See spec.md §6.6.3.
 
+- **Deterministic publish flow**: `concierge.resolve_publish_flow_turn` is checked at the top of `get_concierge_response` (before any LLM call) and resolves every step after the save in Python from the assistant's previous message — publish question ("yes" -> tag question, never repeated), tag question (a tag, or "neither"/"no tag"/"skip" -> untagged, `flair: null`), description question ("no" -> empty, an AI-write request -> a generated description via `_generate_publish_description` with a deterministic fallback, other text -> verbatim, cancel -> private). `ConciergePublishBuildAction.flair` is required-but-nullable. See spec.md §6.7.5.
+
 ## Allowed imports
 - `httpx`, `pydantic`.
 - `engine.*` — to build the deterministic pre-check payload (`evaluate_build`, `bottleneck_percentage_baseline`) and to compute the heuristic fallback. This is a **read-only, compute-only** dependency — `llm/` calls `engine/` functions, never the reverse.

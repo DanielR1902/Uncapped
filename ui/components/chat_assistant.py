@@ -1939,16 +1939,18 @@ def render_concierge_widget() -> None:
             # with a fabricated success message either.
             saved_build = st.session_state.get("concierge_last_saved_build")
             if saved_build and (
-                (applied_action_type == "publish_build" and action_dict.get("flair"))
+                applied_action_type == "publish_build"
                 or (
                     applied_action_type == "save_build"
                     and action_dict.get("publish_immediately")
                     and action_dict.get("flair")
                 )
             ):
+                # An explicitly untagged publish (user declined a tag) has no tag to name.
+                tag_text = f" under '{action_dict['flair']}'" if action_dict.get("flair") else " (no tag)"
                 reply_content = (
-                    f"Build '{saved_build['name']}' successfully published to Community "
-                    f"under '{action_dict['flair']}'!\nViewable now in Community & Your Posts."
+                    f"Build '{saved_build['name']}' successfully published to Community"
+                    f"{tag_text}!\nViewable now in Community & Your Posts."
                 )
 
             # RIGOROUS TELEMETRY REPLY FORMAT: for load_build/modify_build/

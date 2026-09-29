@@ -1693,8 +1693,10 @@ def test_publish_confirmation_no_answer_stays_action_null(monkeypatch):
     result = concierge.get_concierge_response(
         "No", history, CATALOG_SUMMARY, COMMUNITY_SUMMARY, current_build_context=CURRENT_BUILD_CONTEXT
     )
-    assert result["source"] == "llm"
+    # Resolved deterministically in Python now (spec.md §6.7.5), not by the model.
+    assert result["source"] == "heuristic"
     assert result["action"] is None
+    assert "stays private" in result["reply"]
 
 
 def test_publish_confirmation_yes_then_description_no_returns_publish_action(monkeypatch):

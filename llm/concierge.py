@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -671,6 +672,12 @@ You handle thirteen kinds of requests:
    every other follow-up in this prompt: by reading your own immediately-preceding turn in
    `conversation_history` to confirm which state you're actually in, never by guessing from the new message
    alone:
+
+     NOTE: the app resolves the publish flow's questions after the save (the "publish it to the Community as
+     well?" answer, the tag choice — including "neither"/"no tag"/"skip", which publishes with NO tag — and the
+     description, including "write one for me") deterministically in Python before you are consulted; the states
+     below only describe that flow for context. A post may be published with `flair: null` when the user
+     explicitly declined a tag; never force a tag on them.
 
      STATE 1 — TAG QUESTION (your last turn asked "...'Rate My Build' or 'Looking for Help'?"): the new
      message names one of the two (recognize by MEANING, the same wording patterns as the `flair` extraction
@@ -1465,6 +1472,218 @@ def _coerce_component_id_shapes(raw: dict) -> dict:
     return raw
 
 
+# ---------------------------------------------------------------------------
+# Deterministic publish flow (spec.md §6.7 intent 7 / §6.7.5)
+#
+# save -> "publish it to the Community as well?" -> tag question -> description
+# question -> publish. The flow used to be resolved only by the model reading
+# its own previous turn, and it looped (re-asking the first question after
+# "yes"; after "no" at the description step) and forced a tag. Every step
+# after the save is now resolved in PLAIN PYTHON, before any LLM call, because
+# the state is fully recoverable from the assistant's previous message:
+#   PUBLISH_QUESTION  -> "yes" -> TAG question (never repeats the first question)
+#   TAG question      -> a tag | "neither"/"no tag"/"skip" (tag None) -> DESCRIPTION question
+#   DESCRIPTION       -> "no" (empty) | AI-write request (generated) | typed text | cancel
+# ---------------------------------------------------------------------------
+_PUBLISH_QUESTION_MARKER = "publish it to the community as well"
+_TAG_QUESTION_MARKER = "'rate my build' or 'looking for help'"
+_DESCRIPTION_QUESTION_MARKER = "add a description or notes"
+_NO_TAG_MARKER = "no tag selected"
+_TAG_QUESTION_TEXT = (
+    "Would you like to tag this community post as 'Rate My Build' or 'Looking for Help'? "
+    "(Say 'no tag' to publish without one.)"
+)
+_DESCRIPTION_SUFFIX = "Would you like to add a description or notes? (Type your description, or type 'no' to publish without one)"
+_TAGGED_AS_RE = re.compile(r"Tagged as '(Rate My Build|Looking for Help)'", re.IGNORECASE)
+_PUBLISH_TAGS = {"rate my build": "Rate My Build", "looking for help": "Looking for Help"}
+_DECLINE_FIRST_WORDS = {"no", "nope", "nah", "none", "skip", "nothing", "n"}
+_DECLINE_FILLER_WORDS = {
+    "thanks", "thank", "you", "description", "notes", "note", "please", "need", "it", "i", "im", "good",
+    "fine", "just", "publish", "without", "one", "needed", "not", "now",
+}
+_YES_WORDS = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "y", "please", "go", "ahead", "do", "it", "publish"}
+_NO_TAG_RE = re.compile(
+    r"^\s*(neither|no tag|none|skip|no|nope|nah|no thanks|don'?t tag|without (a )?tag|untagged|no label)\b[\s\S]{0,20}$",
+    re.IGNORECASE,
+)
+_CANCEL_RE = re.compile(r"\b(cancel|stop|abort|don'?t publish|do not publish)\b", re.IGNORECASE)
+_AI_WRITE_PHRASES = re.compile(
+    r"(random description|generated? (one|it|a description)|write (me )?(one|it|a (random |short )?description)|"
+    r"you write|write one|make (one|it) up|come up with (one|something)|ai description|"
+    r"auto[- ]?(generate|write)?|surprise me|you decide|up to you|compose (one|it))",
+    re.IGNORECASE,
+)
+
+
+def _last_assistant_text(conversation_history: list[dict]) -> str | None:
+    last = next((m for m in reversed(conversation_history or []) if m.get("role") == "assistant"), None)
+    return None if last is None else str(last.get("content", ""))
+
+
+def _is_decline(message: str) -> bool:
+    words = re.findall(r"[a-z']+", message.lower())
+    return (
+        1 <= len(words) <= 4
+        and words[0] in _DECLINE_FIRST_WORDS
+        and all(w in _DECLINE_FILLER_WORDS or w in _DECLINE_FIRST_WORDS for w in words[1:])
+    )
+
+
+def _is_yes(message: str) -> bool:
+    words = re.findall(r"[a-z']+", message.lower())
+    return 1 <= len(words) <= 4 and words[0] in {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "y"} and all(
+        w in _YES_WORDS for w in words
+    )
+
+
+def _is_ai_write_request(message: str) -> bool:
+    """A request for the model to WRITE the description ("write a random
+    description", "generate one", "you write it") — never a description itself."""
+    if len(message.split()) > 10:
+        return False
+    return bool(_AI_WRITE_PHRASES.search(message))
+
+
+def _fallback_description(build_context: dict | None) -> str:
+    components = (build_context or {}).get("components") or {}
+
+    def _name(category: str) -> str | None:
+        entry = components.get(category)
+        return entry.get("name") if isinstance(entry, dict) else None
+
+    cpu, gpu, ram = _name("CPU"), _name("GPU"), _name("RAM")
+    parts = [p for p in (cpu, gpu) if p]
+    if not parts:
+        return "A custom PC build shared for community feedback."
+    text = "Built around " + " and ".join(parts)
+    if ram:
+        text += f" with {ram}"
+    return text + ", shared for community feedback."
+
+
+def _generate_publish_description(build_context: dict | None) -> str:
+    """1-2 sentence description grounded only in the build's real parts. Tries
+    one small LLM call; any failure falls back to a deterministic sentence built
+    from the same data. Never returns the user's own request text."""
+    fallback = _fallback_description(build_context)
+    try:
+        response = _post_with_retry(
+            OPENROUTER_URL,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            headers={
+                "Authorization": f"Bearer {_api_key()}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "http://localhost:8501",
+                "X-Title": "Uncapped Studio",
+            },
+            json={
+                "model": _model(),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Write a concise 1-2 sentence community-post description of a PC build, grounded ONLY "
+                            "in the components given (name the CPU/GPU and, if relevant, the workload). No prices, "
+                            "no synergy or bottleneck numbers, no dollar signs. Respond with JSON: "
+                            '{"description": "<text>"}'
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(build_context or {})},
+                ],
+                "response_format": {"type": "json_object"},
+                "max_tokens": 200,
+            },
+        )
+        if response.status_code >= 400:
+            return fallback
+        content, _finish = _json_utils.extract_message(response.json())
+        text = str(_json_utils.parse_strict(content).get("description", "")).strip()
+    except Exception:
+        return fallback
+    text = text.replace("$", "USD ")
+    return text[:400] if text else fallback
+
+
+def _flow_response(reply: str, action: dict | None) -> dict:
+    response = ConciergeResponse.model_validate({"reply": reply, "action": action})
+    response.source = "heuristic"
+    return response.model_dump()
+
+
+def resolve_publish_flow_turn(
+    user_message: str, conversation_history: list[dict], current_build_context: dict | None = None
+) -> dict | None:
+    """Resolve the current turn of the save/publish flow in Python, based on
+    the assistant's immediately-preceding message; returns a ConciergeResponse-
+    shaped dict, or None when this is not a publish-flow turn (or the answer is
+    ambiguous — the model then handles it)."""
+    content = _last_assistant_text(conversation_history)
+    message = (user_message or "").strip()
+    if content is None or not message:
+        return None
+    low = content.lower()
+
+    if _DESCRIPTION_QUESTION_MARKER in low:
+        tag_match = _TAGGED_AS_RE.search(content)
+        if tag_match is not None:
+            flair: str | None = _PUBLISH_TAGS[tag_match.group(1).lower()]
+        elif _NO_TAG_MARKER in low:
+            flair = None
+        else:
+            return None
+        if _CANCEL_RE.search(message):
+            return _flow_response("Okay — your build stays private and was not published.", None)
+        if _is_decline(message):
+            return _flow_response(
+                "Publishing to the Community without a description.",
+                {"type": "publish_build", "author_notes": None, "flair": flair},
+            )
+        if _is_ai_write_request(message):
+            description = _generate_publish_description(current_build_context)
+            return _flow_response(
+                f"Publishing to the Community with this description: {description}",
+                {"type": "publish_build", "author_notes": description, "flair": flair},
+            )
+        return _flow_response(
+            "Publishing to the Community with your description.",
+            {"type": "publish_build", "author_notes": message, "flair": flair},
+        )
+
+    if _TAG_QUESTION_MARKER in low:
+        if _CANCEL_RE.search(message):
+            return _flow_response("Okay — your build stays private and was not published.", None)
+        lowered = message.lower()
+        wants_rmb = "rate my build" in lowered or "rate" in re.findall(r"[a-z']+", lowered) or "first" in lowered
+        wants_lfh = "looking for help" in lowered or "help" in re.findall(r"[a-z']+", lowered) or "second" in lowered
+        if wants_rmb != wants_lfh:
+            tag = "Rate My Build" if wants_rmb else "Looking for Help"
+            return _flow_response(f"Tagged as '{tag}'! {_DESCRIPTION_SUFFIX}", None)
+        if not (wants_rmb or wants_lfh) and _NO_TAG_RE.match(message):
+            return _flow_response(f"No tag selected. {_DESCRIPTION_SUFFIX}", None)
+        return None
+
+    if _PUBLISH_QUESTION_MARKER in low:
+        if _is_yes(message):
+            return _flow_response(_TAG_QUESTION_TEXT, None)
+        if _is_decline(message) or _CANCEL_RE.search(message):
+            return _flow_response("Okay — your build stays private.", None)
+        return None
+
+    return None
+
+
+def resolve_publish_description_turn(
+    user_message: str, conversation_history: list[dict], current_build_context: dict | None = None
+) -> dict | None:
+    """Backward-compatible name for the description step of
+    `resolve_publish_flow_turn` (only responds when the previous assistant
+    message was the description question)."""
+    content = _last_assistant_text(conversation_history)
+    if content is None or _DESCRIPTION_QUESTION_MARKER not in content.lower():
+        return None
+    return resolve_publish_flow_turn(user_message, conversation_history, current_build_context)
+
+
 def get_concierge_response(
     user_message: str,
     conversation_history: list[dict],
@@ -1609,6 +1828,14 @@ def get_concierge_response(
      "currency_switch": "USD" | "EUR" | "NIS" | None,
      "source": "llm" | "heuristic"}.
     """
+    try:
+        deterministic = resolve_publish_flow_turn(user_message, conversation_history, current_build_context)
+    except Exception:  # never let the shortcut break the normal path
+        traceback.print_exc(file=sys.stderr)
+        deterministic = None
+    if deterministic is not None:
+        return deterministic
+
     try:
         payload = _build_payload(
             user_message,
