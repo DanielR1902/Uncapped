@@ -171,7 +171,11 @@ def render_part_picker(
 
     spent_elsewhere: float | None = None
     if budget_ceiling is not None:
-        spent_elsewhere = sum(c.price_usd for cat, c in build_state.items() if cat != category)
+        # quantity-aware: RAM/Storage line totals are price x quantity
+        spent_elsewhere = sum(
+            c.price_usd * ((quantities or {}).get(cat, 1) if cat in _QUANTITY_CATEGORIES else 1)
+            for cat, c in build_state.items() if cat != category
+        )
 
     # Industrial dashed-wireframe empty state vs. solid glass-panel filled
     # state (spec.md §7.4.1) — the key's own "_empty"/"_filled" suffix is
@@ -312,13 +316,15 @@ def render_part_picker(
                             if spent_elsewhere is not None:
                                 min_reserve = _min_reserve_for_other_slots(category, build_state, candidate)
                                 max_slot_cost = budget_ceiling - spent_elsewhere - min_reserve
-                            over_budget = max_slot_cost is not None and candidate.price_usd > max_slot_cost
+                            slot_qty = quantity if category in _QUANTITY_CATEGORIES else 1
+                            over_budget = max_slot_cost is not None and candidate.price_usd * slot_qty > max_slot_cost
                             if not is_current:
                                 if st.button(
                                     "Select",
                                     key=f"select_{category}_{candidate.id}",
                                     use_container_width=True,
                                     disabled=over_budget,
+                                    help="Exceeds budget ceiling" if over_budget else None,
                                 ):
                                     on_select(candidate)
                                     st.rerun()

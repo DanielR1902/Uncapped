@@ -660,6 +660,96 @@ _NON_ADDITIVE_RE = re.compile(
 _QUANTITY_CATEGORIES = ("RAM", "Storage")
 _APPLY_NOTES_KEY = "concierge_apply_notes"
 
+# Staged by `_apply_concierge_action` when a modify_build was refused for
+# exceeding the hard budget ceiling; the reply assembly replaces the model's
+# text with the honest refusal (so "Upgraded..." can never sit next to
+# "no component changes").
+_BUDGET_REJECTION_KEY = "concierge_budget_rejection"
+
+# One-shot staging key for the Budget-mode "Budget ceiling (USD)" number_input
+# (`budget_ceiling_input`): that widget is instantiated later in the same
+# script pass, so writing its key here would raise
+# StreamlitWidgetAlreadyInstantiatedError — `create_build._budget_controls`
+# pops this and applies it before the widget instantiates.
+PENDING_BUDGET_INPUT_KEY = "pending_budget_ceiling_input"
+
+_BUDGET_FIGURE_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*(k\b|thousand\b)?", re.IGNORECASE)
+
+
+def _message_budget_figures_usd(message: str | None, active_currency: str) -> list[float]:
+    """Every plausible budget figure literally present in the user's message
+    (>= 100, "3k" -> 3000), converted to USD via the currency the message
+    names (else the active one)."""
+    low = (message or "").lower()
+    if re.search(r"\bnis\b|₪|shekel", low):
+        currency = "NIS"
+    elif re.search(r"\beur\b|€|euro", low):
+        currency = "EUR"
+    elif re.search(r"\busd\b|\$|dollar", low):
+        currency = "USD"
+    else:
+        currency = active_currency
+    rate = CURRENCY_RATES.get(currency, 1.0) or 1.0
+    figures: list[float] = []
+    for match in _BUDGET_FIGURE_RE.finditer(message or ""):
+        value = float(match.group(1).replace(",", ""))
+        if match.group(2):
+            value *= 1000
+        if value >= 100:
+            figures.append(value / rate)
+    return figures
+
+
+def _verified_budget_cap(cap: float | None, message: str | None, active_currency: str, strict: bool = False) -> float | None:
+    """Authoritative check of an LLM-supplied budget figure against what the
+    user actually typed. Returns `cap` when it matches a figure in the message
+    (1% tolerance); when it doesn't but the message contains exactly ONE
+    figure, that figure (the LLM computed a corrupted/residual number, e.g.
+    1647 for "3k budget"). With ambiguous or no figures: `cap` unchanged, or
+    None when `strict` (used before REPLACING an existing ceiling)."""
+    figures = _message_budget_figures_usd(message, active_currency)
+    if cap and any(abs(f - cap) <= max(1.0, 0.01 * cap) for f in figures):
+        return cap
+    if len(figures) == 1:
+        return round(figures[0], 2)
+    return None if strict else cap
+
+
+_BUDGET_WORD_RE = re.compile(r"\b(budget|ceiling)\b", re.IGNORECASE)
+_BUDGET_CHANGE_RE = re.compile(
+    r"\b(low(er|ering)|reduc\w*|decreas\w*|cut(ting)?|drop(ping)?|down|rais\w*|increas\w*|up(ping|ped)?|"
+    r"set(ting)?|chang\w*|adjust\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def _explicit_budget_change(user_message: str | None, build_draft: dict | None, active_currency: str) -> float | None:
+    """Deterministic backstop for "I'm lowering your budget to 3k, make the
+    necessary adjustments" / "upping budget to 5k, make upgrades": the user
+    stated ONE budget figure with budget wording against an ACTIVE build. Returns
+    that exact figure in USD (or None) so the ceiling change + rebalance never
+    depends on the model routing the message to the right action. Additive
+    requests ("add a monitor") never count."""
+    if not user_message or not build_draft or not build_draft.get("components"):
+        return None
+    if "?" in user_message:  # a question, not an instruction
+        return None
+    if not _BUDGET_WORD_RE.search(user_message) or not _BUDGET_CHANGE_RE.search(user_message):
+        return None
+    if _is_additive_request(user_message):
+        return None
+    figures = _message_budget_figures_usd(user_message, active_currency)
+    if len(figures) != 1:
+        return None
+    return round(figures[0], 2)
+
+
+def _set_budget_ceiling(build_draft: dict, ceiling: float) -> None:
+    """Commit an explicit ceiling to the draft and stage the number_input."""
+    build_draft["budget_ceiling"] = ceiling
+    st.session_state[PENDING_BUDGET_INPUT_KEY] = ceiling
+    state.invalidate_advisory_cache()  # advisories were computed against the old ceiling
+
 
 def _is_additive_request(user_message: str | None) -> bool:
     """True for a plain "add a monitor / another drive"-style message: an
@@ -743,16 +833,6 @@ def _enforce_additive_action(
     if not allowed and not quantities:
         note = "Nothing was added: I could not identify a valid peripheral or extra to add to your build."
     return patched, True, note
-
-
-def _overage_confirmed() -> bool:
-    """True when the assistant turn immediately before the current user
-    message was the BUDGET GUARDRAIL's exact over-ceiling question."""
-    messages = st.session_state.get("concierge_messages") or []
-    if len(messages) < 2:
-        return False
-    previous = messages[-2]
-    return previous.get("role") == "assistant" and "exceed your budget" in str(previous.get("content", ""))
 
 
 _CHANGE_ORDER = tuple(solvers.CATEGORY_ORDER) + tuple(solvers.PERIPHERAL_CATEGORIES)
@@ -1197,6 +1277,12 @@ def _apply_concierge_action(action: dict | None, user_message: str | None = None
         # into a peripheral-only `modify_build` patch and applied strictly.
         strict_additive = False
         additive_snapshot: dict | None = None
+        # HARD BUDGET CEILING (spec.md §6.7.3): a modify_build that would push
+        # the total over a real ceiling is refused WHOLE — restored from this
+        # snapshot, never re-solved/downgraded to make room.
+        hard_snapshot: dict | None = None
+        if action_type == "modify_build" and build_draft and build_draft.get("components"):
+            hard_snapshot = copy.deepcopy(build_draft)
         if build_draft and build_draft.get("components"):
             action, strict_additive, additive_note = _enforce_additive_action(action, user_message, build_draft)
             action_type = action["type"]
@@ -1205,6 +1291,10 @@ def _apply_concierge_action(action: dict | None, user_message: str | None = None
             if strict_additive:
                 additive_snapshot = copy.deepcopy(build_draft)
         budget_cap_usd = action.get("budget_cap_usd") if action_type == "load_build" else None
+        if budget_cap_usd:
+            budget_cap_usd = _verified_budget_cap(
+                budget_cap_usd, user_message, st.session_state.get("selected_currency", "USD"),
+            )
 
         if budget_cap_usd:
             seed_selection = {}
@@ -1219,7 +1309,7 @@ def _apply_concierge_action(action: dict | None, user_message: str | None = None
                 mode="Budget",
                 components={category: component.id for category, component in selection.items()},
             )
-            build_draft["budget_ceiling"] = budget_cap_usd
+            _set_budget_ceiling(build_draft, budget_cap_usd)
         else:
             # A modify_build with nothing to modify against starts a fresh Free
             # draft too, same as load_build — a defensive fallback for the (should
@@ -1295,28 +1385,45 @@ def _apply_concierge_action(action: dict | None, user_message: str | None = None
                     category not in touched and after_quantities.get(category, 1) != before_qty
                     for category, before_qty in before_quantities_snap.items()
                 )
-                over_ceiling = False
-                if budget_ceiling and not violated:
-                    current_state = state.resolve_build_state(build_draft)
-                    over_ceiling = (
-                        state.build_total_cost(current_state, after_quantities) > budget_ceiling
-                        and not _overage_confirmed()
-                    )
-                if violated or over_ceiling:
+                if violated:
                     build_draft.clear()
                     build_draft.update(additive_snapshot)
                     st.session_state.setdefault(_APPLY_NOTES_KEY, []).append(
-                        "The addition would exceed your budget, so nothing was changed. Say yes to proceed anyway."
-                        if over_ceiling
-                        else "The addition could not be applied without altering other parts, so nothing was changed."
+                        "The addition could not be applied without altering other parts, so nothing was changed."
                     )
-            elif budget_ceiling:
-                current_state = state.resolve_build_state(build_draft)
-                current_total = state.build_total_cost(current_state, build_draft.get("quantities", {}))
-                if current_state and current_total > budget_ceiling:
-                    clamped_state = solvers.initialize_budget_build(budget_ceiling, seed_selection=current_state)
-                    for category, component in clamped_state.items():
-                        state.set_component(build_draft, category, component)
+
+            if hard_snapshot is not None and budget_ceiling:
+                snap_state = state.resolve_build_state(hard_snapshot)
+                snap_quantities = hard_snapshot.get("quantities", {}) or {}
+                before_total = state.build_total_cost(snap_state, snap_quantities)
+                now_state = state.resolve_build_state(build_draft)
+                after_total = state.build_total_cost(now_state, build_draft.get("quantities", {}) or {})
+                if after_total > budget_ceiling + 1e-6 and after_total > before_total + 1e-6:
+                    parts: list[tuple[str, float]] = []
+                    adding = False
+                    for category, component_id in (action.get("components") or {}).items():
+                        if hard_snapshot["components"].get(category) == component_id:
+                            continue
+                        component = components_repo.get_by_id(component_id)
+                        if component is None:
+                            continue
+                        adding = adding or category not in hard_snapshot["components"]
+                        parts.append((component.name, component.price_usd))
+                    for category, qty in (action.get("quantities") or {}).items():
+                        old_qty = snap_quantities.get(category, 1)
+                        unit = now_state.get(category)
+                        if unit is not None and qty > old_qty:
+                            adding = True
+                            parts.append((f"extra {category}", unit.price_usd * (qty - old_qty)))
+                    build_draft.clear()
+                    build_draft.update(hard_snapshot)
+                    st.session_state[_BUDGET_REJECTION_KEY] = {
+                        "verb": "Adding" if adding or not parts else "Upgrading to",
+                        "label": " + ".join(name for name, _p in parts) or "this change",
+                        "price": sum(price for _n, price in parts) if parts else after_total - before_total,
+                        "total": after_total,
+                        "ceiling": budget_ceiling,
+                    }
 
         st.session_state["build_draft"] = build_draft
         st.session_state["create_mode"] = build_draft.get("creation_mode") or "Free"
@@ -1433,17 +1540,57 @@ def _apply_concierge_action(action: dict | None, user_message: str | None = None
         # opposite of what "you have leeway" asked for.
         existing_ceiling = build_draft.get("budget_ceiling") if build_draft.get("creation_mode") == "Budget" else None
         stated_ceiling = action.get("budget_cap_usd")
-        budget_ceiling = existing_ceiling or stated_ceiling
+        # EXPLICIT NEW TOTAL BUDGET ("I'm upping the budget to 5k"): unlike
+        # leeway wording, this REPLACES the ceiling. Root cause of the
+        # "0 changes after raising the budget" bug: the existing ceiling
+        # always won here, so the solvers kept evaluating against 4000. The
+        # figure is verified against the numbers actually in the user's
+        # message before it may overwrite anything.
+        new_total = None
+        if action.get("stated_total_budget") and stated_ceiling:
+            new_total = _verified_budget_cap(
+                stated_ceiling, user_message, st.session_state.get("selected_currency", "USD"), strict=True,
+            )
+        if new_total:
+            build_draft["creation_mode"] = "Budget"
+            _set_budget_ceiling(build_draft, new_total)
+            budget_ceiling = new_total
+        else:
+            budget_ceiling = existing_ceiling or stated_ceiling
         if not budget_ceiling:
             return None
         if build_draft.get("creation_mode") != "Budget":
             build_draft["creation_mode"] = "Budget"
-            build_draft["budget_ceiling"] = budget_ceiling
+            _set_budget_ceiling(build_draft, budget_ceiling)
         mode = "Budget"
         build_state = state.resolve_build_state(build_draft)
         if not build_state:
             return None
         quantities = build_draft.get("quantities", {})
+
+        # EXPLICIT BUDGET LOWERING (spec.md §6.7.4): a build over the (new)
+        # ceiling is rebalanced DOWN first — least-harmful step-downs via the
+        # deterministic `fit_build_to_ceiling` — never left over budget.
+        if state.build_total_cost(build_state, quantities) > budget_ceiling:
+            fitted_state, fitted_quantities = solvers.fit_build_to_ceiling(build_state, budget_ceiling, quantities)
+            for category, component in fitted_state.items():
+                if category not in build_state or build_state[category].id != component.id:
+                    state.set_component(build_draft, category, component)
+            for category, qty in fitted_quantities.items():
+                if (quantities or {}).get(category, 1) != qty:
+                    state.set_quantity(build_draft, category, qty)
+            build_state = state.resolve_build_state(build_draft)
+            quantities = build_draft.get("quantities", {})
+
+        # APPLY, don't just report: spend real headroom under the (possibly
+        # just-raised) ceiling on higher-tier CPU/GPU parts via the
+        # deterministic, gated solver BEFORE the advisory-driven loop below
+        # (which then works on whatever headroom is left).
+        upgraded = solvers.spend_headroom_upgrades(build_state, budget_ceiling, quantities)
+        for category, component in upgraded.items():
+            if category not in build_state or build_state[category].id != component.id:
+                state.set_component(build_draft, category, component)
+        build_state = state.resolve_build_state(build_draft)
 
         # DETERMINISTIC MULTI-TIER UPGRADE (root-cause fix for "AI math
         # hallucinations" — a real, confirmed failure in both directions:
@@ -1614,6 +1761,22 @@ def render_concierge_widget() -> None:
                     active_currency=_active_currency(),
                     currency_rates=CURRENCY_RATES,
                 )
+            # ABSOLUTE PRIORITY OF EXPLICIT BUDGET CHANGES (spec.md §6.7.4): a
+            # stated new budget always sets the ceiling AND rebalances (down if
+            # lowered, up if raised), whatever action the model chose — except a
+            # fresh build-me (`load_build`), which builds around the figure anyway.
+            explicit_budget = _explicit_budget_change(
+                user_input, st.session_state.get("build_draft"), _active_currency(),
+            )
+            if explicit_budget is not None and (result.get("action") or {}).get("type") != "load_build":
+                result = dict(result)
+                result["action"] = {
+                    "type": "use_remaining_budget",
+                    "budget_cap_usd": explicit_budget,
+                    "stated_total_budget": True,
+                    "explanation": "",
+                }
+                result["reply"] = "Applying your new budget and rebalancing the build to fit it."
             # RIGOROUS TELEMETRY REPLY FORMAT — snapshot the BEFORE state for
             # the 3 action types that patch an EXISTING build (modify_build/
             # fix_warnings/optimize_bottleneck have a meaningful "before"; a
@@ -1726,6 +1889,23 @@ def render_concierge_widget() -> None:
                     build_state = state.resolve_build_state(build_draft)
                     if build_state:
                         real_total = state.build_total_cost(build_state, build_draft.get("quantities", {}))
+            rejection = st.session_state.pop(_BUDGET_REJECTION_KEY, None)
+            if rejection:
+                # Honest, Python-computed refusal REPLACES the model's text
+                # and every telemetry/Changes line: nothing was applied, so
+                # nothing may claim it was.
+                st.session_state.pop(_APPLY_NOTES_KEY, None)
+                refusal = (
+                    f"{rejection['verb']} this {rejection['label']} "
+                    f"({format_currency(rejection['price'], target_currency)}) would bring the total to "
+                    f"{format_currency(rejection['total'], target_currency)}, which exceeds your budget "
+                    f"ceiling of {format_currency(rejection['ceiling'], target_currency)}. "
+                    "Please raise the budget first. Your build was not changed."
+                )
+                st.session_state["concierge_messages"].append(
+                    {"role": "assistant", "content": sanitize_markdown(refusal)}
+                )
+                st.rerun()
             reply_content = result["reply"]
             action_dict = result.get("action") or {}
             applied_action_type = action_dict.get("type")
@@ -1912,6 +2092,12 @@ def render_concierge_widget() -> None:
                                 f" (cost {change_sign}{format_currency(abs(cost_delta), target_currency)})"
                             )
                         lines.insert(0, f"Changes: {change_text}")
+                _ceiling = (build_draft or {}).get("budget_ceiling")
+                if applied_action_type == "use_remaining_budget" and _ceiling and real_total > _ceiling + 1e-6:
+                    lines.append(
+                        f"Still over budget: total {format_currency(real_total, target_currency)} vs ceiling "
+                        f"{format_currency(_ceiling, target_currency)} — no further compatible reduction was possible."
+                    )
                 reply_content = f"{reply_content}\n\n" + "\n\n".join(f"**{line}**" for line in lines)
             elif real_total is not None:
                 reply_content = f"{reply_content}\n\n**Total: {format_currency(real_total, target_currency)}**"

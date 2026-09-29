@@ -598,6 +598,13 @@ class ConciergeUseRemainingBudgetAction(BaseModel):
     # caller converts/keeps the active build in Budget mode under this
     # ceiling going forward, even if it was previously Free/Workload mode.
     budget_cap_usd: float | None = None
+    # True ONLY when the message states a NEW TOTAL budget/ceiling ("I'm upping
+    # the budget to 5k", "increase budget to 5000") — as opposed to leeway or
+    # remaining headroom under the existing ceiling. `budget_cap_usd` is then
+    # the exact stated total (converted to USD), never a delta/residual, and
+    # the caller replaces the draft's ceiling with it (after verifying it
+    # against the figures actually present in the user's message).
+    stated_total_budget: bool = False
     explanation: str = ""
 
 

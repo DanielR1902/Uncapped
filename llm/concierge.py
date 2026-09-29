@@ -881,7 +881,7 @@ You handle thirteen kinds of requests:
     and the caller converts/keeps the build in Budget mode under it going forward. If NEITHER applies (no
     active build, still Free/Workload mode AND no figure stated this message), there is no "remaining budget"
     to reason about — treat the request as intent 6 instead. When it does apply, return
-    `{"type": "use_remaining_budget", "budget_cap_usd": <float>|null, "explanation": "<string>"}`.
+    `{"type": "use_remaining_budget", "budget_cap_usd": <float>|null, "stated_total_budget": <bool>, "explanation": "<string>"}`.
 
     `budget_cap_usd` MUST STAY `null` WHENEVER A REAL `budget_ceiling` ALREADY EXISTS (a real, confirmed bug
     this closes): a live call was caught treating "you have 1864.68 EUR leeway, use them to upgrade" — sent
@@ -899,6 +899,17 @@ You handle thirteen kinds of requests:
     to a stated figure) applies ONLY when no real ceiling exists yet at all (Free/Workload mode, or Budget
     mode with `budget_ceiling` still unset) — never as a way to describe additional room under one that's
     already there.
+
+    STATED NEW TOTAL BUDGET (`stated_total_budget: true`): when the message states a NEW TOTAL budget/ceiling
+    for the active build — "I'm upping the budget to 5k, make all possible upgrades", "increase budget to
+    5000", "budget is now 5000 USD" — set `stated_total_budget: true` and `budget_cap_usd` to that EXACT total
+    (converted to USD, "5k" = 5000), never a difference, a leftover, or a computed residual. This REPLACES
+    the existing ceiling (the caller updates the Budget ceiling input to it and searches upgrades against
+    the new headroom). This includes LOWERING ("I'm lowering your budget to 3k, make the necessary
+    adjustments" -> `stated_total_budget: true`, `budget_cap_usd: 3000`): the app then downgrades parts,
+    least-harmful first, until the build fits — never claim it is already fine. This is different from leeway wording ("you have 1000 left") above, which keeps
+    `budget_cap_usd: null`. Likewise, for a build-me request stating a budget ("build me a pc with 3k
+    budget"), `budget_cap_usd` is exactly the stated figure (3000), never a value you computed from parts.
 
     BUDGET CURRENCY CONVERSION (the exact same rule as intent 3's own — a narrow, deliberate exception to
     "never do currency math yourself"): when a fresh figure IS stated in this message, determine which
@@ -1013,24 +1024,15 @@ whichever summary matches its `source` (`drafts_summary`'s `"draft_id"` for `"dr
 It also applies to a `save_build` action whose `source == "community"`: its `source_post_id` MUST likewise be
 a real `"post_id"` value already present in `community_summary` as given to you this call.
 
-BUDGET GUARDRAIL RULE (checked BEFORE returning any `load_build`/`modify_build` action): this check only
-ever applies when `current_build_context["mode"] == "Budget"` AND `current_build_context` also carries a
-real, explicit budget ceiling figure somewhere in its payload (e.g. a `budget_ceiling`/`ceiling` field). If
-no such ceiling figure is present in the data you were given, SKIP this entire rule and proceed normally —
-never guess or estimate a ceiling that wasn't given. When a ceiling figure IS present: compute the
-proposed action's resulting total cost using only real numbers already present in `catalog_summary`/
-`current_build_context` — current total cost of `current_build_context["components"]`, plus the real price
-of every newly-added/swapped-in component, minus the real price of every removed/replaced component — all
-exact, never estimated. If that resulting total would exceed the ceiling, do NOT return the action yet:
-respond instead with `action: null` and set `reply` to EXACTLY this template with the real computed
-shortfall substituted in (formatted per the no-bare-"$" rule above, e.g. "45.00"): "This upgrade will
-exceed your budget by USD {delta}. Would you like to proceed anyway?" On the user's NEXT message, look at
-your own immediately preceding turn in `conversation_history`: only if that turn literally asked this
-exact budget-overage question, AND the new user message is a plain affirmative ("yes", "yeah", "go ahead",
-"sure", "do it", etc.), THEN return the actual `load_build`/`modify_build` action you were about to
-propose before, computed the same way as before. A bare affirmative that is answering a DIFFERENT question
-(e.g. confirming a community post, not this budget question) must NEVER be treated as a budget
-confirmation — only take this shortcut when your own last message was specifically that budget question.
+HARD BUDGET CEILING RULE (applies to every `load_build`/`modify_build` that adds or upgrades a part): when
+`current_build_context` carries a real `budget_ceiling`, that ceiling is a HARD LIMIT — never a suggestion.
+Return the action the user asked for as normal; the app enforces the ceiling in Python: if the change would
+push the total over the ceiling it is REFUSED WHOLE (nothing is added, no other part is downgraded, swapped
+or re-solved to make room) and the app replaces your reply with the honest refusal. So never offer to
+"proceed anyway", never propose downgrading other parts to fit, and never write your own totals. Do not
+claim an addition or upgrade already happened in the past tense ("Upgraded your Monitor...") — say what you
+are applying ("Adding the LG 45GR95QE monitor.") and let the app's Python-computed "Changes:" line be the
+record of what actually changed.
 
 Respond with STRICT JSON and nothing else (no prose, no markdown fences), matching exactly one of these
 shapes:
@@ -1761,6 +1763,8 @@ def _optimize_in_place(
                 continue
             if _cost(candidate, quantities) > upper:
                 continue
+            # (No performance axis here: this loop fixes bottleneck/synergy
+            # only and must not spend money on tier-ups that don't help them.)
             if solvers.is_monotonic_improvement(before, solvers.build_metrics(candidate, quantities)):
                 chosen = candidate
                 break

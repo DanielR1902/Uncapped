@@ -42,8 +42,21 @@ def build_metrics(
     return warnings, live[0], live[1]
 
 
+def build_performance(build_state: BuildState) -> float:
+    """CPU + GPU benchmark sum — a "higher tier" measure. Synergy/bottleneck
+    only describe how well CPU and GPU MATCH each other, so a matched pair
+    moving up a tier (both stronger, same ratio) leaves both unchanged;
+    performance is what makes that a real, gate-accepted improvement."""
+    return float(
+        sum((build_state[c].benchmark_score or 0) for c in ("CPU", "GPU") if c in build_state)
+    )
+
+
 def is_monotonic_improvement(
-    before: tuple[int, float, float] | None, after: tuple[int, float, float] | None
+    before: tuple[int, float, float] | None,
+    after: tuple[int, float, float] | None,
+    perf_before: float | None = None,
+    perf_after: float | None = None,
 ) -> bool:
     """Strict monotonic improvement gate (spec.md §6.6.3): `after` is accepted
     only if compatibility warnings are 0 or strictly fewer than `before`, AND
@@ -59,7 +72,175 @@ def is_monotonic_improvement(
         return False
     if a_syn < b_syn - _METRIC_EPSILON or a_bn > b_bn + _METRIC_EPSILON:
         return False
-    return a_syn > b_syn + _METRIC_EPSILON or a_bn < b_bn - _METRIC_EPSILON
+    if a_syn > b_syn + _METRIC_EPSILON or a_bn < b_bn - _METRIC_EPSILON:
+        return True
+    # Optional third axis (spec.md §6.6.3): when neither synergy nor bottleneck
+    # moved, a strictly higher CPU+GPU performance tier still counts.
+    return (
+        perf_before is not None
+        and perf_after is not None
+        and perf_after > perf_before + _METRIC_EPSILON
+    )
+
+
+def fit_build_to_ceiling(
+    build_state: BuildState,
+    ceiling: float,
+    quantities: dict[str, int] | None = None,
+    max_rounds: int = 60,
+) -> tuple[BuildState, dict[str, int]]:
+    """Explicit budget LOWERING (spec.md §6.7.4): downgrade an over-ceiling
+    build until `total <= ceiling` while doing the least damage to the build.
+    Each round applies the single step-down (one of the few nearest cheaper
+    catalog options, or the cheapest, for any present category — core or
+    peripheral) with the best savings-per-damage, where damage is the drop in
+    synergy plus a small CPU+GPU-performance term. Parts that don't move
+    synergy (RAM/Storage/Cooler/Case/PSU/peripherals) therefore go first;
+    CPU/GPU only when needed, taking the least harmful step. Compatibility is
+    kept (every trial must pass `evaluate_build` when the input did); when no
+    step-down remains, an extra RAM/Storage unit is dropped; if still over,
+    `initialize_budget_build(ceiling, seed_selection=state)` is the last
+    resort. Deterministic; strictly reduces cost each round so it terminates.
+    Returns `(new_state, new_quantities)` (unchanged when already under)."""
+    quantities = dict(quantities or {})
+    state = dict(build_state)
+
+    def _cost(s: BuildState, q: dict[str, int]) -> float:
+        return sum(c.price_usd * q.get(cat, 1) for cat, c in s.items())
+
+    was_compatible = evaluate_build(state, quantities).is_compatible
+    for _ in range(max_rounds):
+        total = _cost(state, quantities)
+        if total <= ceiling + _METRIC_EPSILON:
+            break
+        before = live_bottleneck_and_synergy(state)
+        perf_before = build_performance(state)
+        best: tuple[float, BuildState, dict[str, int]] | None = None
+        for category, current in state.items():
+            qty = quantities.get(category, 1)
+            cheaper = sorted(
+                (c for c in components_repo.get_by_category(category) if c.price_usd < current.price_usd),
+                key=lambda c: c.price_usd,
+                reverse=True,
+            )
+            options = cheaper[:3] + cheaper[-1:] if len(cheaper) > 3 else cheaper
+            for cand in options:
+                trial = {**state, category: cand}
+                if was_compatible and not evaluate_build(trial, quantities).is_compatible:
+                    continue
+                saved = (current.price_usd - cand.price_usd) * qty
+                after = live_bottleneck_and_synergy(trial)
+                syn_drop = max(0.0, before[0] - after[0]) if before and after else 0.0
+                perf_drop = max(0.0, perf_before - build_performance(trial))
+                damage = syn_drop * 5.0 + perf_drop * 0.01
+                score = saved / (1.0 + damage)
+                if best is None or score > best[0]:
+                    best = (score, trial, quantities)
+        if best is None:
+            # no compatible step-down: drop one extra RAM/Storage unit
+            reducible = [c for c in ("Storage", "RAM") if quantities.get(c, 1) > 1 and c in state]
+            if not reducible:
+                break
+            quantities[reducible[0]] = quantities[reducible[0]] - 1
+            continue
+        state = best[1]
+    if _cost(state, quantities) > ceiling + _METRIC_EPSILON:
+        state = {**state, **initialize_budget_build(ceiling, seed_selection=state)}
+    return state, quantities
+
+
+def spend_headroom_upgrades(
+    build_state: BuildState,
+    ceiling: float,
+    quantities: dict[str, int] | None = None,
+    max_rounds: int = 8,
+) -> BuildState:
+    """Use real budget headroom under `ceiling` on higher-tier CPU/GPU parts
+    (spec.md §6.6.3, dynamic thresholds): each round applies the single best
+    swap — or, when balanced so no single swap helps, the best CPU+GPU pair —
+    that fits the remaining headroom and passes the monotonic gate with the
+    performance axis (0 warnings, synergy not lower, bottleneck not higher,
+    something strictly better). A GPU that needs more PSU headroom may also
+    pull in the cheapest PSU/Case fix from `resolve_compatibility_issues`,
+    with that cost counted against the headroom too. Returns the new build
+    state (== `build_state` when nothing qualifies). Deterministic and
+    monotone (every round strictly raises performance or synergy), so it
+    always terminates."""
+    quantities = quantities or {}
+    state = dict(build_state)
+
+    def _cost(s: BuildState) -> float:
+        return sum(c.price_usd * quantities.get(cat, 1) for cat, c in s.items())
+
+    for _ in range(max_rounds):
+        remaining = ceiling - _cost(state)
+        before = build_metrics(state, quantities)
+        if remaining <= 0 or before is None:
+            break
+        perf_before = build_performance(state)
+        best: tuple[tuple[float, float], BuildState] | None = None
+
+        def consider(trial: BuildState) -> None:
+            nonlocal best
+            if _cost(trial) > ceiling + _METRIC_EPSILON:
+                return
+            after = build_metrics(trial, quantities)
+            perf_after = build_performance(trial)
+            if is_monotonic_improvement(before, after, perf_before, perf_after):
+                key = (round(after[1], 6), perf_after)
+                if best is None or key > best[0]:
+                    best = (key, trial)
+
+        singles: list[tuple[str, Component]] = []
+        for category in ("CPU", "GPU"):
+            current = state.get(category)
+            if current is None:
+                continue
+            for cand in get_compatible_candidates(category, state):
+                if cand.id != current.id and 0 < cand.price_usd - current.price_usd <= remaining:
+                    singles.append((category, cand))
+                    consider({**state, category: cand})
+        if best is None:
+            # no single swap passes: try a fixed number of the strongest
+            # affordable CPU+GPU pairs (cheap pure-python prefilter first).
+            b_pct, _d = bottleneck_percentage_baseline(state)
+            cpus = [c for cat, c in singles if cat == "CPU"]
+            gpus = [c for cat, c in singles if cat == "GPU"]
+            pairs = []
+            for cpu in cpus:
+                for gpu in gpus:
+                    spend = (cpu.price_usd - state["CPU"].price_usd) + (gpu.price_usd - state["GPU"].price_usd)
+                    if spend > remaining:
+                        continue
+                    trial = {**state, "CPU": cpu, "GPU": gpu}
+                    pct, _d = bottleneck_percentage_baseline(trial)
+                    if pct <= b_pct + _METRIC_EPSILON and build_performance(trial) > perf_before:
+                        pairs.append((build_performance(trial), trial))
+            for _perf, trial in sorted(pairs, key=lambda p: p[0], reverse=True)[:25]:
+                consider(trial)
+        if best is None:
+            # A stronger GPU may need a bigger PSU (or case) to be compatible:
+            # take the strongest few compat-failing GPU/CPU upgrades and let the
+            # deterministic resolver patch them, counting that cost too.
+            failing = []
+            for category in ("GPU", "CPU"):
+                current = state.get(category)
+                if current is None:
+                    continue
+                for cand in components_repo.get_by_category(category):
+                    if cand.id != current.id and 0 < cand.price_usd - current.price_usd <= remaining:
+                        failing.append((cand.benchmark_score or 0, category, cand))
+            for _score, category, cand in sorted(failing, key=lambda f: f[0], reverse=True)[:6]:
+                trial = {**state, category: cand}
+                for fix_category, fix_id in resolve_compatibility_issues(trial, quantities).items():
+                    fix = components_repo.get_by_id(fix_id)
+                    if fix is not None:
+                        trial[fix_category] = fix
+                consider(trial)
+        if best is None:
+            break
+        state = best[1]
+    return state
 
 
 # GPU/CPU dominate both cost and performance, so they're locked in first —

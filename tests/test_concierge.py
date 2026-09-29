@@ -2559,7 +2559,9 @@ def test_use_remaining_budget_action_passes_through(monkeypatch):
     assert result["source"] == "llm"
     # budget_cap_usd defaults to None and is always present in the dumped
     # action (this round's spec.md §6.7 intent 13 extension).
-    assert result["action"] == {"type": "use_remaining_budget", "budget_cap_usd": None, "explanation": ""}
+    assert result["action"] == {
+        "type": "use_remaining_budget", "budget_cap_usd": None, "stated_total_budget": False, "explanation": "",
+    }
 
 
 def test_use_remaining_budget_action_parses_freshly_stated_ceiling(monkeypatch):

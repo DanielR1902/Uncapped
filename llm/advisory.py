@@ -1033,6 +1033,17 @@ def _apply_action(
     return {**state, category: component}, quantities
 
 
+def _improves(prev_state: BuildState, prev_metrics, new_state: BuildState, new_q: dict[str, int]) -> bool:
+    """The monotonic gate incl. the CPU+GPU performance-tier axis: a matched
+    pair moving up a tier (synergy/bottleneck unchanged) is a real upgrade."""
+    return solvers.is_monotonic_improvement(
+        prev_metrics,
+        solvers.build_metrics(new_state, new_q),
+        solvers.build_performance(prev_state),
+        solvers.build_performance(new_state),
+    )
+
+
 def _gate_actions(
     build_state: BuildState,
     quantities: dict[str, int] | None,
@@ -1068,7 +1079,7 @@ def _gate_actions(
             continue
         seen.add(key)
         trial_state, trial_q = applied
-        if solvers.is_monotonic_improvement(accepted_metrics, solvers.build_metrics(trial_state, trial_q)):
+        if _improves(accepted_state, accepted_metrics, trial_state, trial_q):
             kept.extend(pending + [action])
             pending = []
             accepted_state, accepted_q = trial_state, trial_q
@@ -1077,9 +1088,7 @@ def _gate_actions(
             continue
         if pending:
             alone = _apply_action(accepted_state, accepted_q, action, lookup)
-            if alone is not None and solvers.is_monotonic_improvement(
-                accepted_metrics, solvers.build_metrics(*alone)
-            ):
+            if alone is not None and _improves(accepted_state, accepted_metrics, alone[0], alone[1]):
                 kept.append(action)
                 accepted_state, accepted_q = alone
                 accepted_metrics = solvers.build_metrics(accepted_state, accepted_q)
@@ -1269,6 +1278,40 @@ def prune_stale_actions(
     return result
 
 
+def _headroom_within_budget(
+    build_state: BuildState, mode: str, ceiling: float | None, quantities: dict[str, int] | None
+) -> dict | None:
+    """DYNAMIC THRESHOLD (spec.md §6.6.3): in Budget mode, real headroom under
+    the CURRENT ceiling must be offered as in-budget upgrades (never "already
+    fully optimized" while a higher-tier compatible CPU/GPU fits). Uses
+    `engine.solvers.spend_headroom_upgrades`; the resulting swaps are
+    re-validated by the same cumulative gate so they are all executable."""
+    if mode != "Budget" or not ceiling:
+        return None
+    upgraded = solvers.spend_headroom_upgrades(build_state, ceiling, quantities)
+    changed = [
+        c for c in upgraded
+        if c not in build_state or upgraded[c].id != build_state[c].id
+    ]
+    if not changed:
+        return None
+    order = {"CPU": 0, "GPU": 1}
+    changed.sort(key=lambda c: order.get(c, 2))
+    swaps = [{"action": "swap", "category": c, "replace_with_id": upgraded[c].id} for c in changed]
+    kept, final_state, _q = _gate_actions(build_state, quantities, swaps)
+    if len(kept) != len(swaps):
+        return None
+    cost = _real_cost_delta(build_state, quantities, kept, final_state)
+    return {
+        "explanation": (
+            f"Use your remaining budget: swap {_describe_kept(build_state, kept, final_state)} "
+            f"(+{cost:,.2f} USD, still within your {ceiling:,.2f} USD ceiling)."
+        ),
+        "swaps": kept,
+        "can_optimize_further": True,
+    }
+
+
 def get_build_advisory(
     build_state: BuildState,
     mode: str,
@@ -1277,7 +1320,29 @@ def get_build_advisory(
     bottleneck_info: dict | None = None,
     quantities: dict[str, int] | None = None,
 ) -> dict:
-    """Public entry point. `mode` is one of "Budget" | "Workload" | "Free"
+    """Public entry point: the gated advisory, plus — in Budget mode when it
+    found no in-budget swap but the build sits below the CURRENT ceiling
+    (`current_budget_or_cost`) — real headroom upgrades. See
+    `_get_build_advisory_core` for the full contract."""
+    result = _get_build_advisory_core(
+        build_state, mode, current_budget_or_cost, profile, bottleneck_info, quantities
+    )
+    if not result["within_budget"]["swaps"]:
+        headroom = _headroom_within_budget(build_state, mode, current_budget_or_cost, quantities)
+        if headroom is not None:
+            result["within_budget"] = headroom
+    return result
+
+
+def _get_build_advisory_core(
+    build_state: BuildState,
+    mode: str,
+    current_budget_or_cost: float,
+    profile: str | None = None,
+    bottleneck_info: dict | None = None,
+    quantities: dict[str, int] | None = None,
+) -> dict:
+    """Core advisory (LLM or heuristic) with gates applied. `mode` is one of "Budget" | "Workload" | "Free"
     (this project's three creation modes). `current_budget_or_cost` is the
     Budget-mode ceiling when mode == "Budget", otherwise the build's current
     total cost (Workload/Free have no ceiling concept). `profile` is the

@@ -115,6 +115,7 @@ def _apply_budget_and_generate(build_draft: dict) -> None:
         ceiling = entered
 
     build_draft["budget_ceiling"] = ceiling
+    state.invalidate_advisory_cache()  # advisories were computed against the old ceiling
     build_draft["components"] = {}  # wipe every existing core/peripheral selection before regenerating
 
     new_selection = solvers.initialize_budget_build(ceiling, fill_peripherals_with_surplus=True)
@@ -134,6 +135,30 @@ def _budget_controls(build_draft: dict) -> None:
         if unlimited:
             build_draft["budget_ceiling"] = None
 
+        # A ceiling the AI Concierge just set (ui/components/chat_assistant.py
+        # stages it — it can't write this widget's key itself, this widget
+        # instantiates later in the same script pass). Applied BEFORE the
+        # widget so it renders the exact stated number, not a stale value.
+        #
+        # Standard keyed-widget pattern (no `value=` on the widget — passing
+        # both `value=` and session-state writes to the same key triggers
+        # Streamlit's "created with a default value but also had its value
+        # set via the Session State API" warning and desyncs programmatic
+        # updates): the canonical key is seeded once, then re-synced ONLY when
+        # the draft's ceiling changes from outside the widget (Concierge,
+        # loaded build, Apply button) — never over the user's in-progress typing.
+        staged_ceiling = st.session_state.pop("pending_budget_ceiling_input", None)
+        draft_ceiling = build_draft.get("budget_ceiling")
+        if staged_ceiling is not None:
+            st.session_state["budget_ceiling_input"] = float(staged_ceiling)
+            st.session_state["_budget_input_synced_to"] = float(staged_ceiling)
+        elif "budget_ceiling_input" not in st.session_state:
+            st.session_state["budget_ceiling_input"] = float(draft_ceiling or 1500.0)
+            st.session_state["_budget_input_synced_to"] = float(draft_ceiling or 1500.0)
+        elif draft_ceiling is not None and st.session_state.get("_budget_input_synced_to") != float(draft_ceiling):
+            st.session_state["budget_ceiling_input"] = float(draft_ceiling)
+            st.session_state["_budget_input_synced_to"] = float(draft_ceiling)
+
         st.number_input(
             # Deliberately always USD-denominated regardless of the sidebar currency
             # selector (ui/format.py) — the ceiling is compared directly against
@@ -143,8 +168,7 @@ def _budget_controls(build_draft: dict) -> None:
             # precision-drift bugs; out of scope for this round's DISPLAY-only currency
             # support (spec.md §7.7) — the label says so explicitly to avoid ambiguity.
             "Budget ceiling (USD)",
-            value=build_draft.get("budget_ceiling") or 1500.0, step=50.0,
-            key="budget_ceiling_input", disabled=unlimited,
+            step=50.0, key="budget_ceiling_input", disabled=unlimited,
         )
 
         st.button(
@@ -187,6 +211,7 @@ def _do_reset_build(build_draft: dict) -> None:
     # render (a widget's `key`-bound session_state entry always wins
     # over its `value=`/`index=` default once it exists).
     st.session_state.pop("budget_ceiling_input", None)
+    st.session_state.pop("pending_budget_ceiling_input", None)
     st.session_state.pop("budget_unlimited_input", None)
     st.session_state.pop("workload_profile_input", None)
     st.session_state.pop("workload_tier_input", None)
@@ -202,6 +227,31 @@ def _candidates_for(build_draft: dict, build_state: dict, category: str) -> list
     return solvers.get_compatible_candidates(category, others)
 
 
+def _select_component(build_draft: dict, category: str, component) -> None:
+    """Hard budget ceiling on manual selection (spec.md §6.7.3): when a ceiling
+    is active ("No limit" unchecked) a pick that would raise the total above it
+    is REJECTED with a toast and nothing is modified — no other part is
+    swapped or downgraded to make room. The picker's own disabled button is
+    the first line of defense; this is the authoritative check."""
+    ceiling = build_draft.get("budget_ceiling")
+    if ceiling:
+        quantities = build_draft.get("quantities", {}) or {}
+        build_state = state.resolve_build_state(build_draft)
+        qty = quantities.get(category, 1) if category in ("RAM", "Storage") else 1
+        old = build_state.get(category)
+        total = state.build_total_cost(build_state, quantities)
+        new_total = total - (old.price_usd * qty if old is not None else 0.0) + component.price_usd * qty
+        if new_total > ceiling + 1e-6 and new_total > total + 1e-6:
+            currency = st.session_state.get("selected_currency", "USD")
+            st.toast(
+                f"Exceeds budget ceiling: {component.name} would bring the total to "
+                f"{format_currency(new_total, currency)} (ceiling {format_currency(ceiling, currency)}). Nothing was changed.",
+                icon="⚠️",
+            )
+            return
+    state.set_component(build_draft, category, component)
+
+
 def _part_pickers(build_draft: dict, build_state: dict) -> None:
     st.markdown("#### Core Components")
     grid_cols = st.columns(2)
@@ -212,7 +262,7 @@ def _part_pickers(build_draft: dict, build_state: dict) -> None:
                 category,
                 build_state,
                 candidates,
-                on_select=lambda component, cat=category: state.set_component(build_draft, cat, component),
+                on_select=lambda component, cat=category: _select_component(build_draft, cat, component),
                 on_remove=lambda cat=category: state.remove_component(build_draft, cat),
                 budget_ceiling=build_draft.get("budget_ceiling"),
                 quantity=state.get_quantity(build_draft, category),
@@ -229,7 +279,7 @@ def _part_pickers(build_draft: dict, build_state: dict) -> None:
                 category,
                 build_state,
                 candidates,
-                on_select=lambda component, cat=category: state.set_component(build_draft, cat, component),
+                on_select=lambda component, cat=category: _select_component(build_draft, cat, component),
                 on_remove=lambda cat=category: state.remove_component(build_draft, cat),
                 budget_ceiling=build_draft.get("budget_ceiling"),
             )

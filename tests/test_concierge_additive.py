@@ -132,9 +132,9 @@ def _boot(seeded, name, mode="Free", ceiling=None, headroom=0.0):
     return at, components, prev_total
 
 
-def _patch_llm(monkeypatch, action):
+def _patch_llm(monkeypatch, action, reply="No components were downgraded."):
     def _fake(user_message, conversation_history, catalog_summary, community_summary, **kwargs):
-        return {"reply": "No components were downgraded.", "action": action, "source": "llm"}
+        return {"reply": reply, "action": action, "source": "llm"}
 
     monkeypatch.setattr(ca, "get_concierge_response", _fake)
 
@@ -196,30 +196,31 @@ def test_add_monitor_modify_build_with_extra_core_swaps_drops_the_core_changes(s
     assert _quantity_aware_total(draft) == pytest.approx(prev_total + monitor.price_usd)
 
 
-def test_additive_over_ceiling_is_rolled_back_until_user_confirms(seeded_db, monkeypatch):
+def test_over_budget_peripheral_is_refused_honestly_and_touches_nothing(seeded_db, monkeypatch):
+    """HARD BUDGET CEILING: an over-ceiling addition is refused WHOLE — the
+    reply is the honest Python refusal (never the model's "Upgraded..."), no
+    "Changes:" line contradicts it, and no existing part is altered."""
     at, before, prev_total = _boot(seeded_db, "addmon3", mode="Budget", ceiling=True, headroom=0.0)
     monitor = components_repo.get_by_category("Monitor")[0]
     _patch_llm(
         monkeypatch,
         {"type": "modify_build", "components": {"Monitor": monitor.id}, "quantities": {}, "explanation": "x"},
+        reply=f"Upgraded your Monitor to {monitor.name}.",
     )
 
     at.get_by_key("concierge_chat_input").set_value("add a monitor").run()
     draft = at.session_state["build_draft"]
     assert "Monitor" not in draft["components"]
     assert draft["components"] == before
-    assert "exceed your budget" in at.session_state["concierge_messages"][-1]["content"]
+    reply = at.session_state["concierge_messages"][-1]["content"]
+    assert "exceeds your budget ceiling" in reply and "Please raise the budget first" in reply
+    assert monitor.name in reply
+    assert "Upgraded" not in reply and "Changes:" not in reply and "no component changes" not in reply
+    assert _quantity_aware_total(draft) == pytest.approx(prev_total)
 
-    # The guardrail's own question, then a plain "yes": now it applies, still
-    # without touching any other part.
-    at.session_state["concierge_messages"] = at.session_state["concierge_messages"] + [
-        {"role": "assistant", "content": "This upgrade will exceed your budget by USD 10.00. Would you like to proceed anyway?"},
-    ]
+    # A later "yes" does NOT override the hard ceiling.
     at.get_by_key("concierge_chat_input").set_value("yes").run()
-    draft = at.session_state["build_draft"]
-    assert draft["components"]["Monitor"] == monitor.id
-    for category, component_id in before.items():
-        assert draft["components"][category] == component_id
+    assert at.session_state["build_draft"]["components"] == before
 
 
 def test_replace_reply_includes_python_changes_line_and_cost(seeded_db, monkeypatch):
@@ -237,3 +238,54 @@ def test_replace_reply_includes_python_changes_line_and_cost(seeded_db, monkeypa
     reply = at.session_state["concierge_messages"][-1]["content"]
     assert f"Changes: replaced GPU: {old_gpu.name} -> {new_gpu.name}" in reply
     assert "(cost " in reply
+
+
+def test_over_budget_core_upgrade_is_refused_without_any_downgrade(seeded_db, monkeypatch):
+    """No silent re-solve: a pricier GPU that busts the ceiling is refused whole;
+    every other part (including the GPU itself) stays exactly as it was."""
+    at, before, prev_total = _boot(seeded_db, "addgpu1", mode="Budget", ceiling=True, headroom=0.0)
+    old_gpu = components_repo.get_by_id(before["GPU"])
+    pricier = next(
+        g for g in sorted(components_repo.get_by_category("GPU"), key=lambda c: c.price_usd)
+        if g.price_usd > old_gpu.price_usd
+    )
+    _patch_llm(
+        monkeypatch,
+        {"type": "modify_build", "components": {"GPU": pricier.id}, "quantities": {}, "explanation": "x"},
+        reply=f"Upgraded your GPU to {pricier.name}.",
+    )
+
+    at.get_by_key("concierge_chat_input").set_value("upgrade my gpu").run()
+
+    draft = at.session_state["build_draft"]
+    assert draft["components"] == before
+    reply = at.session_state["concierge_messages"][-1]["content"]
+    assert "Upgrading to" in reply and "exceeds your budget ceiling" in reply
+    assert "Upgraded" not in reply
+    assert _quantity_aware_total(draft) == pytest.approx(prev_total)
+
+
+def test_manual_selection_over_ceiling_is_rejected_and_build_unchanged(seeded_db, monkeypatch):
+    """`create_build._select_component`: a pick that would exceed the active
+    ceiling toasts and modifies nothing."""
+    from types import SimpleNamespace
+
+    from ui.views import create_build as cb
+
+    selection = solvers.initialize_budget_build(1800.0)
+    total = sum(c.price_usd for c in selection.values())
+    draft = {
+        "components": {c: comp.id for c, comp in selection.items()},
+        "quantities": {}, "budget_ceiling": total, "creation_mode": "Budget",
+    }
+    toasts: list[str] = []
+    monkeypatch.setattr(
+        cb, "st", SimpleNamespace(session_state={}, toast=lambda msg, **k: toasts.append(msg)),
+    )
+    monitor = max(components_repo.get_by_category("Monitor"), key=lambda c: c.price_usd)
+    before = dict(draft["components"])
+
+    cb._select_component(draft, "Monitor", monitor)
+
+    assert draft["components"] == before
+    assert toasts and "Exceeds budget ceiling" in toasts[0]

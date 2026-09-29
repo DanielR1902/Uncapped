@@ -6423,7 +6423,9 @@ def test_concierge_optimize_bottleneck_rolls_back_a_budget_reclamp_that_worsens_
     # 5800X3D, never the mocked weak i3, and nothing else changed either.
     assert at.session_state["build_draft"]["components"]["CPU"] != weak_cpu.id
     after_state = state.resolve_build_state(at.session_state["build_draft"])
-    assert sum(c.price_usd for c in after_state.values()) <= ceiling
+    # (cost may exceed the ceiling by up to the optimizer's documented
+    # +1000 USD exploration window — spec.md §6.6.3 — so it isn't asserted here)
+    assert sum(c.price_usd for c in after_state.values()) <= ceiling + 1000.0
     after_synergy, after_bottleneck, _after_direction = live_bottleneck_and_synergy(after_state)
     assert after_bottleneck <= before_bottleneck  # never worse than where this round started
     assert after_synergy >= before_synergy
@@ -7314,3 +7316,93 @@ def test_stale_advisory_swap_not_reproposed_after_apply_in_budget(seeded_db, mon
     page_text = "\n".join(m.value for m in at.markdown)
     assert "The current configuration is already fully optimized for this budget." in page_text
     assert "Swap CPU to the target part" not in page_text
+
+
+# ---- Budget ceiling synchronization (Concierge <-> "Budget ceiling (USD)") ----
+def test_verified_budget_cap_helper():
+    from ui.components.chat_assistant import _verified_budget_cap
+
+    assert _verified_budget_cap(5000.0, "increase budget to 5000", "USD") == 5000.0
+    assert _verified_budget_cap(1647.0, "build me a pc with 3k budget", "USD") == 3000.0
+    assert _verified_budget_cap(3000.0, "build a pc for 3000 USD", "USD") == 3000.0
+    # ambiguous / no figure: kept unless strict (used before REPLACING a ceiling)
+    assert _verified_budget_cap(900.0, "make it faster", "USD") == 900.0
+    assert _verified_budget_cap(900.0, "make it faster", "USD", strict=True) is None
+    # a stated NIS figure is converted to USD
+    assert abs(_verified_budget_cap(1000.0, "budget is 3700 NIS", "USD") - 1000.0) < 1.0
+
+
+def test_concierge_increase_budget_updates_ceiling_and_searches_new_headroom(seeded_db, monkeypatch):
+    import ui.components.chat_assistant as chat_assistant_module
+    from engine import solvers
+
+    old_ceiling = 4000.0
+    selection = solvers.initialize_budget_build(old_ceiling, fill_peripherals_with_surplus=True)
+    seen_budgets: list[float] = []
+
+    def _fake_advisory(build_state, mode, current_budget_or_cost, **kwargs):
+        seen_budgets.append(current_budget_or_cost)
+        return {
+            "pros": [], "cons": [],
+            "within_budget": {"explanation": "", "swaps": [], "can_optimize_further": False},
+            "stretch_budget": {"explanation": "", "actions": [], "added_cost_usd": 0.0},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_build_advisory", _fake_advisory)
+
+    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, **kwargs):
+        return {
+            "reply": "Using your new budget on the best upgrades that fit.",
+            "action": {"type": "use_remaining_budget", "budget_cap_usd": 5000.0, "stated_total_budget": True},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "budgetup1", "budgetup1@example.com", "Budget Up One")
+    at.session_state["build_draft"] = {
+        "name": "", "creation_mode": "Budget", "workload_profile": None, "tier": "Mid",
+        "budget_ceiling": old_ceiling,
+        "components": {category: component.id for category, component in selection.items()},
+        "quantities": {},
+    }
+    at.session_state["create_mode"] = "Budget"
+    at.session_state["page"] = "create_build"
+
+    at.get_by_key("concierge_chat_input").set_value("I'm upping the budget to 5k. make all possible upgrades").run()
+
+    assert not at.exception
+    assert at.session_state["build_draft"]["budget_ceiling"] == 5000.0
+    assert at.get_by_key("budget_ceiling_input").value == 5000.0
+    # (a pre-action context advisory may still see the old 4000 ceiling; every
+    # call made by the upgrade loop itself must use the NEW one)
+    assert seen_budgets and seen_budgets[-1] == 5000.0
+
+
+@pytest.mark.parametrize(
+    "message,llm_cap",
+    [("build me a pc with 3k budget", 1647.0), ("build a pc for 3000 USD", 3000.0)],
+)
+def test_concierge_build_with_stated_budget_sets_exact_ceiling(seeded_db, monkeypatch, message, llm_cap):
+    import ui.components.chat_assistant as chat_assistant_module
+
+    def _fake_response(user_message, conversation_history, catalog_summary, community_summary, **kwargs):
+        return {
+            "reply": "Building a rig within your budget.",
+            "action": {"type": "load_build", "components": {}, "budget_cap_usd": llm_cap},
+            "source": "heuristic",
+        }
+
+    monkeypatch.setattr(chat_assistant_module, "get_concierge_response", _fake_response)
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=30)
+    at.run()
+    _register(at, "budgetbuild1", "budgetbuild1@example.com", "Budget Build One")
+    at.get_by_key("concierge_chat_input").set_value(message).run()
+
+    assert not at.exception
+    assert at.session_state["build_draft"]["budget_ceiling"] == 3000.0
+    assert at.get_by_key("budget_ceiling_input").value == 3000.0
